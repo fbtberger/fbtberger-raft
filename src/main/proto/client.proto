@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package raft.client;
+
+option java_package = "com.fbtberger.raft.client.proto";
+option java_multiple_files = true;
+
+// The RPC contract external clients use to talk to the cluster. It is
+// deliberately separate from raft.proto's RequestVote/AppendEntries, which
+// are an internal server-to-server protocol: clients should never need to
+// know those messages exist. A client only ever submits an opaque command
+// and gets back an opaque result (or a redirect hint), so the same RPC can
+// carry whatever a particular deployment's state machine understands --
+// the KV "SET key value" commands in this repo's demo, or anything else.
+//
+// This mirrors how the paper (Section 8) describes client interaction:
+// a client sends its command to what it believes is the leader; a server
+// that isn't the leader rejects the request and, if it knows who the
+// leader is, tells the client who to try instead.
+service RaftClientService {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+
+  // Cluster reconfiguration (§6): adds or removes one voting member at a
+  // time. Like Submit, these only succeed against the leader; a non-leader
+  // rejects the request and reports a leader_hint if it has one.
+  rpc AddServer(AddServerRequest) returns (ReconfigurationResponse);
+  rpc RemoveServer(RemoveServerRequest) returns (ReconfigurationResponse);
+}
+
+message SubmitRequest {
+  bytes command = 1;
+}
+
+message SubmitResponse {
+  bool success = 1;
+
+  // Set iff success is true: the state machine's return value for this command.
+  bytes result = 2;
+
+  // Set iff success is false and this server knows who the current leader is;
+  // clients should retry against this node id (resolved via their own copy of
+  // the cluster's address book, e.g. RaftConfig.peerAddresses()).
+  string leader_hint = 3;
+
+  // Set iff success is false, for diagnostics / display to a human.
+  string error = 4;
+}
+
+message AddServerRequest {
+  string id = 1;
+  string address = 2; // host:port
+}
+
+message RemoveServerRequest {
+  string id = 1;
+}
+
+message ReconfigurationResponse {
+  bool success = 1;
+
+  // Set iff success is false and this server knows who the current leader is.
+  string leader_hint = 2;
+
+  // Set iff success is false, for diagnostics / display to a human.
+  string error = 3;
+}

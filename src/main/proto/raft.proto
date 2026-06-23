@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package raft;
+
+option java_package = "com.fbtberger.raft.proto";
+option java_outer_classname = "RaftProto";
+option java_multiple_files = true;
+
+// A cluster membership list (§6): every server this configuration considers
+// a voting member, by id and gRPC address. Like a command, a configuration
+// change is just a special kind of log entry, replicated the same way as
+// everything else -- there is no separate mechanism for it.
+message ClusterConfiguration {
+  message Member {
+    string id = 1;
+    string address = 2; // host:port
+  }
+  repeated Member members = 1;
+}
+
+// One entry in the replicated log (paper, Figure 2 / Figure 6): either a
+// state machine command or a configuration change, plus the term in which
+// the leader received it. Exactly one of the two is ever set; which one
+// determines whether applyCommittedEntries() hands it to the state machine
+// or treats it as a membership change (§6).
+message LogEntry {
+  int64 index = 1;
+  int64 term = 2;
+  oneof payload {
+    bytes command = 3;
+    ClusterConfiguration configuration = 4;
+  }
+}
+
+// RequestVote RPC, invoked by candidates to gather votes (§5.2).
+message RequestVoteRequest {
+  int64 term = 1;
+  string candidateId = 2;
+  int64 lastLogIndex = 3;
+  int64 lastLogTerm = 4;
+}
+
+message RequestVoteResponse {
+  int64 term = 1;
+  bool voteGranted = 2;
+}
+
+// AppendEntries RPC, invoked by the leader to replicate log entries and,
+// with an empty entries list, as a heartbeat (§5.3).
+message AppendEntriesRequest {
+  int64 term = 1;
+  string leaderId = 2;
+  int64 prevLogIndex = 3;
+  int64 prevLogTerm = 4;
+  repeated LogEntry entries = 5;
+  int64 leaderCommit = 6;
+}
+
+message AppendEntriesResponse {
+  int64 term = 1;
+  bool success = 2;
+}
+
+// InstallSnapshot RPC (§7), used by a leader instead of AppendEntries when a
+// follower needs entries the leader has already compacted out of its own
+// log -- a follower that's fallen far behind, or a brand-new member just
+// added via §6 with an empty log. Unlike the paper's version this always
+// carries the entire snapshot in one request rather than chunking it with
+// offset/done fields; see the README for why that's an accepted
+// simplification here (gRPC's default message size limit is generous enough
+// for this implementation's demo-sized state machine).
+message InstallSnapshotRequest {
+  int64 term = 1;
+  string leaderId = 2;
+  int64 lastIncludedIndex = 3;
+  int64 lastIncludedTerm = 4;
+  bytes stateMachineData = 5;   // opaque to Raft: whatever StateMachine.takeSnapshot() produced
+  bytes configurationData = 6; // serialized ClusterConfiguration as of lastIncludedIndex (§6+§7)
+}
+
+message InstallSnapshotResponse {
+  int64 term = 1;
+}
+
+service RaftService {
+  rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
