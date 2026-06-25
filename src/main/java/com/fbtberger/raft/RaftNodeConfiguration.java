@@ -5,6 +5,7 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -73,12 +74,12 @@ public class RaftNodeConfiguration {
     }
 
     /**
-     * The replicated state machine. This implementation is a simple
-     * key-value store; a production deployment would swap in its own
-     * {@link StateMachine} here without touching anything else.
+     * Default state machine (key-value store). A production deployment
+     * overrides this by providing its own {@link StateMachine} bean.
      */
     @Bean
-    public KeyValueStateMachine stateMachine() {
+    @ConditionalOnMissingBean(StateMachine.class)
+    public StateMachine stateMachine() {
         return new KeyValueStateMachine();
     }
 
@@ -106,7 +107,7 @@ public class RaftNodeConfiguration {
     @Bean(destroyMethod = "shutdown")
     public RaftNode raftNode(RaftConfig config,
                               RaftStorage storage,
-                              KeyValueStateMachine stateMachine,
+                              StateMachine stateMachine,
                               Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory) {
         return new RaftNode(config, storage, stateMachine, peerStubFactory);
     }
