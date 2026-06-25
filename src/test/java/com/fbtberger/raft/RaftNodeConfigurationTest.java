@@ -109,12 +109,12 @@ class RaftNodeConfigurationTest {
 
     @Test
     void raftNodeStartsAsFollowerAndShutDownCleanly() {
-        // start() arms the election timer; we verify the initial role and
-        // then immediately shut the node down so the timer never fires
-        // and no threads leak into other tests.
-        raftNode.start();
+        // Before start() is called, the node must be a FOLLOWER (§5.1).
+        // After start(), a single-node cluster immediately elects itself
+        // leader (majority == 1), so the FOLLOWER assertion must come first.
         assertEquals(ServerRole.FOLLOWER, raftNode.role(),
                 "every node starts as FOLLOWER per §5.1");
+        raftNode.start();
         raftNode.shutdown();
         // A second shutdown must be idempotent (scheduler.shutdownNow()
         // on an already-terminated executor is a no-op).
