@@ -105,7 +105,6 @@ class ThreeNodeClusterTest {
             // Register the in-process server under *this* node's address so
             // other nodes' stub factories can find it by the same name.
             Server srv = InProcessServerBuilder.forName(address)
-                    .directExecutor()
                     .addService(new RaftGrpcService(node))
                     .build()
                     .start();
