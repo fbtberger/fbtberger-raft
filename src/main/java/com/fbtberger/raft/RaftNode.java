@@ -161,6 +161,10 @@ public final class RaftNode {
      */
     private void resetElectionTimer() {
         if (!started) return;
+        if (majority() == 1) {
+            startElection();
+            return;
+        }
         if (electionTimer != null) electionTimer.cancel(false);
         int timeoutMs = ELECTION_TIMEOUT_MIN_MS
                 + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS + 1);
@@ -184,6 +188,11 @@ public final class RaftNode {
             long newTerm = store.getCurrentTerm() + 1;
             store.setTermAndVote(newTerm, config.selfId());
             log("election timeout -> starting election for term " + newTerm);
+
+            if (majority() == 1) {
+                becomeLeaderLocked();
+                return;
+            }
             resetElectionTimer();
 
             RequestVoteRequest request = RequestVoteRequest.newBuilder()
