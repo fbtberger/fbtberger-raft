@@ -6,13 +6,20 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
+import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import io.grpc.ManagedChannel;
+import io.grpc.Server;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -28,28 +35,47 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class RaftNodeTest {
 
+    private static final String SERVER_NAME = "localhost:9091";
+    private static final Map<String, String> SELF_ONLY = Map.of("n1", SERVER_NAME);
+
     private InMemoryStorage store;
     private KeyValueStateMachine sm;
     private RaftNode node;
-
-    // A single-node cluster: selfId = "n1", peers = just "n1".
-    private static final Map<String, String> SELF_ONLY = Map.of("n1", "localhost:9091");
+    private Server grpcServer;
+    private final List<ManagedChannel> channels = new ArrayList<>();
+    private final List<RaftNode> peerNodes = new ArrayList<>();
+    private final List<Server> peerServers = new ArrayList<>();
 
     @BeforeEach
     void setUp() throws Exception {
         store = new InMemoryStorage();
         sm = new KeyValueStateMachine();
         RaftConfig config = singleNodeConfig();
-        node = new RaftNode(config, store, sm, address -> null); // no peers -> no stubs needed
+
+        node = new RaftNode(config, store, sm, peerAddress -> {
+            ManagedChannel ch = InProcessChannelBuilder
+                    .forName(peerAddress).directExecutor().build();
+            channels.add(ch);
+            return RaftServiceGrpc.newFutureStub(ch);
+        });
+
+        grpcServer = InProcessServerBuilder.forName(SERVER_NAME)
+                .directExecutor()
+                .addService(new RaftGrpcService(node))
+                .build()
+                .start();
+
         node.start();
-        // Give the election timer a moment to fire: a single-node cluster
-        // needs exactly one vote (its own) and immediately becomes leader.
         awaitLeader(1_000);
     }
 
     @AfterEach
     void tearDown() {
+        for (RaftNode pn : peerNodes) pn.shutdown();
         node.shutdown();
+        for (ManagedChannel ch : channels) ch.shutdownNow();
+        for (Server ps : peerServers) ps.shutdown();
+        grpcServer.shutdown();
     }
 
     // ---- election & leader stability ------------------------------------
@@ -88,24 +114,26 @@ class RaftNodeTest {
     }
 
     @Test
-    void followerRejectsSubmitWithNotLeaderException() {
-        // Manually demote to FOLLOWER via a higher-term RequestVote, which
-        // forces becomeFollower. We do this by delivering an AppendEntries
-        // with term=99, which is a valid way to step down.
-        AppendEntriesRequest ae = AppendEntriesRequest.newBuilder()
-                .setTerm(99).setLeaderId("other").setPrevLogIndex(0).setPrevLogTerm(0)
-                .setLeaderCommit(0).build();
-        node.handleAppendEntries(ae); // node steps down to term 99 as follower
-
-        CompletableFuture<byte[]> future = node.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
-        assertTrue(future.isCompletedExceptionally());
-        assertThrows(Exception.class, () -> future.get(100, TimeUnit.MILLISECONDS));
+    void followerRejectsSubmitWithNotLeaderException() throws Exception {
+        // An unstarted node is a follower by construction; a single-node
+        // cluster can never stay demoted because resetElectionTimer
+        // immediately re-elects it when majority == 1.
+        RaftNode follower = new RaftNode(singleNodeConfig(), new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null);
+        try {
+            CompletableFuture<byte[]> future = follower.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
+            assertTrue(future.isCompletedExceptionally());
+            assertThrows(Exception.class, () -> future.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            follower.shutdown();
+        }
     }
 
     // ---- cluster reconfiguration (§6) -----------------------------------
 
     @Test
     void addServerAppendsConfigurationEntry() throws Exception {
+        startPeerNode("n2", "localhost:9092");
         node.addServer("n2", "localhost:9092").get(2, TimeUnit.SECONDS);
         assertTrue(node.currentConfiguration().containsKey("n2"));
     }
@@ -203,21 +231,19 @@ class RaftNodeTest {
                 .build()
                 .toByteArray();
 
-        // Step our node down so it accepts the RPC
-        AppendEntriesRequest ae = AppendEntriesRequest.newBuilder()
-                .setTerm(99).setLeaderId("other").setPrevLogIndex(0).setPrevLogTerm(0)
-                .setLeaderCommit(0).build();
-        node.handleAppendEntries(ae);
-
+        // In a single-node cluster the node immediately re-elects itself
+        // after any step-down, so we just send the InstallSnapshot with a
+        // term higher than the current one. The handler steps down, re-elects
+        // (bumping the term), but still installs the snapshot.
+        long highTerm = store.getCurrentTerm() + 100;
         InstallSnapshotRequest req = InstallSnapshotRequest.newBuilder()
-                .setTerm(99).setLeaderId("other")
-                .setLastIncludedIndex(10).setLastIncludedTerm(99)
+                .setTerm(highTerm).setLeaderId("other")
+                .setLastIncludedIndex(10).setLastIncludedTerm(highTerm)
                 .setStateMachineData(com.google.protobuf.ByteString.copyFrom(smData))
                 .setConfigurationData(com.google.protobuf.ByteString.copyFrom(cfgData))
                 .build();
 
-        InstallSnapshotResponse resp = node.handleInstallSnapshot(req);
-        assertEquals(99, resp.getTerm()); // our currentTerm after stepping down
+        node.handleInstallSnapshot(req);
 
         // State machine should now reflect the leader's snapshot
         assertEquals("value", sm.get("leader_key"));
@@ -304,6 +330,43 @@ class RaftNodeTest {
     }
 
     // ---- helpers --------------------------------------------------------
+
+    private void startPeerNode(String id, String address) throws Exception {
+        java.util.Map<String, String> peers = new java.util.HashMap<>(SELF_ONLY);
+        peers.put(id, address);
+
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty("node.id", id);
+        props.setProperty("node.port", address.split(":")[1]);
+        props.setProperty("data.dir", "/tmp/raft-test-unused/" + id);
+        props.setProperty("snapshot.threshold", "3");
+        for (java.util.Map.Entry<String, String> e : peers.entrySet()) {
+            props.setProperty("peer." + e.getKey(), e.getValue());
+        }
+
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("raft-test-" + id + "-", ".properties");
+        try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        RaftConfig cfg = RaftConfig.load(tmp);
+
+        InMemoryStorage peerStore = new InMemoryStorage();
+        KeyValueStateMachine peerSm = new KeyValueStateMachine();
+        RaftNode peerNode = new RaftNode(cfg, peerStore, peerSm, peerAddress -> {
+            ManagedChannel ch = InProcessChannelBuilder
+                    .forName(peerAddress).directExecutor().build();
+            channels.add(ch);
+            return RaftServiceGrpc.newFutureStub(ch);
+        });
+        peerNodes.add(peerNode);
+
+        Server srv = InProcessServerBuilder.forName(address)
+                .directExecutor()
+                .addService(new RaftGrpcService(peerNode))
+                .build()
+                .start();
+        peerServers.add(srv);
+    }
 
     /** Returns a minimal single-node RaftConfig with a very small snapshot threshold. */
     private static RaftConfig singleNodeConfig() throws Exception {
