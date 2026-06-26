@@ -6,6 +6,8 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
+import com.fbtberger.raft.proto.PreVoteRequest;
+import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.fbtberger.raft.transport.GrpcTransport;
@@ -351,6 +353,193 @@ class RaftNodeTest {
                 .setLeaderCommit(0).build();
         AppendEntriesResponse resp = node.handleAppendEntries(req);
         assertFalse(resp.getSuccess());
+    }
+
+    // ---- AppendEntries edge cases -----------------------------------------
+
+    @Test
+    void appendEntriesFromHigherTermCausesStepDown() throws Exception {
+        // Use a multi-node config so the node stays as follower after step-down
+        InMemoryStorage followerStore = new InMemoryStorage();
+        RaftNode follower = new RaftNode(multiNodeConfig("ae1"), followerStore,
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            long higherTerm = 10;
+            AppendEntriesRequest req = AppendEntriesRequest.newBuilder()
+                    .setTerm(higherTerm).setLeaderId("other")
+                    .setPrevLogIndex(0).setPrevLogTerm(0)
+                    .setLeaderCommit(0).build();
+            AppendEntriesResponse resp = follower.handleAppendEntries(req);
+            assertTrue(resp.getSuccess());
+            assertEquals(higherTerm, followerStore.getCurrentTerm());
+            assertEquals(ServerRole.FOLLOWER, follower.role());
+        } finally {
+            follower.shutdown();
+        }
+    }
+
+    @Test
+    void appendEntriesAdvancesFollowerCommitIndex() throws Exception {
+        InMemoryStorage followerStore = new InMemoryStorage();
+        RaftNode follower = new RaftNode(multiNodeConfig("ae2"), followerStore,
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            LogEntry entry = LogEntry.newBuilder().setIndex(1).setTerm(1)
+                    .setCommand(com.google.protobuf.ByteString.copyFromUtf8("SET a 1")).build();
+            AppendEntriesRequest appendReq = AppendEntriesRequest.newBuilder()
+                    .setTerm(1).setLeaderId("leader")
+                    .setPrevLogIndex(0).setPrevLogTerm(0)
+                    .addEntries(entry).setLeaderCommit(1).build();
+            AppendEntriesResponse resp = follower.handleAppendEntries(appendReq);
+            assertTrue(resp.getSuccess());
+        } finally {
+            follower.shutdown();
+        }
+    }
+
+    @Test
+    void appendEntriesTruncatesConflictingEntries() throws Exception {
+        InMemoryStorage followerStore = new InMemoryStorage();
+        KeyValueStateMachine followerSm = new KeyValueStateMachine();
+        RaftNode follower = new RaftNode(multiNodeConfig("ae3"), followerStore,
+                followerSm, addr -> null, RaftMetrics.noop());
+        try {
+            // Append an entry at index 1 with term 1
+            LogEntry original = LogEntry.newBuilder().setIndex(1).setTerm(1)
+                    .setCommand(com.google.protobuf.ByteString.copyFromUtf8("SET a old")).build();
+            follower.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                    .setTerm(1).setLeaderId("leader")
+                    .setPrevLogIndex(0).setPrevLogTerm(0)
+                    .addEntries(original).setLeaderCommit(0).build());
+
+            // Now send a conflicting entry at index 1 with term 2
+            LogEntry conflict = LogEntry.newBuilder().setIndex(1).setTerm(2)
+                    .setCommand(com.google.protobuf.ByteString.copyFromUtf8("SET a new")).build();
+            AppendEntriesResponse resp = follower.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                    .setTerm(2).setLeaderId("leader")
+                    .setPrevLogIndex(0).setPrevLogTerm(0)
+                    .addEntries(conflict).setLeaderCommit(0).build());
+            assertTrue(resp.getSuccess());
+            assertEquals(2, followerStore.getLogEntry(1).getTerm());
+        } finally {
+            follower.shutdown();
+        }
+    }
+
+    // ---- PreVote (§4.2.3) -------------------------------------------------
+
+    @Test
+    void preVoteGrantedWhenNoRecentLeaderContact() throws Exception {
+        RaftNode follower = new RaftNode(multiNodeConfig("pv1"), new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            Thread.sleep(150 /* ELECTION_TIMEOUT_MIN_MS */ + 10);
+            PreVoteRequest req = PreVoteRequest.newBuilder()
+                    .setTerm(2).setCandidateId("other")
+                    .setLastLogIndex(0).setLastLogTerm(0).build();
+            PreVoteResponse resp = follower.handlePreVote(req);
+            assertTrue(resp.getVoteGranted());
+        } finally {
+            follower.shutdown();
+        }
+    }
+
+    @Test
+    void preVoteDeniedWhenLeaderIsActive() throws Exception {
+        long term = store.getCurrentTerm();
+        node.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(term).setLeaderId("n1")
+                .setPrevLogIndex(0).setPrevLogTerm(0)
+                .setLeaderCommit(0).build());
+
+        PreVoteRequest req = PreVoteRequest.newBuilder()
+                .setTerm(term + 1).setCandidateId("intruder")
+                .setLastLogIndex(100).setLastLogTerm(100).build();
+        PreVoteResponse resp = node.handlePreVote(req);
+        assertFalse(resp.getVoteGranted());
+    }
+
+    @Test
+    void preVoteDeniedForStaleTerm() {
+        PreVoteRequest req = PreVoteRequest.newBuilder()
+                .setTerm(0).setCandidateId("old")
+                .setLastLogIndex(0).setLastLogTerm(0).build();
+        PreVoteResponse resp = node.handlePreVote(req);
+        assertFalse(resp.getVoteGranted());
+    }
+
+    @Test
+    void preVoteDeniedWhenCandidateLogIsStale() throws Exception {
+        node.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        Thread.sleep(150 /* ELECTION_TIMEOUT_MIN_MS */ + 10);
+
+        PreVoteRequest req = PreVoteRequest.newBuilder()
+                .setTerm(store.getCurrentTerm() + 1).setCandidateId("behind")
+                .setLastLogIndex(0).setLastLogTerm(0).build();
+        PreVoteResponse resp = node.handlePreVote(req);
+        assertFalse(resp.getVoteGranted());
+    }
+
+    // ---- snapshot transfer edge cases ------------------------------------
+
+    @Test
+    void handleInstallSnapshotWithUnexpectedOffsetResetsBuffer() throws Exception {
+        RaftNode receiver = new RaftNode(singleNodeConfig(), new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            InstallSnapshotRequest badOffset = InstallSnapshotRequest.newBuilder()
+                    .setTerm(1).setLeaderId("leader")
+                    .setLastIncludedIndex(10).setLastIncludedTerm(1)
+                    .setOffset(999)
+                    .setData(com.google.protobuf.ByteString.copyFromUtf8("garbage"))
+                    .setDone(false).build();
+            InstallSnapshotResponse resp = receiver.handleInstallSnapshot(badOffset);
+            assertNotNull(resp);
+            assertEquals(0, receiver.snapshotIndex());
+        } finally {
+            receiver.shutdown();
+        }
+    }
+
+    // ---- config edge cases -----------------------------------------------
+
+    @Test
+    void configDefaultsForOptionalProperties() throws Exception {
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty("node.id", "n1");
+        props.setProperty("node.port", "9091");
+        props.setProperty("data.dir", "/tmp/test");
+        props.setProperty("peer.n1", "localhost:9091");
+
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("raft-cfg-", ".properties");
+        try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        RaftConfig cfg = RaftConfig.load(tmp);
+        assertEquals(0, cfg.metricsPort());
+        assertEquals(1_048_576, cfg.snapshotChunkSize());
+        assertEquals(100, cfg.snapshotThreshold());
+    }
+
+    @Test
+    void configParsesAllOptionalProperties() throws Exception {
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty("node.id", "n1");
+        props.setProperty("node.port", "9091");
+        props.setProperty("data.dir", "/tmp/test");
+        props.setProperty("peer.n1", "localhost:9091");
+        props.setProperty("metrics.port", "8080");
+        props.setProperty("snapshot.chunk.size", "512");
+        props.setProperty("snapshot.threshold", "50");
+
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("raft-cfg-", ".properties");
+        try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        RaftConfig cfg = RaftConfig.load(tmp);
+        assertEquals(8080, cfg.metricsPort());
+        assertEquals(512, cfg.snapshotChunkSize());
+        assertEquals(50, cfg.snapshotThreshold());
     }
 
     // ---- helpers --------------------------------------------------------

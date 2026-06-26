@@ -1,5 +1,6 @@
 plugins {
     java
+    jacoco
     id("com.google.protobuf") version "0.9.4"
     id("com.github.johnrengelman.shadow") version "8.1.1"
 }
@@ -74,6 +75,15 @@ protobuf {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        csv.required.set(true)
+        xml.required.set(true)
+    }
 }
 
 tasks.jar {
