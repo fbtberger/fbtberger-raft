@@ -1,0 +1,142 @@
+@startuml
+skinparam defaultFontSize 10
+skinparam classAttributeIconSize 0
+hide empty members
+
+title Core Class Diagram
+
+interface "RaftRpcHandler" as Handler {
+    +handleRequestVote(req): RequestVoteResponse
+    +handleAppendEntries(req): AppendEntriesResponse
+    +handleInstallSnapshot(req): InstallSnapshotResponse
+    +handlePreVote(req): PreVoteResponse
+}
+
+interface "RaftTransport" as Transport {
+    +requestVote(req): CompletableFuture
+    +appendEntries(req): CompletableFuture
+    +installSnapshot(req): CompletableFuture
+    +preVote(req): CompletableFuture
+    +close()
+}
+
+interface "RaftTransportFactory" as Factory {
+    +connect(address): RaftTransport
+}
+
+interface "RaftTransportServer" as TServer {
+    +start()
+    +close()
+}
+
+interface "RaftStorage" as Storage {
+    +getCurrentTerm(): long
+    +getVotedFor(): String
+    +setTermAndVote(term, votedFor)
+    +appendEntries(entries)
+    +appendEntriesDeferSync(entries): CompletableFuture
+    +truncateFrom(index)
+    +getLogEntry(index): LogEntry
+    +getLastLogIndex(): long
+    +saveSnapshotAndCompact(snapshot)
+    +getSnapshot(): Snapshot
+}
+
+interface "StateMachine" as SM {
+    +apply(command): byte[]
+    +takeSnapshot(): byte[]
+    +restoreSnapshot(data)
+}
+
+class "RaftNode" as Node {
+    -role: ServerRole
+    -currentLeaderId: String
+    -commitIndex: AtomicLong
+    -lastApplied: AtomicLong
+    -leaderDiskMatchIndex: AtomicLong
+    -lastLeaderContactMs: long
+    -snapshotInProgress: boolean
+    +start()
+    +shutdown()
+    +submitCommand(cmd): CompletableFuture
+    +addServer(id, addr): CompletableFuture
+    +removeServer(id): CompletableFuture
+    +snapshotNow()
+    -startElection()
+    -startRealElection(term)
+    -becomeLeaderLocked()
+    -becomeFollowerLocked(term)
+    -replicateTo(peerId)
+    -sendInstallSnapshot(peerId, transport)
+    -advanceCommitIndex()
+    -takeSnapshotAsync()
+    -onLeaderDiskSyncComplete(idx, term)
+}
+
+class "RaftConfig" as Config {
+    +selfId(): String
+    +selfPort(): int
+    +dataDir(): Path
+    +peerAddresses(): Map
+    +snapshotThreshold(): int
+    +snapshotChunkSize(): int
+    +metricsPort(): int
+    +majority(): int
+    {static} +load(path): RaftConfig
+}
+
+class "RaftMetrics" as Metrics {
+    +electionStarted()
+    +electionWon()
+    +voteGranted()
+    +stepDown()
+    +entryApplied()
+    +snapshotTaken()
+    +snapshotInstalled()
+    +clientRejected()
+    +replicationSent(count)
+    +replicationSuccess()
+    +replicationFailure()
+    +snapshotChunkSent()
+    +snapshotChunkReceived()
+    +appendEntriesTimer(): Timer
+    +requestVoteTimer(): Timer
+    +clientSubmitTimer(): Timer
+    {static} +noop(): RaftMetrics
+}
+
+enum "ServerRole" as Role {
+    FOLLOWER
+    CANDIDATE
+    LEADER
+}
+
+class "BerkeleyDbStorage" as BDB
+class "InMemoryStorage" as IMS
+class "KeyValueStateMachine" as KV
+class "GrpcTransport" as GT
+class "GrpcTransportFactory" as GTF
+class "GrpcTransportServer" as GTS
+class "NettyTransport" as NT
+class "NettyTransportFactory" as NTF
+class "NettyTransportServer" as NTS
+
+Node .up.|> Handler
+Node --> Config
+Node --> Storage
+Node --> SM
+Node --> Factory
+Node --> Metrics
+Node --> Role
+
+Storage <|.. BDB
+Storage <|.. IMS
+SM <|.. KV
+Transport <|.. GT
+Transport <|.. NT
+Factory <|.. GTF
+Factory <|.. NTF
+TServer <|.. GTS
+TServer <|.. NTS
+
+@enduml

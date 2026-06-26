@@ -1,0 +1,34 @@
+@startuml
+title Chunked Snapshot Transfer (§7 / §5.1 COW)
+skinparam defaultFontSize 10
+
+participant "Leader" as L
+participant "Follower" as F
+
+note over L: Follower's nextIndex <= snapshotIndex\nNeed to send snapshot instead of AppendEntries
+
+L -> L: Load snapshot\nPack SM data + config data\ninto single byte stream
+L -> L: Create SnapshotTransfer\n(tracks offset, inFlight)
+
+== Chunk 1 ==
+L -> F: InstallSnapshot(\n  lastIncludedIndex=100,\n  offset=0,\n  data=[chunk1],\n  done=false)
+
+note over F: Buffer chunk at offset 0
+F --> L: InstallSnapshotResponse(term=T)
+note over L: Advance transfer.nextOffset
+
+== Chunk 2 ==
+L -> F: InstallSnapshot(\n  offset=1048576,\n  data=[chunk2],\n  done=false)
+
+note over F: Append chunk to buffer
+F --> L: InstallSnapshotResponse(term=T)
+
+== Final Chunk ==
+L -> F: InstallSnapshot(\n  offset=2097152,\n  data=[chunk3],\n  done=true)
+
+note over F: Reassemble full snapshot\nUnpack SM + config data\nsaveSnapshotAndCompact\nrestoreSnapshot\nRecompute configuration
+F --> L: InstallSnapshotResponse(term=T)
+
+note over L: matchIndex[F] = 100\nnextIndex[F] = 101\nResume normal AppendEntries
+
+@enduml

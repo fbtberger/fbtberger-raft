@@ -1,0 +1,53 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam defaultFontSize 11
+
+title System Architecture Overview
+
+package "Raft Node Process" {
+    [RaftServer\n(main + CLI)] as Server
+    [RaftNode\n(consensus algorithm)] as Node
+    [StateMachine\n(KeyValueStateMachine)] as SM
+    [RaftStorage\n(BerkeleyDbStorage)] as Storage
+    [RaftMetrics\n(Micrometer/Prometheus)] as Metrics
+
+    package "Transport Layer" {
+        [RaftTransportServer] as TServer
+        [RaftTransport] as TClient
+
+        package "gRPC Implementation" {
+            [GrpcTransportServer] as GrpcS
+            [GrpcTransport] as GrpcC
+        }
+        package "Netty Implementation" {
+            [NettyTransportServer] as NettyS
+            [NettyTransport] as NettyC
+        }
+
+        TServer <|.. GrpcS
+        TServer <|.. NettyS
+        TClient <|.. GrpcC
+        TClient <|.. NettyC
+    }
+
+    [RaftClientGrpcService\n(client-facing RPCs)] as ClientSvc
+
+    Server --> Node : start / shutdown
+    Node --> SM : apply / takeSnapshot
+    Node --> Storage : appendEntries / setTermAndVote
+    Node --> TClient : requestVote / appendEntries\ninstallSnapshot / preVote
+    Node --> Metrics : counters / timers / gauges
+    TServer --> Node : handleRequestVote\nhandleAppendEntries\nhandleInstallSnapshot\nhandlePreVote
+    ClientSvc --> Node : submitCommand\naddServer / removeServer
+}
+
+cloud "Other Raft Nodes" as Peers
+actor "Client" as Client
+database "Prometheus" as Prom
+
+TClient --> Peers : RPC
+TServer <-- Peers : RPC
+ClientSvc <-- Client : gRPC
+Metrics --> Prom : /metrics HTTP
+
+@enduml

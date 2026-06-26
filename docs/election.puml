@@ -1,0 +1,36 @@
+@startuml
+title Leader Election with PreVote (§4.2.3 / §5.2)
+skinparam defaultFontSize 10
+
+participant "Candidate\n(Node A)" as A
+participant "Follower\n(Node B)" as B
+participant "Follower\n(Node C)" as C
+
+note over A: Election timeout fires\n(no heartbeat received)
+== PreVote Phase (§4.2.3) ==
+A -> A: Check: not removed from config
+A -> B: PreVoteRequest(term=T+1, lastLogIndex, lastLogTerm)
+A -> C: PreVoteRequest(term=T+1, lastLogIndex, lastLogTerm)
+
+note over B: Grant if:\n1. Log is up-to-date\n2. No recent leader heartbeat
+B --> A: PreVoteResponse(voteGranted=true)
+C --> A: PreVoteResponse(voteGranted=true)
+
+note over A: PreVote majority received\nProceed to real election
+
+== Real Election (§5.2) ==
+A -> A: Increment term to T+1\nVote for self\nBecome CANDIDATE
+
+A -> B: RequestVoteRequest(term=T+1, candidateId=A, ...)
+A -> C: RequestVoteRequest(term=T+1, candidateId=A, ...)
+
+B --> A: RequestVoteResponse(voteGranted=true)
+C --> A: RequestVoteResponse(voteGranted=true)
+
+note over A: Majority votes received!\nBecome LEADER
+
+== Leader Established ==
+A -> A: Append no-op entry (§8)\nInit nextIndex/matchIndex
+A -> B: AppendEntries (heartbeat + no-op)
+A -> C: AppendEntries (heartbeat + no-op)
+@enduml

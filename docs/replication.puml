@@ -1,0 +1,39 @@
+@startuml
+title Log Replication Pipeline (§5.3 / §10.2.1 / §10.2.2)
+skinparam defaultFontSize 10
+
+participant "Client" as Cl
+participant "Leader" as L
+participant "Leader\nDisk" as LD
+participant "Follower B" as B
+participant "Follower C" as C
+
+Cl -> L: submitCommand(cmd)
+activate L
+
+L -> L: Append entry to log\n(COMMIT_WRITE_NO_SYNC)
+L -> L: Register pending future
+
+== Parallel: Disk Sync + Replication (§10.2.1) ==
+
+L ->> LD: flushLog(true)\n[background thread]
+activate LD
+
+L -> B: AppendEntries(entries=[entry],\nleaderCommit=N)
+note right: §10.2.2: nextIndex\nadvanced optimistically\n(pipelining)
+L -> C: AppendEntries(entries=[entry],\nleaderCommit=N)
+
+B --> L: AppendEntriesResponse(success=true)
+note over L: matchIndex[B] updated
+
+LD --> L: sync complete
+deactivate LD
+note over L: leaderDiskMatchIndex\nupdated
+
+C --> L: AppendEntriesResponse(success=true)
+note over L: matchIndex[C] updated\nMajority reached!
+
+L -> L: advanceCommitIndex\napplyCommittedEntries
+L --> Cl: result
+deactivate L
+@enduml
