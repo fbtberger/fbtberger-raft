@@ -134,6 +134,17 @@ class ThreeNodeClusterTest {
         fail("No leader elected within " + timeoutMs + " ms");
     }
 
+    private void awaitLeaderReady(long timeoutMs) throws InterruptedException {
+        awaitCondition(() -> {
+            try {
+                leader().submitCommand("NOOP".getBytes()).get(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }, timeoutMs);
+    }
+
     private void awaitCondition(BooleanSupplier cond, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {
@@ -253,6 +264,7 @@ class ThreeNodeClusterTest {
         // scheduling its own election timer and disrupting the cluster with
         // spurious term inflation.
         startNodes(allPeers, 5);
+        awaitLeaderReady(2_000);
 
         leader().addServer("n4", "localhost:9094").get(2, TimeUnit.SECONDS);
 
@@ -265,8 +277,8 @@ class ThreeNodeClusterTest {
 
     @Test
     void removeServerShrinksCluster() throws Exception {
+        awaitLeaderReady(2_000);
         String lid = leaderId();
-        // Remove a follower (not the leader itself)
         String follower = nodes.keySet().stream()
                 .filter(id -> !id.equals(lid)).findFirst().orElseThrow();
 

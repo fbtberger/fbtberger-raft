@@ -81,6 +81,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // durably synced, so the leader can replicate to followers in
     // parallel with writing to its own disk.
     private final AtomicLong leaderDiskMatchIndex = new AtomicLong(0);
+    // §4 errata: index of the no-op appended when this leader took office.
+    // Config changes are rejected until commitIndex >= this value.
+    private volatile long leaderNoOpIndex = Long.MAX_VALUE;
 
     private final Map<Long, CompletableFuture<byte[]>> pendingClientRequests = new ConcurrentHashMap<>();
 
@@ -333,6 +336,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // older entries are actually committed yet, even though Leader
         // Completeness guarantees we already have them in our log.
         long noOpIndex = store.getLastLogIndex() + 1;
+        leaderNoOpIndex = noOpIndex;
         long leaderTerm = store.getCurrentTerm();
         LogEntry noOp = LogEntry.newBuilder()
                 .setIndex(noOpIndex)
@@ -1115,8 +1119,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
-    /** Returns a failed future if a previous configuration change hasn't committed yet, or null if it's fine to proceed. */
+    /** Returns a failed future if a config change isn't safe right now, or null if it's fine to proceed. */
     private CompletableFuture<byte[]> rejectIfConfigurationChangePending() {
+        // §4 errata: a leader must commit an entry from its own term
+        // before accepting config changes, so it knows the latest
+        // committed configuration. The no-op serves this purpose.
+        if (commitIndex.get() < leaderNoOpIndex) {
+            return failedFuture(new ConfigurationChangeException(
+                    "leader has not yet committed an entry in its current term; retry shortly"));
+        }
         if (currentConfigurationIndex > commitIndex.get()) {
             return failedFuture(new ConfigurationChangeException(
                     "a previous configuration change has not committed yet; retry once it has"));
