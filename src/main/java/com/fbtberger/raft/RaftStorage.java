@@ -2,6 +2,8 @@ package com.fbtberger.raft;
 
 import com.fbtberger.raft.proto.LogEntry;
 
+import java.util.concurrent.CompletableFuture;
+
 /**
  * Abstraction over the durable state every Raft server must keep: currentTerm,
  * votedFor, and the log (Figure 2). {@link RaftNode} talks only to this interface,
@@ -47,6 +49,19 @@ public interface RaftStorage extends AutoCloseable {
      * passed in always extend the log rather than overwrite it in place.
      */
     void appendEntries(Iterable<LogEntry> entries);
+
+    /**
+     * §10.2.1: appends entries so they are immediately readable (for
+     * replication) but defers the durable fsync. Returns a future that
+     * completes once the data is safely on disk. Leaders use this to
+     * write to their own disk in parallel with replicating to followers.
+     * The default implementation falls back to synchronous
+     * {@link #appendEntries}.
+     */
+    default CompletableFuture<Void> appendEntriesDeferSync(Iterable<LogEntry> entries) {
+        appendEntries(entries);
+        return CompletableFuture.completedFuture(null);
+    }
 
     /**
      * Deletes the entry at fromIndexInclusive and everything after it. This is how

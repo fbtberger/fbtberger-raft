@@ -15,6 +15,9 @@ import com.sleepycat.je.Transaction;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * {@link RaftStorage} backed by Berkeley DB Java Edition -- the durable
@@ -40,6 +43,7 @@ public final class BerkeleyDbStorage implements RaftStorage {
     private final Environment env;
     private final Database metaDb; // currentTerm, votedFor, snapshot metadata + payload
     private final Database logDb;  // index -> LogEntry
+    private final ExecutorService syncExecutor;
 
     // Cached in memory and recomputed from disk at startup, so it always
     // reflects what's actually durable.
@@ -68,6 +72,11 @@ public final class BerkeleyDbStorage implements RaftStorage {
 
         this.metaDb = env.openDatabase(null, "raftMeta", dbConfig);
         this.logDb = env.openDatabase(null, "raftLog", dbConfig);
+        this.syncExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "bdb-sync");
+            t.setDaemon(true);
+            return t;
+        });
 
         recoverSnapshotBounds();
         recoverCachedLogBounds();
@@ -166,7 +175,25 @@ public final class BerkeleyDbStorage implements RaftStorage {
      */
     @Override
     public synchronized void appendEntries(Iterable<LogEntry> entries) {
-        Transaction txn = env.beginTransaction(null, null);
+        appendWithDurability(entries, null);
+    }
+
+    /**
+     * §10.2.1: appends entries with {@link Durability#COMMIT_WRITE_NO_SYNC}
+     * so they are immediately readable for replication, then syncs to disk
+     * on a background thread. The returned future completes once the data
+     * is durable.
+     */
+    @Override
+    public synchronized CompletableFuture<Void> appendEntriesDeferSync(Iterable<LogEntry> entries) {
+        appendWithDurability(entries,
+                new com.sleepycat.je.TransactionConfig()
+                        .setDurability(Durability.COMMIT_WRITE_NO_SYNC));
+        return CompletableFuture.runAsync(() -> env.flushLog(true), syncExecutor);
+    }
+
+    private void appendWithDurability(Iterable<LogEntry> entries, com.sleepycat.je.TransactionConfig txnConfig) {
+        Transaction txn = env.beginTransaction(null, txnConfig);
         try {
             long newLastIndex = lastLogIndex;
             long newLastTerm = lastLogTerm;
@@ -320,6 +347,7 @@ public final class BerkeleyDbStorage implements RaftStorage {
 
     @Override
     public void close() {
+        syncExecutor.shutdown();
         logDb.close();
         metaDb.close();
         env.close();

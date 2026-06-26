@@ -73,6 +73,11 @@ public final class RaftNode {
     private final Map<String, Long> nextIndex = new ConcurrentHashMap<>();
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
 
+    // §10.2.1: tracks how far the leader's own disk writes have been
+    // durably synced, so the leader can replicate to followers in
+    // parallel with writing to its own disk.
+    private final AtomicLong leaderDiskMatchIndex = new AtomicLong(0);
+
     private final Map<Long, CompletableFuture<byte[]>> pendingClientRequests = new ConcurrentHashMap<>();
 
     // Leader-side: in-progress chunked snapshot transfers per peer (§7).
@@ -280,17 +285,23 @@ public final class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTask != null) heartbeatTask.cancel(false);
 
+        // §10.2.1: everything already in our log was written durably as a
+        // follower/candidate, so our own disk match starts there.
+        leaderDiskMatchIndex.set(store.getLastLogIndex());
+
         // §8: commit a blank no-op entry for our new term right away. Until
         // an entry from our own term has committed, we can't be sure which
         // older entries are actually committed yet, even though Leader
         // Completeness guarantees we already have them in our log.
         long noOpIndex = store.getLastLogIndex() + 1;
+        long leaderTerm = store.getCurrentTerm();
         LogEntry noOp = LogEntry.newBuilder()
                 .setIndex(noOpIndex)
-                .setTerm(store.getCurrentTerm())
+                .setTerm(leaderTerm)
                 .setCommand(ByteString.EMPTY)
                 .build();
-        store.appendEntries(List.of(noOp));
+        store.appendEntriesDeferSync(List.of(noOp)).thenRun(() ->
+                onLeaderDiskSyncComplete(noOpIndex, leaderTerm));
 
         long lastLogIndex = store.getLastLogIndex();
         for (String peerId : peerStubs.keySet()) {
@@ -765,6 +776,24 @@ public final class RaftNode {
      * {@link #currentConfiguration} every time, since a reconfiguration can
      * change it while entries are still being committed (§6).
      */
+    /**
+     * §10.2.1: called (possibly from the storage sync thread) when the
+     * leader's own disk write has been durably fsynced. Advances the
+     * leader's match index and tries to commit.
+     */
+    private void onLeaderDiskSyncComplete(long syncedIndex, long expectedTerm) {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER || store.getCurrentTerm() != expectedTerm) {
+                return;
+            }
+            leaderDiskMatchIndex.updateAndGet(prev -> Math.max(prev, syncedIndex));
+            advanceCommitIndex();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void advanceCommitIndex() {
         long currentTerm = store.getCurrentTerm();
         long lastLogIndex = store.getLastLogIndex();
@@ -774,7 +803,9 @@ public final class RaftNode {
             if (entry == null || entry.getTerm() != currentTerm) {
                 continue;
             }
-            int matches = 1; // the leader's own copy
+            // §10.2.1: count the leader's own copy only when it has been
+            // durably written to disk, rather than assuming it immediately.
+            int matches = leaderDiskMatchIndex.get() >= n ? 1 : 0;
             for (long m : matchIndex.values()) {
                 if (m >= n) matches++;
             }
@@ -987,17 +1018,24 @@ public final class RaftNode {
     /** Appends entryBuilder as the next log entry and replicates it to every current peer. Caller must hold {@code lock}. */
     private CompletableFuture<byte[]> appendAndReplicateLocked(LogEntry.Builder entryBuilder) {
         long index = store.getLastLogIndex() + 1;
-        LogEntry entry = entryBuilder.setIndex(index).setTerm(store.getCurrentTerm()).build();
-        store.appendEntries(List.of(entry));
+        long appendTerm = store.getCurrentTerm();
+        LogEntry entry = entryBuilder.setIndex(index).setTerm(appendTerm).build();
+
+        CompletableFuture<byte[]> future = new CompletableFuture<>();
+        pendingClientRequests.put(index, future);
+
+        // §10.2.1: write the entry so it's readable for replication but
+        // defer the fsync — replication starts in parallel with the disk
+        // sync, and leaderDiskMatchIndex advances when the sync completes.
+        store.appendEntriesDeferSync(List.of(entry)).thenRun(() ->
+                onLeaderDiskSyncComplete(index, appendTerm));
+
         if (entry.hasConfiguration()) {
             // §6: the latest configuration in our log governs immediately,
             // even before it commits -- including which peers we replicate
             // this very entry to below.
             applyConfigurationLocked(entry.getIndex(), entry.getConfiguration());
         }
-
-        CompletableFuture<byte[]> future = new CompletableFuture<>();
-        pendingClientRequests.put(index, future);
 
         for (String peerId : peerStubs.keySet()) {
             replicateTo(peerId);
