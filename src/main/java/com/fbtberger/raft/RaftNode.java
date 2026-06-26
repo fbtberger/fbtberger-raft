@@ -52,6 +52,10 @@ public final class RaftNode {
     private static final int HEARTBEAT_INTERVAL_MS = 50;
     private static final int ELECTION_TIMEOUT_MIN_MS = 150;
     private static final int ELECTION_TIMEOUT_MAX_MS = 300;
+    // §10.2.2: cap each AppendEntries batch so heartbeats aren't starved.
+    private static final int MAX_BATCH_BYTES = 1_048_576; // 1 MB
+    // §10.2.2: maximum pipelined AppendEntries RPCs in flight per peer.
+    private static final int MAX_INFLIGHT_APPENDS = 2;
 
     private final RaftConfig config;
     private final RaftStorage store;
@@ -72,6 +76,8 @@ public final class RaftNode {
     // Volatile state on leaders, reinitialized after every election (Figure 2).
     private final Map<String, Long> nextIndex = new ConcurrentHashMap<>();
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
+    // §10.2.2: in-flight AppendEntries RPCs per peer for pipelining.
+    private final Map<String, Integer> peerInflight = new ConcurrentHashMap<>();
 
     // §10.2.1: tracks how far the leader's own disk writes have been
     // durably synced, so the leader can replicate to followers in
@@ -586,31 +592,38 @@ public final class RaftNode {
     private void replicateTo(String peerId) {
         RaftServiceGrpc.RaftServiceFutureStub stub = peerStubs.get(peerId);
         if (stub == null) {
-            return; // removed from the configuration since this round started
+            return;
         }
         long peerNextIndex = nextIndex.getOrDefault(peerId, 1L);
         long snapshotIndex = store.getSnapshotIndex();
         if (peerNextIndex <= snapshotIndex) {
-            // This follower needs entries we've already compacted out of
-            // our own log (§7) -- a follower that's fallen far behind, or a
-            // brand-new member added via §6 that's never had anything
-            // replicated to it. AppendEntries can't help here; send it our
-            // snapshot instead.
             sendInstallSnapshot(peerId, stub);
             return;
         }
+
+        // §10.2.2: skip if we've already hit the pipelining limit.
+        int inflight = peerInflight.getOrDefault(peerId, 0);
+        if (inflight >= MAX_INFLIGHT_APPENDS) {
+            return;
+        }
+
         long currentTerm = store.getCurrentTerm();
         long prevLogIndex = peerNextIndex - 1;
-        // getTermAt (rather than getLogEntry(...).getTerm()) so this still
-        // resolves correctly when prevLogIndex lands exactly on the
-        // snapshot boundary, where the entry itself no longer physically
-        // exists in the log.
         long prevLogTerm = Math.max(0, store.getTermAt(prevLogIndex));
 
+        // §10.2.2: collect entries up to MAX_BATCH_BYTES so a single
+        // large batch doesn't starve heartbeats.
         long lastLogIndex = store.getLastLogIndex();
         List<LogEntry> entries = new ArrayList<>();
+        int batchBytes = 0;
         for (long i = peerNextIndex; i <= lastLogIndex; i++) {
-            entries.add(store.getLogEntry(i));
+            LogEntry entry = store.getLogEntry(i);
+            int entrySize = entry.getSerializedSize();
+            if (!entries.isEmpty() && batchBytes + entrySize > MAX_BATCH_BYTES) {
+                break;
+            }
+            entries.add(entry);
+            batchBytes += entrySize;
         }
         if (!entries.isEmpty()) {
             metrics.replicationSent(entries.size());
@@ -627,6 +640,14 @@ public final class RaftNode {
 
         long lastSentIndex = entries.isEmpty() ? prevLogIndex : entries.get(entries.size() - 1).getIndex();
 
+        // §10.2.2: optimistically advance nextIndex for pipelining so
+        // the next replicateTo call can send subsequent entries without
+        // waiting for this RPC's acknowledgment.
+        if (!entries.isEmpty()) {
+            nextIndex.put(peerId, lastSentIndex + 1);
+        }
+        peerInflight.merge(peerId, 1, Integer::sum);
+
         ListenableFuture<AppendEntriesResponse> future = stub.appendEntries(request);
         Futures.addCallback(future, new FutureCallback<AppendEntriesResponse>() {
             @Override
@@ -636,8 +657,14 @@ public final class RaftNode {
 
             @Override
             public void onFailure(Throwable t) {
-                // Peer unreachable; nextIndex stays put and we'll just try
-                // again on the next heartbeat tick (§5.5).
+                lock.lock();
+                try {
+                    peerInflight.merge(peerId, -1, Integer::sum);
+                    long confirmed = matchIndex.getOrDefault(peerId, 0L);
+                    nextIndex.put(peerId, Math.max(1, confirmed + 1));
+                } finally {
+                    lock.unlock();
+                }
             }
         }, MoreExecutors.directExecutor());
     }
@@ -742,24 +769,30 @@ public final class RaftNode {
     private void handleAppendEntriesResponse(String peerId, long sentTerm, long lastSentIndex, AppendEntriesResponse response) {
         lock.lock();
         try {
+            peerInflight.merge(peerId, -1, Integer::sum);
             if (response.getTerm() > store.getCurrentTerm()) {
                 becomeFollowerLocked(response.getTerm());
                 return;
             }
             if (role != ServerRole.LEADER || store.getCurrentTerm() != sentTerm) {
-                return; // no longer leading the term this request was sent under
+                return;
             }
             if (response.getSuccess()) {
                 metrics.replicationSuccess();
-                matchIndex.put(peerId, lastSentIndex);
-                nextIndex.put(peerId, lastSentIndex + 1);
+                // §10.2.2: don't regress matchIndex if an older pipelined
+                // response arrives after a newer one already succeeded.
+                long currentMatch = matchIndex.getOrDefault(peerId, 0L);
+                if (lastSentIndex > currentMatch) {
+                    matchIndex.put(peerId, lastSentIndex);
+                }
+                // nextIndex was already advanced optimistically when sent.
                 advanceCommitIndex();
             } else {
                 metrics.replicationFailure();
-                // Log mismatch: back this follower's nextIndex up by one
-                // and we'll offer it an earlier prevLogIndex next time (§5.3).
-                long current = nextIndex.getOrDefault(peerId, 1L);
-                nextIndex.put(peerId, Math.max(1, current - 1));
+                // §10.2.2: revert optimistic nextIndex to last confirmed
+                // position. The next heartbeat tick will retry from there.
+                long confirmed = matchIndex.getOrDefault(peerId, 0L);
+                nextIndex.put(peerId, Math.max(1, confirmed + 1));
             }
         } finally {
             lock.unlock();
@@ -1147,6 +1180,7 @@ public final class RaftNode {
             closeStubChannel(peerStubs.remove(peerId));
             nextIndex.remove(peerId);
             matchIndex.remove(peerId);
+            peerInflight.remove(peerId);
             snapshotTransfers.remove(peerId);
         }
     }
