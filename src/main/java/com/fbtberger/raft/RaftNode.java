@@ -739,10 +739,12 @@ public final class RaftNode {
                 return; // no longer leading the term this request was sent under
             }
             if (response.getSuccess()) {
+                metrics.replicationSuccess();
                 matchIndex.put(peerId, lastSentIndex);
                 nextIndex.put(peerId, lastSentIndex + 1);
                 advanceCommitIndex();
             } else {
+                metrics.replicationFailure();
                 // Log mismatch: back this follower's nextIndex up by one
                 // and we'll offer it an earlier prevLogIndex next time (§5.3).
                 long current = nextIndex.getOrDefault(peerId, 1L);

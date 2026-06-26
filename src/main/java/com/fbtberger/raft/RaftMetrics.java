@@ -27,6 +27,8 @@ public final class RaftMetrics {
         private final Counter replicationSent;
         private final Counter snapshotChunksSent;
         private final Counter snapshotChunksReceived;
+        private final Counter replicationSuccess;
+        private final Counter replicationFailure;
 
         private final Timer appendEntriesTimer;
         private final Timer requestVoteTimer;
@@ -59,6 +61,10 @@ public final class RaftMetrics {
                                 .tags(tags).description("Snapshot chunks sent to followers").register(registry);
                 this.snapshotChunksReceived = Counter.builder("raft.snapshot.chunk.received")
                                 .tags(tags).description("Snapshot chunks received from leader").register(registry);
+                this.replicationSuccess = Counter.builder("raft.replication.success")
+                                .tags(tags).description("Successful AppendEntries responses from followers").register(registry);
+                this.replicationFailure = Counter.builder("raft.replication.failure")
+                                .tags(tags).description("Failed AppendEntries responses (log mismatch backoff)").register(registry);
 
                 this.appendEntriesTimer = Timer.builder("raft.rpc.append.entries")
                                 .tags(tags).description("AppendEntries RPC handling time").register(registry);
@@ -139,6 +145,14 @@ public final class RaftMetrics {
 
         public void snapshotChunkReceived() {
                 snapshotChunksReceived.increment();
+        }
+
+        public void replicationSuccess() {
+                replicationSuccess.increment();
+        }
+
+        public void replicationFailure() {
+                replicationFailure.increment();
         }
 
         public Timer appendEntriesTimer() {
