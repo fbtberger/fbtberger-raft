@@ -1,5 +1,7 @@
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.transport.RpcTimeouts;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -45,9 +47,10 @@ public final class RaftConfig {
     private final int snapshotThreshold;
     private final int snapshotChunkSize;
     private final int metricsPort;
+    private final RpcTimeouts rpcTimeouts;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
-                       int snapshotThreshold, int snapshotChunkSize, int metricsPort) {
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort, RpcTimeouts rpcTimeouts) {
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
@@ -55,6 +58,7 @@ public final class RaftConfig {
         this.snapshotThreshold = snapshotThreshold;
         this.snapshotChunkSize = snapshotChunkSize;
         this.metricsPort = metricsPort;
+        this.rpcTimeouts = rpcTimeouts;
     }
 
     public static RaftConfig load(Path propertiesFile) throws IOException {
@@ -82,7 +86,8 @@ public final class RaftConfig {
         if (!peers.containsKey(selfId)) {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort);
+        RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, rpcTimeouts);
     }
 
     private static String require(Properties props, String key) {
@@ -124,4 +129,6 @@ public final class RaftConfig {
      * to 0 (disabled) if {@code metrics.port} isn't set in the .properties file.
      */
     public int metricsPort() { return metricsPort; }
+
+    public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 }

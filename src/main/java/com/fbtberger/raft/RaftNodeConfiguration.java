@@ -4,6 +4,7 @@ import com.fbtberger.raft.transport.GrpcTransportFactory;
 import com.fbtberger.raft.transport.GrpcTransportServer;
 import com.fbtberger.raft.transport.RaftTransportFactory;
 import com.fbtberger.raft.transport.RaftTransportServer;
+import com.fbtberger.raft.transport.TimeoutTransport;
 import com.sun.net.httpserver.HttpServer;
 import io.grpc.ServerBuilder;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
@@ -74,8 +75,9 @@ public class RaftNodeConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(RaftTransportFactory.class)
-    public RaftTransportFactory transportFactory() {
-        return new GrpcTransportFactory();
+    public RaftTransportFactory transportFactory(RaftConfig config) {
+        RaftTransportFactory base = new GrpcTransportFactory();
+        return address -> new TimeoutTransport(base.connect(address), config.rpcTimeouts());
     }
 
     @Bean
