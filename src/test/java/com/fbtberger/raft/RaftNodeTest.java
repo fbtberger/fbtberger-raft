@@ -236,14 +236,7 @@ class RaftNodeTest {
         // term higher than the current one. The handler steps down, re-elects
         // (bumping the term), but still installs the snapshot.
         long highTerm = store.getCurrentTerm() + 100;
-        InstallSnapshotRequest req = InstallSnapshotRequest.newBuilder()
-                .setTerm(highTerm).setLeaderId("other")
-                .setLastIncludedIndex(10).setLastIncludedTerm(highTerm)
-                .setStateMachineData(com.google.protobuf.ByteString.copyFrom(smData))
-                .setConfigurationData(com.google.protobuf.ByteString.copyFrom(cfgData))
-                .build();
-
-        node.handleInstallSnapshot(req);
+        sendFullSnapshot(node, highTerm, "other", 10, highTerm, smData, cfgData);
 
         // State machine should now reflect the leader's snapshot
         assertEquals("value", sm.get("leader_key"));
@@ -262,17 +255,49 @@ class RaftNodeTest {
         assertTrue(localSnap >= 1);
 
         // Now receive an InstallSnapshot with a smaller index -- must be ignored
-        InstallSnapshotRequest stale = InstallSnapshotRequest.newBuilder()
-                .setTerm(store.getCurrentTerm())
-                .setLeaderId("n1")
-                .setLastIncludedIndex(localSnap - 1) // strictly older
-                .setLastIncludedTerm(1)
-                .setStateMachineData(com.google.protobuf.ByteString.EMPTY)
-                .setConfigurationData(com.google.protobuf.ByteString.EMPTY)
-                .build();
-
-        node.handleInstallSnapshot(stale);
+        sendFullSnapshot(node, store.getCurrentTerm(), "n1",
+                localSnap - 1, 1, new byte[0], new byte[0]);
         assertEquals(localSnap, node.snapshotIndex(), "stale snapshot must not regress our boundary");
+    }
+
+    @Test
+    void handleInstallSnapshotReassemblesMultipleChunks() throws Exception {
+        InMemoryStorage chunkStore = new InMemoryStorage();
+        KeyValueStateMachine chunkSm = new KeyValueStateMachine();
+        RaftNode receiver = new RaftNode(singleNodeConfig(), chunkStore, chunkSm, addr -> null);
+        try {
+            KeyValueStateMachine leaderSm = new KeyValueStateMachine();
+            leaderSm.apply("SET chunked yes".getBytes(StandardCharsets.UTF_8));
+            byte[] smData = leaderSm.takeSnapshot();
+            byte[] cfgData = ClusterConfiguration.newBuilder()
+                    .addMembers(ClusterConfiguration.Member.newBuilder().setId("n1").setAddress("localhost:9091"))
+                    .build()
+                    .toByteArray();
+            byte[] packed = RaftNode.packSnapshotData(smData, cfgData);
+
+            int chunkSize = 8;
+            for (int offset = 0; offset < packed.length; ) {
+                int len = Math.min(chunkSize, packed.length - offset);
+                boolean done = (offset + len >= packed.length);
+                byte[] chunk = new byte[len];
+                System.arraycopy(packed, offset, chunk, 0, len);
+
+                InstallSnapshotRequest req = InstallSnapshotRequest.newBuilder()
+                        .setTerm(1).setLeaderId("leader")
+                        .setLastIncludedIndex(10).setLastIncludedTerm(1)
+                        .setOffset(offset)
+                        .setData(com.google.protobuf.ByteString.copyFrom(chunk))
+                        .setDone(done)
+                        .build();
+                receiver.handleInstallSnapshot(req);
+                offset += len;
+            }
+
+            assertEquals("yes", chunkSm.get("chunked"));
+            assertEquals(10, receiver.snapshotIndex());
+        } finally {
+            receiver.shutdown();
+        }
     }
 
     // ---- RequestVote (§5.2) --------------------------------------------
@@ -401,5 +426,20 @@ class RaftNodeTest {
             Thread.sleep(10);
         }
         fail("commitIndex did not reach " + targetIndex + " within " + timeoutMs + " ms");
+    }
+
+    /** Sends a complete snapshot as a single chunk (offset=0, done=true). */
+    private static void sendFullSnapshot(RaftNode target, long term, String leaderId,
+                                         long lastIncludedIndex, long lastIncludedTerm,
+                                         byte[] smData, byte[] cfgData) {
+        byte[] packed = RaftNode.packSnapshotData(smData, cfgData);
+        InstallSnapshotRequest req = InstallSnapshotRequest.newBuilder()
+                .setTerm(term).setLeaderId(leaderId)
+                .setLastIncludedIndex(lastIncludedIndex).setLastIncludedTerm(lastIncludedTerm)
+                .setOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFrom(packed))
+                .setDone(true)
+                .build();
+        target.handleInstallSnapshot(req);
     }
 }

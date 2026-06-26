@@ -35,21 +35,24 @@ import java.util.Properties;
  */
 public final class RaftConfig {
 
-    /** Used when a .properties file doesn't set {@code snapshot.threshold} explicitly. */
     private static final int DEFAULT_SNAPSHOT_THRESHOLD = 100;
+    private static final int DEFAULT_SNAPSHOT_CHUNK_SIZE = 1_048_576; // 1 MB
 
     private final String selfId;
     private final int selfPort;
     private final Path dataDir;
     private final Map<String, String> peerAddresses; // includes self
     private final int snapshotThreshold;
+    private final int snapshotChunkSize;
 
-    private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses, int snapshotThreshold) {
+    private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
+                       int snapshotThreshold, int snapshotChunkSize) {
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
         this.peerAddresses = peerAddresses;
         this.snapshotThreshold = snapshotThreshold;
+        this.snapshotChunkSize = snapshotChunkSize;
     }
 
     public static RaftConfig load(Path propertiesFile) throws IOException {
@@ -62,6 +65,8 @@ public final class RaftConfig {
         Path dataDir = Path.of(require(props, "data.dir"));
         String thresholdProp = props.getProperty("snapshot.threshold");
         int snapshotThreshold = thresholdProp == null ? DEFAULT_SNAPSHOT_THRESHOLD : Integer.parseInt(thresholdProp);
+        String chunkSizeProp = props.getProperty("snapshot.chunk.size");
+        int snapshotChunkSize = chunkSizeProp == null ? DEFAULT_SNAPSHOT_CHUNK_SIZE : Integer.parseInt(chunkSizeProp);
 
         Map<String, String> peers = new LinkedHashMap<>();
         for (String name : props.stringPropertyNames()) {
@@ -73,7 +78,7 @@ public final class RaftConfig {
         if (!peers.containsKey(selfId)) {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize);
     }
 
     private static String require(Properties props, String key) {
@@ -103,4 +108,10 @@ public final class RaftConfig {
      * observe without sending hundreds of commands first.
      */
     public int snapshotThreshold() { return snapshotThreshold; }
+
+    /**
+     * Maximum size in bytes of each InstallSnapshot chunk (§7, Figure 13).
+     * Defaults to 1 MB if {@code snapshot.chunk.size} isn't set.
+     */
+    public int snapshotChunkSize() { return snapshotChunkSize; }
 }

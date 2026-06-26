@@ -61,21 +61,19 @@ message AppendEntriesResponse {
   bool success = 2;
 }
 
-// InstallSnapshot RPC (§7), used by a leader instead of AppendEntries when a
-// follower needs entries the leader has already compacted out of its own
-// log -- a follower that's fallen far behind, or a brand-new member just
-// added via §6 with an empty log. Unlike the paper's version this always
-// carries the entire snapshot in one request rather than chunking it with
-// offset/done fields; see the README for why that's an accepted
-// simplification here (gRPC's default message size limit is generous enough
-// for this implementation's demo-sized state machine).
+// InstallSnapshot RPC (§7, Figure 13), used by a leader instead of
+// AppendEntries when a follower needs entries the leader has already
+// compacted out of its own log. The snapshot is split into fixed-size
+// chunks and sent one chunk per RPC; the follower reassembles them and
+// applies the complete snapshot once the final chunk (done=true) arrives.
 message InstallSnapshotRequest {
   int64 term = 1;
   string leaderId = 2;
   int64 lastIncludedIndex = 3;
   int64 lastIncludedTerm = 4;
-  bytes stateMachineData = 5;   // opaque to Raft: whatever StateMachine.takeSnapshot() produced
-  bytes configurationData = 6; // serialized ClusterConfiguration as of lastIncludedIndex (§6+§7)
+  int64 offset = 5;   // byte offset where this chunk starts in the snapshot
+  bytes data = 6;     // raw bytes of the snapshot chunk starting at offset
+  bool done = 7;      // true if this is the last chunk
 }
 
 message InstallSnapshotResponse {

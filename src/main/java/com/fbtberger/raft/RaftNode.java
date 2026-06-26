@@ -17,7 +17,9 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.grpc.ManagedChannel;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -71,6 +73,15 @@ public final class RaftNode {
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
 
     private final Map<Long, CompletableFuture<byte[]>> pendingClientRequests = new ConcurrentHashMap<>();
+
+    // Leader-side: in-progress chunked snapshot transfers per peer (§7).
+    private final Map<String, SnapshotTransfer> snapshotTransfers = new ConcurrentHashMap<>();
+
+    // Follower-side: buffer for reassembling incoming snapshot chunks.
+    private ByteArrayOutputStream pendingSnapshotBuffer;
+    private long pendingSnapshotIndex;
+    private long pendingSnapshotTerm;
+    private long pendingSnapshotExpectedOffset;
 
     // The cluster membership currently in effect (§6): id -> "host:port",
     // including self. Always reflects the *latest* configuration entry in
@@ -462,23 +473,18 @@ public final class RaftNode {
     // ------------------------------------------------------------------
 
     /**
-     * InstallSnapshot receiver logic: a leader sends this instead of
-     * AppendEntries when a follower needs entries the leader has already
-     * compacted out of its own log. Discards every log entry at or before
-     * {@code lastIncludedIndex} and restores the state machine from the
-     * snapshot's payload; anything the follower already had beyond
-     * {@code lastIncludedIndex} is deliberately left untouched -- even if
-     * it turns out to be stale, the very next normal AppendEntries round
-     * for those indices will detect and truncate any mismatch through the
-     * usual Rules 3 &amp; 4 (§5.3), so no extra suffix-validation is needed
-     * here.
+     * InstallSnapshot receiver logic (§7, Figure 13): the leader splits its
+     * snapshot into chunks and sends one per RPC. Each chunk carries an
+     * {@code offset} and a {@code done} flag. The follower buffers incoming
+     * chunks; when the final chunk arrives ({@code done=true}) it
+     * reassembles the full snapshot, restores the state machine, and
+     * discards every log entry at or before {@code lastIncludedIndex}.
      */
     public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
         lock.lock();
         try {
             long currentTerm = store.getCurrentTerm();
 
-            // Rule 1 (mirroring AppendEntries): a leader from an earlier term is stale.
             if (request.getTerm() < currentTerm) {
                 return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
             }
@@ -490,32 +496,48 @@ public final class RaftNode {
             resetElectionTimer();
 
             if (request.getLastIncludedIndex() <= store.getSnapshotIndex()) {
-                // A stale or duplicate RPC -- we already have an equally or
-                // more current snapshot. Nothing to do.
                 return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
             }
 
-            RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
-                    request.getLastIncludedIndex(),
-                    request.getLastIncludedTerm(),
-                    request.getStateMachineData().toByteArray(),
-                    request.getConfigurationData().toByteArray());
-            store.saveSnapshotAndCompact(snapshot);
-            stateMachine.restoreSnapshot(snapshot.stateMachineData);
-
-            if (snapshot.lastIncludedIndex > commitIndex.get()) {
-                commitIndex.set(snapshot.lastIncludedIndex);
+            // Start a fresh buffer on offset 0 or when the snapshot identity changes.
+            if (request.getOffset() == 0
+                    || pendingSnapshotBuffer == null
+                    || pendingSnapshotIndex != request.getLastIncludedIndex()) {
+                pendingSnapshotBuffer = new ByteArrayOutputStream();
+                pendingSnapshotIndex = request.getLastIncludedIndex();
+                pendingSnapshotTerm = request.getLastIncludedTerm();
+                pendingSnapshotExpectedOffset = 0;
             }
-            lastApplied.set(Math.max(lastApplied.get(), snapshot.lastIncludedIndex));
-            // §6+§7: the configuration entry this snapshot's boundary may
-            // have compacted away is recoverable from the snapshot itself
-            // (saveSnapshotAndCompact persisted it alongside the state
-            // machine bytes), so this stays correct even if no
-            // configuration entry remains in our log at all afterward.
-            recomputeEffectiveConfiguration();
 
-            log("installed snapshot through index " + snapshot.lastIncludedIndex
-                    + " (term " + snapshot.lastIncludedTerm + ") from " + request.getLeaderId());
+            if (request.getOffset() != pendingSnapshotExpectedOffset) {
+                pendingSnapshotBuffer = null;
+                return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+            }
+
+            byte[] chunkData = request.getData().toByteArray();
+            pendingSnapshotBuffer.write(chunkData, 0, chunkData.length);
+            pendingSnapshotExpectedOffset += chunkData.length;
+
+            if (request.getDone()) {
+                byte[] packed = pendingSnapshotBuffer.toByteArray();
+                pendingSnapshotBuffer = null;
+
+                RaftStorage.Snapshot snapshot = unpackSnapshotData(
+                        pendingSnapshotIndex, pendingSnapshotTerm, packed);
+
+                store.saveSnapshotAndCompact(snapshot);
+                stateMachine.restoreSnapshot(snapshot.stateMachineData);
+
+                if (snapshot.lastIncludedIndex > commitIndex.get()) {
+                    commitIndex.set(snapshot.lastIncludedIndex);
+                }
+                lastApplied.set(Math.max(lastApplied.get(), snapshot.lastIncludedIndex));
+                recomputeEffectiveConfiguration();
+
+                log("installed snapshot through index " + snapshot.lastIncludedIndex
+                        + " (term " + snapshot.lastIncludedTerm + ") from " + request.getLeaderId());
+            }
+
             return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
         } finally {
             lock.unlock();
@@ -590,54 +612,96 @@ public final class RaftNode {
     }
 
     /**
-     * Sends this server's current snapshot to a follower that needs entries
-     * we've already compacted away (§7). Unlike the paper's version, this
-     * always sends the whole snapshot in one RPC rather than chunking it
-     * with offset/done fields; see the README for why that's an accepted
-     * simplification here.
+     * Sends the next chunk of this server's snapshot to a follower that needs
+     * entries we've already compacted away (§7, Figure 13). The snapshot is
+     * split into fixed-size chunks; one chunk is sent per heartbeat cycle.
+     * The transfer is tracked in {@link #snapshotTransfers} and progresses
+     * as each chunk is acknowledged by the follower.
      */
     private void sendInstallSnapshot(String peerId, RaftServiceGrpc.RaftServiceFutureStub stub) {
-        RaftStorage.Snapshot snapshot = store.getSnapshot();
-        if (snapshot == null) {
-            return; // shouldn't happen if snapshotIndex > 0, but nothing sane to send otherwise
+        SnapshotTransfer transfer = snapshotTransfers.get(peerId);
+
+        if (transfer != null && transfer.lastIncludedIndex < store.getSnapshotIndex()) {
+            snapshotTransfers.remove(peerId);
+            transfer = null;
         }
+
+        if (transfer == null) {
+            RaftStorage.Snapshot snapshot = store.getSnapshot();
+            if (snapshot == null) {
+                return;
+            }
+            byte[] packed = packSnapshotData(snapshot.stateMachineData, snapshot.configurationData);
+            transfer = new SnapshotTransfer(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm, packed);
+            snapshotTransfers.put(peerId, transfer);
+        }
+
+        if (transfer.inFlight) {
+            return;
+        }
+
+        int offset = (int) transfer.nextOffset;
+        int chunkSize = config.snapshotChunkSize();
+        int remaining = transfer.data.length - offset;
+        int len = Math.min(chunkSize, remaining);
+        boolean done = (offset + len >= transfer.data.length);
+
         long currentTerm = store.getCurrentTerm();
         InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
                 .setTerm(currentTerm)
                 .setLeaderId(config.selfId())
-                .setLastIncludedIndex(snapshot.lastIncludedIndex)
-                .setLastIncludedTerm(snapshot.lastIncludedTerm)
-                .setStateMachineData(ByteString.copyFrom(snapshot.stateMachineData))
-                .setConfigurationData(ByteString.copyFrom(snapshot.configurationData))
+                .setLastIncludedIndex(transfer.lastIncludedIndex)
+                .setLastIncludedTerm(transfer.lastIncludedTerm)
+                .setOffset(offset)
+                .setData(ByteString.copyFrom(transfer.data, offset, len))
+                .setDone(done)
                 .build();
+
+        transfer.inFlight = true;
+        SnapshotTransfer transferRef = transfer;
+        long newOffset = offset + len;
 
         ListenableFuture<InstallSnapshotResponse> future = stub.installSnapshot(request);
         Futures.addCallback(future, new FutureCallback<InstallSnapshotResponse>() {
             @Override
             public void onSuccess(InstallSnapshotResponse response) {
-                handleInstallSnapshotResponse(peerId, currentTerm, snapshot.lastIncludedIndex, response);
+                handleSnapshotChunkResponse(peerId, currentTerm, transferRef, newOffset, done, response);
             }
 
             @Override
             public void onFailure(Throwable t) {
-                // Peer unreachable; we'll just try again on the next heartbeat tick.
+                lock.lock();
+                try {
+                    transferRef.inFlight = false;
+                } finally {
+                    lock.unlock();
+                }
             }
         }, MoreExecutors.directExecutor());
     }
 
-    private void handleInstallSnapshotResponse(String peerId, long sentTerm, long lastIncludedIndex, InstallSnapshotResponse response) {
+    private void handleSnapshotChunkResponse(String peerId, long sentTerm, SnapshotTransfer transfer,
+                                              long newOffset, boolean wasFinal, InstallSnapshotResponse response) {
         lock.lock();
         try {
+            transfer.inFlight = false;
             if (response.getTerm() > store.getCurrentTerm()) {
                 becomeFollowerLocked(response.getTerm());
+                snapshotTransfers.remove(peerId);
                 return;
             }
             if (role != ServerRole.LEADER || store.getCurrentTerm() != sentTerm) {
-                return; // no longer leading the term this request was sent under
+                snapshotTransfers.remove(peerId);
+                return;
             }
-            matchIndex.put(peerId, lastIncludedIndex);
-            nextIndex.put(peerId, lastIncludedIndex + 1);
-            advanceCommitIndex();
+            if (wasFinal) {
+                snapshotTransfers.remove(peerId);
+                matchIndex.put(peerId, transfer.lastIncludedIndex);
+                nextIndex.put(peerId, transfer.lastIncludedIndex + 1);
+                advanceCommitIndex();
+            } else {
+                transfer.nextOffset = newOffset;
+            }
         } finally {
             lock.unlock();
         }
@@ -1017,6 +1081,7 @@ public final class RaftNode {
             closeStubChannel(peerStubs.remove(peerId));
             nextIndex.remove(peerId);
             matchIndex.remove(peerId);
+            snapshotTransfers.remove(peerId);
         }
     }
 
@@ -1044,5 +1109,50 @@ public final class RaftNode {
 
     private void log(String msg) {
         System.out.println("[" + config.selfId() + "] " + msg);
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot chunking helpers (§7, Figure 13)
+    // ------------------------------------------------------------------
+
+    static final class SnapshotTransfer {
+        final long lastIncludedIndex;
+        final long lastIncludedTerm;
+        final byte[] data;
+        long nextOffset;
+        boolean inFlight;
+
+        SnapshotTransfer(long lastIncludedIndex, long lastIncludedTerm, byte[] data) {
+            this.lastIncludedIndex = lastIncludedIndex;
+            this.lastIncludedTerm = lastIncludedTerm;
+            this.data = data;
+        }
+    }
+
+    /**
+     * Packs stateMachineData and configurationData into a single byte
+     * stream for chunked transfer: {@code [4-byte big-endian smLen][smData][cfgData]}.
+     */
+    static byte[] packSnapshotData(byte[] stateMachineData, byte[] configurationData) {
+        byte[] packed = new byte[4 + stateMachineData.length + configurationData.length];
+        packed[0] = (byte) (stateMachineData.length >>> 24);
+        packed[1] = (byte) (stateMachineData.length >>> 16);
+        packed[2] = (byte) (stateMachineData.length >>> 8);
+        packed[3] = (byte) (stateMachineData.length);
+        System.arraycopy(stateMachineData, 0, packed, 4, stateMachineData.length);
+        System.arraycopy(configurationData, 0, packed, 4 + stateMachineData.length, configurationData.length);
+        return packed;
+    }
+
+    /**
+     * Inverse of {@link #packSnapshotData}: splits a reassembled byte stream
+     * back into the two original payloads and wraps them in a {@link RaftStorage.Snapshot}.
+     */
+    static RaftStorage.Snapshot unpackSnapshotData(long lastIncludedIndex, long lastIncludedTerm, byte[] packed) {
+        int smLen = ((packed[0] & 0xFF) << 24) | ((packed[1] & 0xFF) << 16)
+                  | ((packed[2] & 0xFF) << 8)  | (packed[3] & 0xFF);
+        byte[] smData = Arrays.copyOfRange(packed, 4, 4 + smLen);
+        byte[] cfgData = Arrays.copyOfRange(packed, 4 + smLen, packed.length);
+        return new RaftStorage.Snapshot(lastIncludedIndex, lastIncludedTerm, smData, cfgData);
     }
 }
