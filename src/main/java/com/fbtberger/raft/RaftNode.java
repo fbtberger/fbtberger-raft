@@ -107,6 +107,9 @@ public final class RaftNode {
     private volatile Map<String, String> currentConfiguration;
     private volatile long currentConfigurationIndex;
 
+    // Guards against overlapping background snapshots (§5.1 COW).
+    private volatile boolean snapshotInProgress = false;
+
     private final Random random = new Random();
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTask;
@@ -893,36 +896,60 @@ public final class RaftNode {
     }
 
     // ------------------------------------------------------------------
-    // Log compaction / snapshotting (§7). Every server does this
-    // independently, not just the leader -- otherwise each one's log would
-    // grow without bound regardless of who's currently leading. Synchronous
-    // and runs while holding `lock`, the same as the rest of Raft's
-    // decision-making here, so a slow takeSnapshot()/saveSnapshotAndCompact()
-    // call briefly pauses replication and elections on this server; the
-    // paper's own systems avoid that with copy-on-write or a forked child
-    // process, which is out of scope for this implementation (see README).
+    // Log compaction / snapshotting (§7, §5.1 COW). Every server does
+    // this independently, not just the leader. The state machine bytes
+    // are captured under `lock` (fast, in-memory copy-on-write), then
+    // persisted and compacted on a background thread so disk I/O doesn't
+    // block replication or elections.
     // ------------------------------------------------------------------
 
     /** Takes a new snapshot if enough newly applied entries have piled up since the last one. Caller must hold {@code lock}. */
     private void maybeTakeSnapshotLocked() {
+        if (snapshotInProgress) return;
         if (lastApplied.get() - store.getSnapshotIndex() < config.snapshotThreshold()) {
             return;
         }
-        takeSnapshotLocked();
+        takeSnapshotAsync();
     }
 
-    /** Unconditionally snapshots through {@code lastApplied}, if there's anything new to capture. Caller must hold {@code lock}. */
-    private void takeSnapshotLocked() {
+    /**
+     * Captures the state machine snapshot under the lock, then persists
+     * and compacts on a background thread (§5.1 copy-on-write). The lock
+     * is NOT held during the disk I/O.
+     */
+    private void takeSnapshotAsync() {
         long applied = lastApplied.get();
         if (applied <= store.getSnapshotIndex()) {
-            return; // nothing new since the last snapshot
+            return;
         }
         long includedTerm = store.getTermAt(applied);
         byte[] stateMachineData = stateMachine.takeSnapshot();
-        // Captured here, not derived from the log, precisely so a §6
-        // configuration entry that's about to be compacted away isn't lost:
-        // currentConfiguration already reflects everything up to and
-        // including `applied`, whether or not its source entry survives.
+        byte[] configurationData = toProto(currentConfiguration).toByteArray();
+        RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
+                applied, includedTerm, stateMachineData, configurationData);
+
+        snapshotInProgress = true;
+        scheduler.execute(() -> {
+            try {
+                store.saveSnapshotAndCompact(snapshot);
+                metrics.snapshotTaken();
+                log("snapshotted through index " + snapshot.lastIncludedIndex
+                        + " (term " + snapshot.lastIncludedTerm
+                        + "); log entries at or before it have been discarded");
+            } finally {
+                snapshotInProgress = false;
+            }
+        });
+    }
+
+    /** Synchronous snapshot for {@link #snapshotNow()} — blocks until complete. */
+    private void takeSnapshotSync() {
+        long applied = lastApplied.get();
+        if (applied <= store.getSnapshotIndex()) {
+            return;
+        }
+        long includedTerm = store.getTermAt(applied);
+        byte[] stateMachineData = stateMachine.takeSnapshot();
         byte[] configurationData = toProto(currentConfiguration).toByteArray();
         store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
         metrics.snapshotTaken();
@@ -939,7 +966,7 @@ public final class RaftNode {
     public void snapshotNow() {
         lock.lock();
         try {
-            takeSnapshotLocked();
+            takeSnapshotSync();
         } finally {
             lock.unlock();
         }
