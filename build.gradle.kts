@@ -49,6 +49,21 @@ dependencies {
     implementation("io.netty:netty-handler:$nettyVersion")
     implementation("io.netty:netty-codec:$nettyVersion")
 
+    // Hadoop RPC transport
+    implementation("org.apache.hadoop:hadoop-common:3.3.6") {
+        exclude(group = "org.slf4j")
+        exclude(group = "ch.qos.logback")
+        exclude(group = "log4j")
+        exclude(group = "org.apache.logging.log4j")
+        exclude(group = "commons-logging")
+        exclude(group = "org.eclipse.jetty")
+        exclude(group = "org.apache.curator")
+        exclude(group = "org.apache.zookeeper")
+        exclude(group = "org.apache.avro")
+        exclude(group = "com.sun.jersey")
+        exclude(group = "javax.servlet")
+    }
+
     // Logging
     implementation("org.slf4j:slf4j-api:2.0.12")
     runtimeOnly("ch.qos.logback:logback-classic:1.5.6")
