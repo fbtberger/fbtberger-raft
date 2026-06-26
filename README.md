@@ -11,6 +11,8 @@ metrics.
 
 For a detailed system architecture with UML diagrams, see
 [docs/architecture.pdf](docs/architecture.pdf).
+For a quick API reference, see the
+[developer cheatsheet](docs/cheatsheet.pdf).
 
 ## What is implemented
 
