@@ -4,6 +4,8 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.AppendEntriesResponse;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
+import com.fbtberger.raft.proto.PreVoteRequest;
+import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -72,6 +74,11 @@ public final class NettyTransport implements RaftTransport {
     }
 
     @Override
+    public CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request) {
+        return send(NettyProtocol.PRE_VOTE_REQ, request);
+    }
+
+    @Override
     public void close() {
         channel.close();
         pending.values().forEach(f -> f.completeExceptionally(new RuntimeException("transport closed")));
@@ -129,6 +136,7 @@ public final class NettyTransport implements RaftTransport {
                 case NettyProtocol.REQUEST_VOTE_RESP -> RequestVoteResponse.parseFrom(payload);
                 case NettyProtocol.APPEND_ENTRIES_RESP -> AppendEntriesResponse.parseFrom(payload);
                 case NettyProtocol.INSTALL_SNAPSHOT_RESP -> InstallSnapshotResponse.parseFrom(payload);
+                case NettyProtocol.PRE_VOTE_RESP -> PreVoteResponse.parseFrom(payload);
                 default -> throw new IllegalStateException("unknown response type: " + type);
             };
         }

@@ -4,6 +4,8 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.AppendEntriesResponse;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
+import com.fbtberger.raft.proto.PreVoteRequest;
+import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -99,6 +101,10 @@ public final class NettyTransportServer implements RaftTransportServer {
                     case NettyProtocol.INSTALL_SNAPSHOT_REQ -> {
                         response = handler.handleInstallSnapshot(InstallSnapshotRequest.parseFrom(payload));
                         respType = NettyProtocol.INSTALL_SNAPSHOT_RESP;
+                    }
+                    case NettyProtocol.PRE_VOTE_REQ -> {
+                        response = handler.handlePreVote(PreVoteRequest.parseFrom(payload));
+                        respType = NettyProtocol.PRE_VOTE_RESP;
                     }
                     default -> throw new IllegalStateException("unknown request type: " + type);
                 }

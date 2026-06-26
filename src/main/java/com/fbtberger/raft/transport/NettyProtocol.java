@@ -20,6 +20,8 @@ final class NettyProtocol {
     static final byte APPEND_ENTRIES_RESP    = 4;
     static final byte INSTALL_SNAPSHOT_REQ   = 5;
     static final byte INSTALL_SNAPSHOT_RESP  = 6;
+    static final byte PRE_VOTE_REQ           = 7;
+    static final byte PRE_VOTE_RESP          = 8;
 
     static final int HEADER_BYTES = 1 + 4; // type + reqId
 

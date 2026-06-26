@@ -6,6 +6,8 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
+import com.fbtberger.raft.proto.PreVoteRequest;
+import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.fbtberger.raft.transport.RaftTransport;
@@ -106,6 +108,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // Guards against overlapping background snapshots (§5.1 COW).
     private volatile boolean snapshotInProgress = false;
 
+    // §4.2.3 PreVote: timestamp of the last valid leader contact (heartbeat
+    // or AppendEntries). A server only grants a PreVote if it hasn't heard
+    // from a leader within the election timeout window.
+    private volatile long lastLeaderContactMs = 0;
+
     private final Random random = new Random();
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTask;
@@ -203,46 +210,84 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         electionTimer = scheduler.schedule(this::startElection, timeoutMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Starts a new election: bump the term, vote for ourselves, and ask every other server for its vote (§5.2). */
+    /**
+     * §4.2.3 PreVote + §5.2: before bumping the term, first check with
+     * a majority that they'd grant a vote and haven't heard from a leader
+     * recently. Only if the PreVote succeeds does the real election start.
+     * Single-node clusters skip PreVote and elect immediately.
+     */
     private void startElection() {
         lock.lock();
         try {
             if (!currentConfiguration.containsKey(config.selfId())) {
-                // §6: our own log already reflects a configuration that no
-                // longer includes us (we were removed). A server in that
-                // state must not try to become leader of a cluster it's no
-                // longer part of -- just keep waiting.
                 resetElectionTimer();
                 return;
             }
-            role = ServerRole.CANDIDATE;
-            currentLeaderId = null;
-            long newTerm = store.getCurrentTerm() + 1;
-            store.setTermAndVote(newTerm, config.selfId());
-            metrics.electionStarted();
-            log("election timeout -> starting election for term " + newTerm);
-
             if (majority() == 1) {
+                role = ServerRole.CANDIDATE;
+                currentLeaderId = null;
+                long newTerm = store.getCurrentTerm() + 1;
+                store.setTermAndVote(newTerm, config.selfId());
+                metrics.electionStarted();
                 becomeLeaderLocked();
                 return;
             }
-            resetElectionTimer();
 
-            RequestVoteRequest request = RequestVoteRequest.newBuilder()
-                    .setTerm(newTerm)
+            long proposedTerm = store.getCurrentTerm() + 1;
+            PreVoteRequest preVoteRequest = PreVoteRequest.newBuilder()
+                    .setTerm(proposedTerm)
                     .setCandidateId(config.selfId())
                     .setLastLogIndex(store.getLastLogIndex())
                     .setLastLogTerm(store.getLastLogTerm())
                     .build();
 
-            AtomicLong votesGranted = new AtomicLong(1); // we vote for ourselves
+            AtomicLong preVotesGranted = new AtomicLong(1); // count self
             for (RaftTransport peer : peerTransports.values()) {
-                peer.requestVote(request).whenComplete((response, t) -> {
-                    if (t == null) handleRequestVoteResponse(newTerm, response, votesGranted);
+                peer.preVote(preVoteRequest).whenComplete((response, t) -> {
+                    if (t == null) handlePreVoteResponse(proposedTerm, response, preVotesGranted);
                 });
+            }
+            resetElectionTimer();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void handlePreVoteResponse(long proposedTerm, PreVoteResponse response, AtomicLong preVotesGranted) {
+        lock.lock();
+        try {
+            if (store.getCurrentTerm() + 1 != proposedTerm) {
+                return;
+            }
+            if (response.getVoteGranted() && preVotesGranted.incrementAndGet() >= majority()) {
+                startRealElection(proposedTerm);
             }
         } finally {
             lock.unlock();
+        }
+    }
+
+    private void startRealElection(long newTerm) {
+        role = ServerRole.CANDIDATE;
+        currentLeaderId = null;
+        store.setTermAndVote(newTerm, config.selfId());
+        metrics.electionStarted();
+        log("PreVote succeeded -> starting election for term " + newTerm);
+
+        resetElectionTimer();
+
+        RequestVoteRequest request = RequestVoteRequest.newBuilder()
+                .setTerm(newTerm)
+                .setCandidateId(config.selfId())
+                .setLastLogIndex(store.getLastLogIndex())
+                .setLastLogTerm(store.getLastLogTerm())
+                .build();
+
+        AtomicLong votesGranted = new AtomicLong(1);
+        for (RaftTransport peer : peerTransports.values()) {
+            peer.requestVote(request).whenComplete((response, t) -> {
+                if (t == null) handleRequestVoteResponse(newTerm, response, votesGranted);
+            });
         }
     }
 
@@ -389,6 +434,30 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     // ------------------------------------------------------------------
+    // PreVote RPC (§4.2.3 / §9.6)
+    // ------------------------------------------------------------------
+
+    @Override
+    public PreVoteResponse handlePreVote(PreVoteRequest request) {
+        lock.lock();
+        try {
+            long currentTerm = store.getCurrentTerm();
+
+            if (request.getTerm() < currentTerm) {
+                return PreVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(false).build();
+            }
+
+            boolean logOk = isLogAtLeastAsUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
+            boolean leaderActive = System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
+
+            boolean grant = logOk && !leaderActive;
+            return PreVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(grant).build();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ------------------------------------------------------------------
     // AppendEntries RPC (Figure 2)
     // ------------------------------------------------------------------
 
@@ -416,6 +485,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             currentTerm = store.getCurrentTerm();
             currentLeaderId = request.getLeaderId();
+            lastLeaderContactMs = System.currentTimeMillis();
             resetElectionTimer();
 
             // Rule 2: our log must actually have an entry at prevLogIndex
@@ -513,6 +583,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             currentTerm = store.getCurrentTerm();
             currentLeaderId = request.getLeaderId();
+            lastLeaderContactMs = System.currentTimeMillis();
             resetElectionTimer();
 
             if (request.getLastIncludedIndex() <= store.getSnapshotIndex()) {

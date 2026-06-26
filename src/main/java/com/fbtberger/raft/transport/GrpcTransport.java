@@ -4,6 +4,8 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.AppendEntriesResponse;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
+import com.fbtberger.raft.proto.PreVoteRequest;
+import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
@@ -38,6 +40,11 @@ public final class GrpcTransport implements RaftTransport {
     @Override
     public CompletableFuture<InstallSnapshotResponse> installSnapshot(InstallSnapshotRequest request) {
         return toCompletable(stub.installSnapshot(request));
+    }
+
+    @Override
+    public CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request) {
+        return toCompletable(stub.preVote(request));
     }
 
     @Override
