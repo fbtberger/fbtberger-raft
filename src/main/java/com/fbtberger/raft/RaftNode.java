@@ -14,6 +14,8 @@ import com.fbtberger.raft.transport.RaftTransport;
 import com.fbtberger.raft.transport.RaftTransportFactory;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
@@ -46,6 +48,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * committed commands to a {@link StateMachine}.
  */
 public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(RaftNode.class);
 
     private static final int HEARTBEAT_INTERVAL_MS = 50;
     private static final int ELECTION_TIMEOUT_MIN_MS = 150;
@@ -1290,7 +1294,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     private void log(String msg) {
-        System.out.println("[" + config.selfId() + "] " + msg);
+        LOG.info("[{}] {}", config.selfId(), msg);
     }
 
     // ------------------------------------------------------------------

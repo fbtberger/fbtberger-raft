@@ -49,6 +49,10 @@ dependencies {
     implementation("io.netty:netty-handler:$nettyVersion")
     implementation("io.netty:netty-codec:$nettyVersion")
 
+    // Logging
+    implementation("org.slf4j:slf4j-api:2.0.12")
+    runtimeOnly("ch.qos.logback:logback-classic:1.5.6")
+
     // Test
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testImplementation("org.springframework:spring-test:$springVersion")
