@@ -44,15 +44,17 @@ public final class RaftConfig {
     private final Map<String, String> peerAddresses; // includes self
     private final int snapshotThreshold;
     private final int snapshotChunkSize;
+    private final int metricsPort;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
-                       int snapshotThreshold, int snapshotChunkSize) {
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort) {
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
         this.peerAddresses = peerAddresses;
         this.snapshotThreshold = snapshotThreshold;
         this.snapshotChunkSize = snapshotChunkSize;
+        this.metricsPort = metricsPort;
     }
 
     public static RaftConfig load(Path propertiesFile) throws IOException {
@@ -67,6 +69,8 @@ public final class RaftConfig {
         int snapshotThreshold = thresholdProp == null ? DEFAULT_SNAPSHOT_THRESHOLD : Integer.parseInt(thresholdProp);
         String chunkSizeProp = props.getProperty("snapshot.chunk.size");
         int snapshotChunkSize = chunkSizeProp == null ? DEFAULT_SNAPSHOT_CHUNK_SIZE : Integer.parseInt(chunkSizeProp);
+        String metricsPortProp = props.getProperty("metrics.port");
+        int metricsPort = metricsPortProp == null ? 0 : Integer.parseInt(metricsPortProp);
 
         Map<String, String> peers = new LinkedHashMap<>();
         for (String name : props.stringPropertyNames()) {
@@ -78,7 +82,7 @@ public final class RaftConfig {
         if (!peers.containsKey(selfId)) {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort);
     }
 
     private static String require(Properties props, String key) {
@@ -114,4 +118,10 @@ public final class RaftConfig {
      * Defaults to 1 MB if {@code snapshot.chunk.size} isn't set.
      */
     public int snapshotChunkSize() { return snapshotChunkSize; }
+
+    /**
+     * Port for the Prometheus metrics HTTP endpoint ({@code /metrics}). Defaults
+     * to 0 (disabled) if {@code metrics.port} isn't set in the .properties file.
+     */
+    public int metricsPort() { return metricsPort; }
 }

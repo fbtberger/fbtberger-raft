@@ -57,7 +57,7 @@ class RaftNodeTest {
                     .forName(peerAddress).directExecutor().build();
             channels.add(ch);
             return RaftServiceGrpc.newFutureStub(ch);
-        });
+        }, RaftMetrics.noop());
 
         grpcServer = InProcessServerBuilder.forName(SERVER_NAME)
                 .directExecutor()
@@ -119,7 +119,7 @@ class RaftNodeTest {
         // cluster can never stay demoted because resetElectionTimer
         // immediately re-elects it when majority == 1.
         RaftNode follower = new RaftNode(singleNodeConfig(), new InMemoryStorage(),
-                new KeyValueStateMachine(), addr -> null);
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
         try {
             CompletableFuture<byte[]> future = follower.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
             assertTrue(future.isCompletedExceptionally());
@@ -264,7 +264,7 @@ class RaftNodeTest {
     void handleInstallSnapshotReassemblesMultipleChunks() throws Exception {
         InMemoryStorage chunkStore = new InMemoryStorage();
         KeyValueStateMachine chunkSm = new KeyValueStateMachine();
-        RaftNode receiver = new RaftNode(singleNodeConfig(), chunkStore, chunkSm, addr -> null);
+        RaftNode receiver = new RaftNode(singleNodeConfig(), chunkStore, chunkSm, addr -> null, RaftMetrics.noop());
         try {
             KeyValueStateMachine leaderSm = new KeyValueStateMachine();
             leaderSm.apply("SET chunked yes".getBytes(StandardCharsets.UTF_8));
@@ -382,7 +382,7 @@ class RaftNodeTest {
                     .forName(peerAddress).directExecutor().build();
             channels.add(ch);
             return RaftServiceGrpc.newFutureStub(ch);
-        });
+        }, RaftMetrics.noop());
         peerNodes.add(peerNode);
 
         Server srv = InProcessServerBuilder.forName(address)

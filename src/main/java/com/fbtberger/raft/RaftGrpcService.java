@@ -8,6 +8,7 @@ import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import io.grpc.stub.StreamObserver;
+import io.micrometer.core.instrument.Timer;
 
 /**
  * Adapter between the generated gRPC service stubs and {@link RaftNode}.
@@ -23,41 +24,52 @@ import io.grpc.stub.StreamObserver;
 public final class RaftGrpcService extends RaftServiceGrpc.RaftServiceImplBase {
 
     private final RaftNode raftNode;
+    private final RaftMetrics metrics;
 
     public RaftGrpcService(RaftNode raftNode) {
         this.raftNode = raftNode;
+        this.metrics = raftNode.metrics();
     }
 
     @Override
     public void requestVote(RequestVoteRequest request, StreamObserver<RequestVoteResponse> responseObserver) {
+        Timer.Sample sample = Timer.start(metrics.registry());
         try {
             RequestVoteResponse response = raftNode.handleRequestVote(request);
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             responseObserver.onError(e);
+        } finally {
+            sample.stop(metrics.requestVoteTimer());
         }
     }
 
     @Override
     public void appendEntries(AppendEntriesRequest request, StreamObserver<AppendEntriesResponse> responseObserver) {
+        Timer.Sample sample = Timer.start(metrics.registry());
         try {
             AppendEntriesResponse response = raftNode.handleAppendEntries(request);
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             responseObserver.onError(e);
+        } finally {
+            sample.stop(metrics.appendEntriesTimer());
         }
     }
 
     @Override
     public void installSnapshot(InstallSnapshotRequest request, StreamObserver<InstallSnapshotResponse> responseObserver) {
+        Timer.Sample sample = Timer.start(metrics.registry());
         try {
             InstallSnapshotResponse response = raftNode.handleInstallSnapshot(request);
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             responseObserver.onError(e);
+        } finally {
+            sample.stop(metrics.installSnapshotTimer());
         }
     }
 }

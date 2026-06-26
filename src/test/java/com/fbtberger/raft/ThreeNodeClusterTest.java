@@ -99,7 +99,7 @@ class ThreeNodeClusterTest {
                         .forName(peerAddress).directExecutor().build();
                 channels.add(ch);
                 return RaftServiceGrpc.newFutureStub(ch);
-            });
+            }, RaftMetrics.noop());
             nodes.put(id, node);
 
             // Register the in-process server under *this* node's address so

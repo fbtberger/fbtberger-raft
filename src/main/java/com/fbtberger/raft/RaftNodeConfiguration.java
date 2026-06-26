@@ -1,15 +1,21 @@
 package com.fbtberger.raft;
 
 import com.fbtberger.raft.proto.RaftServiceGrpc;
+import com.sun.net.httpserver.HttpServer;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.micrometer.prometheusmetrics.PrometheusConfig;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.function.Function;
 
@@ -97,8 +103,18 @@ public class RaftNodeConfiguration {
                 ManagedChannelBuilder.forTarget(address).usePlaintext().build());
     }
 
+    @Bean
+    public PrometheusMeterRegistry meterRegistry() {
+        return new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+    }
+
+    @Bean
+    public RaftMetrics raftMetrics(PrometheusMeterRegistry registry, RaftConfig config) {
+        return new RaftMetrics(registry, config.selfId());
+    }
+
     /**
-     * The core Raft state machine. All four collaborators are injected by
+     * The core Raft state machine. All collaborators are injected by
      * Spring — no object creates its own dependencies.
      *
      * <p>{@code destroyMethod = "shutdown"} cancels the election / heartbeat
@@ -108,8 +124,9 @@ public class RaftNodeConfiguration {
     public RaftNode raftNode(RaftConfig config,
                               RaftStorage storage,
                               StateMachine stateMachine,
-                              Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory) {
-        return new RaftNode(config, storage, stateMachine, peerStubFactory);
+                              Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory,
+                              RaftMetrics metrics) {
+        return new RaftNode(config, storage, stateMachine, peerStubFactory, metrics);
     }
 
     /**
@@ -149,5 +166,30 @@ public class RaftNodeConfiguration {
                 .addService(raftClientGrpcService)
                 .build()
                 .start();
+    }
+
+    /**
+     * Lightweight HTTP server that exposes a {@code /metrics} endpoint for
+     * Prometheus scraping. Only started when {@code metrics.port} is configured
+     * in the node's .properties file; returns {@code null} (no bean) otherwise.
+     */
+    @Bean(destroyMethod = "stop")
+    public HttpServer metricsHttpServer(PrometheusMeterRegistry registry,
+                                        RaftConfig config) throws IOException {
+        if (config.metricsPort() <= 0) {
+            return null;
+        }
+        HttpServer server = HttpServer.create(new InetSocketAddress(config.metricsPort()), 0);
+        server.createContext("/metrics", exchange -> {
+            String scrape = registry.scrape();
+            byte[] body = scrape.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        });
+        server.start();
+        return server;
     }
 }

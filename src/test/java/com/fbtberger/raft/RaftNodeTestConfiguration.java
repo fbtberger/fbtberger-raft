@@ -88,6 +88,6 @@ class RaftNodeTestConfiguration {
                               RaftStorage storage,
                               KeyValueStateMachine stateMachine,
                               Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory) {
-        return new RaftNode(config, storage, stateMachine, peerStubFactory);
+        return new RaftNode(config, storage, stateMachine, peerStubFactory, RaftMetrics.noop());
     }
 }

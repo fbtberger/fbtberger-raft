@@ -8,6 +8,7 @@ import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.google.protobuf.ByteString;
 import io.grpc.stub.StreamObserver;
+import io.micrometer.core.instrument.Timer;
 
 import java.util.concurrent.CompletionException;
 
@@ -23,14 +24,18 @@ import java.util.concurrent.CompletionException;
 public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClientServiceImplBase {
 
     private final RaftNode raftNode;
+    private final RaftMetrics metrics;
 
     public RaftClientGrpcService(RaftNode raftNode) {
         this.raftNode = raftNode;
+        this.metrics = raftNode.metrics();
     }
 
     @Override
     public void submit(SubmitRequest request, StreamObserver<SubmitResponse> responseObserver) {
+        Timer.Sample sample = Timer.start(metrics.registry());
         raftNode.submitCommand(request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
+            sample.stop(metrics.clientSubmitTimer());
             responseObserver.onNext(throwable == null ? success(result) : failure(unwrap(throwable)));
             responseObserver.onCompleted();
         });

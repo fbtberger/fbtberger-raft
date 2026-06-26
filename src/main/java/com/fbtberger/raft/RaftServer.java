@@ -50,6 +50,10 @@ public final class RaftServer {
 
         System.out.println("[" + config.selfId() + "] listening on port " + config.selfPort()
                 + ", starting configuration=" + config.peerAddresses().keySet());
+        if (config.metricsPort() > 0) {
+            System.out.println("[" + config.selfId() + "] Prometheus metrics at http://localhost:"
+                    + config.metricsPort() + "/metrics");
+        }
 
         // Ensure Spring destroys all beans (grpcServer.shutdown() →
         // raftNode.shutdown() → raftStorage.close()) whether we exit via

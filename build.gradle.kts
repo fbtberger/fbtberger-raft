@@ -19,6 +19,7 @@ repositories {
 val grpcVersion = "1.62.2"
 val protobufVersion = "3.25.3"
 val springVersion = "6.1.6"
+val micrometerVersion = "1.13.0"
 
 dependencies {
     // Protocol Buffers
@@ -36,6 +37,10 @@ dependencies {
     // Spring IoC
     implementation("org.springframework:spring-context:$springVersion")
     compileOnly("org.springframework.boot:spring-boot-autoconfigure:3.2.5")
+
+    // Micrometer metrics
+    implementation("io.micrometer:micrometer-core:$micrometerVersion")
+    implementation("io.micrometer:micrometer-registry-prometheus:$micrometerVersion")
 
     // Test
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")

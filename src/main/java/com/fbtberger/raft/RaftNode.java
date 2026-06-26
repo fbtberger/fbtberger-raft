@@ -57,6 +57,7 @@ public final class RaftNode {
     private final RaftStorage store;
     private final StateMachine stateMachine;
     private final Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory;
+    private final RaftMetrics metrics;
     private final Map<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubs = new ConcurrentHashMap<>(); // excludes self
     private final ScheduledExecutorService scheduler;
 
@@ -110,11 +111,13 @@ public final class RaftNode {
     public RaftNode(RaftConfig config,
                      RaftStorage store,
                      StateMachine stateMachine,
-                     Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory) {
+                     Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory,
+                     RaftMetrics metrics) {
         this.config = config;
         this.store = store;
         this.stateMachine = stateMachine;
         this.peerStubFactory = peerStubFactory;
+        this.metrics = metrics;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "raft-" + config.selfId());
             t.setDaemon(true);
@@ -135,6 +138,14 @@ public final class RaftNode {
             commitIndex.set(Math.max(commitIndex.get(), existingSnapshot.lastIncludedIndex));
         }
         recomputeEffectiveConfiguration();
+        metrics.registerGauges(
+                store::getCurrentTerm,
+                commitIndex::get,
+                lastApplied::get,
+                () -> role.ordinal(),
+                () -> currentConfiguration.size(),
+                store::getLastLogIndex,
+                store::getSnapshotIndex);
     }
 
     /** Every server starts out as a follower (§5.1). */
@@ -198,6 +209,7 @@ public final class RaftNode {
             currentLeaderId = null;
             long newTerm = store.getCurrentTerm() + 1;
             store.setTermAndVote(newTerm, config.selfId());
+            metrics.electionStarted();
             log("election timeout -> starting election for term " + newTerm);
 
             if (majority() == 1) {
@@ -263,6 +275,7 @@ public final class RaftNode {
     private void becomeLeaderLocked() {
         role = ServerRole.LEADER;
         currentLeaderId = config.selfId();
+        metrics.electionWon();
         log("elected LEADER for term " + store.getCurrentTerm());
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTask != null) heartbeatTask.cancel(false);
@@ -314,6 +327,7 @@ public final class RaftNode {
         if (role == ServerRole.LEADER && heartbeatTask != null) {
             heartbeatTask.cancel(false);
         }
+        metrics.stepDown();
         role = ServerRole.FOLLOWER;
         resetElectionTimer();
     }
@@ -348,6 +362,7 @@ public final class RaftNode {
             if (canVote && logOk) {
                 store.setTermAndVote(currentTerm, request.getCandidateId());
                 resetElectionTimer();
+                metrics.voteGranted();
                 log("granted vote to " + request.getCandidateId() + " for term " + currentTerm);
                 return RequestVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(true).build();
             }
@@ -517,6 +532,7 @@ public final class RaftNode {
             byte[] chunkData = request.getData().toByteArray();
             pendingSnapshotBuffer.write(chunkData, 0, chunkData.length);
             pendingSnapshotExpectedOffset += chunkData.length;
+            metrics.snapshotChunkReceived();
 
             if (request.getDone()) {
                 byte[] packed = pendingSnapshotBuffer.toByteArray();
@@ -534,6 +550,7 @@ public final class RaftNode {
                 lastApplied.set(Math.max(lastApplied.get(), snapshot.lastIncludedIndex));
                 recomputeEffectiveConfiguration();
 
+                metrics.snapshotInstalled();
                 log("installed snapshot through index " + snapshot.lastIncludedIndex
                         + " (term " + snapshot.lastIncludedTerm + ") from " + request.getLeaderId());
             }
@@ -583,6 +600,9 @@ public final class RaftNode {
         List<LogEntry> entries = new ArrayList<>();
         for (long i = peerNextIndex; i <= lastLogIndex; i++) {
             entries.add(store.getLogEntry(i));
+        }
+        if (!entries.isEmpty()) {
+            metrics.replicationSent(entries.size());
         }
 
         AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
@@ -658,6 +678,7 @@ public final class RaftNode {
                 .build();
 
         transfer.inFlight = true;
+        metrics.snapshotChunkSent();
         SnapshotTransfer transferRef = transfer;
         long newOffset = offset + len;
 
@@ -796,6 +817,7 @@ public final class RaftNode {
             } else {
                 result = stateMachine.apply(entry.getCommand().toByteArray());
             }
+            metrics.entryApplied();
             CompletableFuture<byte[]> pending = pendingClientRequests.remove(index);
             if (pending != null) {
                 pending.complete(result);
@@ -837,6 +859,7 @@ public final class RaftNode {
         // including `applied`, whether or not its source entry survives.
         byte[] configurationData = toProto(currentConfiguration).toByteArray();
         store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
+        metrics.snapshotTaken();
         log("snapshotted through index " + applied + " (term " + includedTerm
                 + "); log entries at or before it have been discarded");
     }
@@ -876,6 +899,7 @@ public final class RaftNode {
         lock.lock();
         try {
             if (role != ServerRole.LEADER) {
+                metrics.clientRejected();
                 return failedFuture(new NotLeaderException(currentLeaderId));
             }
             return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(command)));
@@ -985,6 +1009,8 @@ public final class RaftNode {
         failed.completeExceptionally(e);
         return failed;
     }
+
+    public RaftMetrics metrics() { return metrics; }
 
     public ServerRole role() { return role; }
 
