@@ -5,7 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
 
-import java.util.function.Function;
+import com.fbtberger.raft.transport.RaftTransportFactory;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -45,7 +45,7 @@ class RaftNodeConfigurationTest {
         assertTrue(ctx.containsBean("raftConfig"));
         assertTrue(ctx.containsBean("raftStorage"));
         assertTrue(ctx.containsBean("stateMachine"));
-        assertTrue(ctx.containsBean("peerStubFactory"));
+        assertTrue(ctx.containsBean("transportFactory"));
         assertTrue(ctx.containsBean("raftNode"));
     }
 
@@ -65,13 +65,10 @@ class RaftNodeConfigurationTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
-    void peerStubFactoryReturnsNullForAnyAddress() {
-        // The no-op factory must return null so that RaftNode skips
-        // replication without throwing or connecting to real peers.
-        Function<String, ?> factory = ctx.getBean("peerStubFactory", Function.class);
-        assertNull(factory.apply("localhost:9999"),
-                "test stub factory must return null for every address");
+    void transportFactoryReturnsNullForAnyAddress() {
+        RaftTransportFactory factory = ctx.getBean(RaftTransportFactory.class);
+        assertNull(factory.connect("localhost:9999"),
+                "test transport factory must return null for every address");
     }
 
     // ---- RaftConfig values loaded from temp properties file -------------

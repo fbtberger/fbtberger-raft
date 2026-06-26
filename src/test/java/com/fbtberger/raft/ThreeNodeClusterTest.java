@@ -1,6 +1,8 @@
 package com.fbtberger.raft;
 
-import com.fbtberger.raft.proto.RaftServiceGrpc;
+import com.fbtberger.raft.transport.GrpcTransport;
+import com.fbtberger.raft.transport.GrpcTransportServer;
+import com.fbtberger.raft.transport.RaftTransport;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
@@ -46,7 +48,7 @@ class ThreeNodeClusterTest {
     private Map<String, KeyValueStateMachine> machines;
     private Map<String, InMemoryStorage>     stores;
     private Map<String, Server>              grpcServers;
-    private List<ManagedChannel>             channels;
+    private List<RaftTransport>             transports;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -54,7 +56,7 @@ class ThreeNodeClusterTest {
         machines   = new HashMap<>();
         stores     = new HashMap<>();
         grpcServers = new HashMap<>();
-        channels   = new ArrayList<>();
+        transports = new ArrayList<>();
 
         startNodes(INITIAL_PEERS, /*snapshotThreshold=*/ 5);
         for (RaftNode n : nodes.values()) n.start();
@@ -64,7 +66,7 @@ class ThreeNodeClusterTest {
     @AfterEach
     void tearDown() {
         for (RaftNode n   : nodes.values())      n.shutdown();
-        for (ManagedChannel ch : channels)       ch.shutdownNow();
+        for (RaftTransport t : transports)      t.close();
         for (Server s     : grpcServers.values()) s.shutdown();
     }
 
@@ -92,20 +94,16 @@ class ThreeNodeClusterTest {
 
             RaftConfig cfg = config(id, peers, threshold);
             RaftNode node = new RaftNode(cfg, store, sm, peerAddress -> {
-                // Use the peer's address as the in-process server name --
-                // the server for that peer is registered under that name
-                // in grpcServers below, so no extra lookup is needed.
                 ManagedChannel ch = InProcessChannelBuilder
                         .forName(peerAddress).directExecutor().build();
-                channels.add(ch);
-                return RaftServiceGrpc.newFutureStub(ch);
+                GrpcTransport t = new GrpcTransport(ch);
+                transports.add(t);
+                return t;
             }, RaftMetrics.noop());
             nodes.put(id, node);
 
-            // Register the in-process server under *this* node's address so
-            // other nodes' stub factories can find it by the same name.
             Server srv = InProcessServerBuilder.forName(address)
-                    .addService(new RaftGrpcService(node))
+                    .addService(new GrpcTransportServer.RaftServiceAdapter(node))
                     .build()
                     .start();
             grpcServers.put(id, srv);

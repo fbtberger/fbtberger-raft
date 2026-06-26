@@ -6,16 +6,12 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
-import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
+import com.fbtberger.raft.transport.RaftTransport;
+import com.fbtberger.raft.transport.RaftTransportFactory;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-import io.grpc.ManagedChannel;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
@@ -32,7 +28,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Function;
+
 
 /**
  * The core Raft algorithm: leader election, log replication, cluster
@@ -47,7 +43,7 @@ import java.util.function.Function;
  * factory (so it can connect to newly added members on its own), and hands
  * committed commands to a {@link StateMachine}.
  */
-public final class RaftNode {
+public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandler {
 
     private static final int HEARTBEAT_INTERVAL_MS = 50;
     private static final int ELECTION_TIMEOUT_MIN_MS = 150;
@@ -60,9 +56,9 @@ public final class RaftNode {
     private final RaftConfig config;
     private final RaftStorage store;
     private final StateMachine stateMachine;
-    private final Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory;
+    private final RaftTransportFactory transportFactory;
     private final RaftMetrics metrics;
-    private final Map<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubs = new ConcurrentHashMap<>(); // excludes self
+    private final Map<String, RaftTransport> peerTransports = new ConcurrentHashMap<>(); // excludes self
     private final ScheduledExecutorService scheduler;
 
     private final ReentrantLock lock = new ReentrantLock();
@@ -125,12 +121,12 @@ public final class RaftNode {
     public RaftNode(RaftConfig config,
                      RaftStorage store,
                      StateMachine stateMachine,
-                     Function<String, RaftServiceGrpc.RaftServiceFutureStub> peerStubFactory,
+                     RaftTransportFactory transportFactory,
                      RaftMetrics metrics) {
         this.config = config;
         this.store = store;
         this.stateMachine = stateMachine;
-        this.peerStubFactory = peerStubFactory;
+        this.transportFactory = transportFactory;
         this.metrics = metrics;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "raft-" + config.selfId());
@@ -174,8 +170,8 @@ public final class RaftNode {
 
     public void shutdown() {
         scheduler.shutdownNow();
-        for (RaftServiceGrpc.RaftServiceFutureStub stub : peerStubs.values()) {
-            closeStubChannel(stub);
+        for (RaftTransport transport : peerTransports.values()) {
+            transport.close();
         }
     }
 
@@ -240,21 +236,10 @@ public final class RaftNode {
                     .build();
 
             AtomicLong votesGranted = new AtomicLong(1); // we vote for ourselves
-            for (Map.Entry<String, RaftServiceGrpc.RaftServiceFutureStub> peer : peerStubs.entrySet()) {
-                ListenableFuture<RequestVoteResponse> future = peer.getValue().requestVote(request);
-                Futures.addCallback(future, new FutureCallback<RequestVoteResponse>() {
-                    @Override
-                    public void onSuccess(RequestVoteResponse response) {
-                        handleRequestVoteResponse(newTerm, response, votesGranted);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
-                        // Peer unreachable; the election will simply time
-                        // out and we'll retry if no one has won (§5.2,
-                        // outcome (c)).
-                    }
-                }, MoreExecutors.directExecutor());
+            for (RaftTransport peer : peerTransports.values()) {
+                peer.requestVote(request).whenComplete((response, t) -> {
+                    if (t == null) handleRequestVoteResponse(newTerm, response, votesGranted);
+                });
             }
         } finally {
             lock.unlock();
@@ -313,7 +298,7 @@ public final class RaftNode {
                 onLeaderDiskSyncComplete(noOpIndex, leaderTerm));
 
         long lastLogIndex = store.getLastLogIndex();
-        for (String peerId : peerStubs.keySet()) {
+        for (String peerId : peerTransports.keySet()) {
             nextIndex.put(peerId, lastLogIndex + 1);
             matchIndex.put(peerId, 0L);
         }
@@ -326,7 +311,7 @@ public final class RaftNode {
         lock.lock();
         try {
             if (role != ServerRole.LEADER) return;
-            for (String peerId : peerStubs.keySet()) {
+            for (String peerId : peerTransports.keySet()) {
                 replicateTo(peerId);
             }
         } finally {
@@ -593,14 +578,14 @@ public final class RaftNode {
      * AppendEntries it receives offers it the entire log from index 1.
      */
     private void replicateTo(String peerId) {
-        RaftServiceGrpc.RaftServiceFutureStub stub = peerStubs.get(peerId);
-        if (stub == null) {
+        RaftTransport transport = peerTransports.get(peerId);
+        if (transport == null) {
             return;
         }
         long peerNextIndex = nextIndex.getOrDefault(peerId, 1L);
         long snapshotIndex = store.getSnapshotIndex();
         if (peerNextIndex <= snapshotIndex) {
-            sendInstallSnapshot(peerId, stub);
+            sendInstallSnapshot(peerId, transport);
             return;
         }
 
@@ -651,15 +636,8 @@ public final class RaftNode {
         }
         peerInflight.merge(peerId, 1, Integer::sum);
 
-        ListenableFuture<AppendEntriesResponse> future = stub.appendEntries(request);
-        Futures.addCallback(future, new FutureCallback<AppendEntriesResponse>() {
-            @Override
-            public void onSuccess(AppendEntriesResponse response) {
-                handleAppendEntriesResponse(peerId, currentTerm, lastSentIndex, response);
-            }
-
-            @Override
-            public void onFailure(Throwable t) {
+        transport.appendEntries(request).whenComplete((response, t) -> {
+            if (t != null) {
                 lock.lock();
                 try {
                     peerInflight.merge(peerId, -1, Integer::sum);
@@ -668,8 +646,10 @@ public final class RaftNode {
                 } finally {
                     lock.unlock();
                 }
+            } else {
+                handleAppendEntriesResponse(peerId, currentTerm, lastSentIndex, response);
             }
-        }, MoreExecutors.directExecutor());
+        });
     }
 
     /**
@@ -679,7 +659,7 @@ public final class RaftNode {
      * The transfer is tracked in {@link #snapshotTransfers} and progresses
      * as each chunk is acknowledged by the follower.
      */
-    private void sendInstallSnapshot(String peerId, RaftServiceGrpc.RaftServiceFutureStub stub) {
+    private void sendInstallSnapshot(String peerId, RaftTransport transport) {
         SnapshotTransfer transfer = snapshotTransfers.get(peerId);
 
         if (transfer != null && transfer.lastIncludedIndex < store.getSnapshotIndex()) {
@@ -723,23 +703,18 @@ public final class RaftNode {
         SnapshotTransfer transferRef = transfer;
         long newOffset = offset + len;
 
-        ListenableFuture<InstallSnapshotResponse> future = stub.installSnapshot(request);
-        Futures.addCallback(future, new FutureCallback<InstallSnapshotResponse>() {
-            @Override
-            public void onSuccess(InstallSnapshotResponse response) {
-                handleSnapshotChunkResponse(peerId, currentTerm, transferRef, newOffset, done, response);
-            }
-
-            @Override
-            public void onFailure(Throwable t) {
+        transport.installSnapshot(request).whenComplete((response, t) -> {
+            if (t != null) {
                 lock.lock();
                 try {
                     transferRef.inFlight = false;
                 } finally {
                     lock.unlock();
                 }
+            } else {
+                handleSnapshotChunkResponse(peerId, currentTerm, transferRef, newOffset, done, response);
             }
-        }, MoreExecutors.directExecutor());
+        });
     }
 
     private void handleSnapshotChunkResponse(String peerId, long sentTerm, SnapshotTransfer transfer,
@@ -931,6 +906,9 @@ public final class RaftNode {
         snapshotInProgress = true;
         scheduler.execute(() -> {
             try {
+                if (snapshot.lastIncludedIndex <= store.getSnapshotIndex()) {
+                    return;
+                }
                 store.saveSnapshotAndCompact(snapshot);
                 metrics.snapshotTaken();
                 log("snapshotted through index " + snapshot.lastIncludedIndex
@@ -1097,7 +1075,7 @@ public final class RaftNode {
             applyConfigurationLocked(entry.getIndex(), entry.getConfiguration());
         }
 
-        for (String peerId : peerStubs.keySet()) {
+        for (String peerId : peerTransports.keySet()) {
             replicateTo(peerId);
         }
         advanceCommitIndex(); // handles the single-node-cluster case immediately
@@ -1194,17 +1172,18 @@ public final class RaftNode {
 
         for (Map.Entry<String, String> member : members.entrySet()) {
             if (member.getKey().equals(config.selfId())) continue;
-            peerStubs.computeIfAbsent(member.getKey(), id -> peerStubFactory.apply(member.getValue()));
+            peerTransports.computeIfAbsent(member.getKey(), id -> transportFactory.connect(member.getValue()));
         }
 
         List<String> noLongerMembers = new ArrayList<>();
-        for (String peerId : peerStubs.keySet()) {
+        for (String peerId : peerTransports.keySet()) {
             if (!members.containsKey(peerId)) {
                 noLongerMembers.add(peerId);
             }
         }
         for (String peerId : noLongerMembers) {
-            closeStubChannel(peerStubs.remove(peerId));
+            RaftTransport removed = peerTransports.remove(peerId);
+            if (removed != null) removed.close();
             nextIndex.remove(peerId);
             matchIndex.remove(peerId);
             peerInflight.remove(peerId);
@@ -1221,12 +1200,6 @@ public final class RaftNode {
                     .build());
         }
         return builder.build();
-    }
-
-    private static void closeStubChannel(RaftServiceGrpc.RaftServiceFutureStub stub) {
-        if (stub != null && stub.getChannel() instanceof ManagedChannel managedChannel) {
-            managedChannel.shutdownNow();
-        }
     }
 
     /** Majority size for the *current* configuration -- recomputed every time, since §6 lets this change at runtime. */

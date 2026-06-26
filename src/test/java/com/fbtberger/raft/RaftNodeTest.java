@@ -6,9 +6,11 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
-import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.transport.GrpcTransport;
+import com.fbtberger.raft.transport.GrpcTransportServer;
+import com.fbtberger.raft.transport.RaftTransport;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
@@ -42,7 +44,7 @@ class RaftNodeTest {
     private KeyValueStateMachine sm;
     private RaftNode node;
     private Server grpcServer;
-    private final List<ManagedChannel> channels = new ArrayList<>();
+    private final List<RaftTransport> transports = new ArrayList<>();
     private final List<RaftNode> peerNodes = new ArrayList<>();
     private final List<Server> peerServers = new ArrayList<>();
 
@@ -52,16 +54,11 @@ class RaftNodeTest {
         sm = new KeyValueStateMachine();
         RaftConfig config = singleNodeConfig();
 
-        node = new RaftNode(config, store, sm, peerAddress -> {
-            ManagedChannel ch = InProcessChannelBuilder
-                    .forName(peerAddress).directExecutor().build();
-            channels.add(ch);
-            return RaftServiceGrpc.newFutureStub(ch);
-        }, RaftMetrics.noop());
+        node = new RaftNode(config, store, sm, this::connectInProcess, RaftMetrics.noop());
 
         grpcServer = InProcessServerBuilder.forName(SERVER_NAME)
                 .directExecutor()
-                .addService(new RaftGrpcService(node))
+                .addService(new GrpcTransportServer.RaftServiceAdapter(node))
                 .build()
                 .start();
 
@@ -73,7 +70,7 @@ class RaftNodeTest {
     void tearDown() {
         for (RaftNode pn : peerNodes) pn.shutdown();
         node.shutdown();
-        for (ManagedChannel ch : channels) ch.shutdownNow();
+        for (RaftTransport t : transports) t.close();
         for (Server ps : peerServers) ps.shutdown();
         grpcServer.shutdown();
     }
@@ -115,12 +112,14 @@ class RaftNodeTest {
 
     @Test
     void followerRejectsSubmitWithNotLeaderException() throws Exception {
-        // An unstarted node is a follower by construction; a single-node
-        // cluster can never stay demoted because resetElectionTimer
-        // immediately re-elects it when majority == 1.
-        RaftNode follower = new RaftNode(singleNodeConfig(), new InMemoryStorage(),
+        // Use a 3-node config so the node stays a follower (majority > 1
+        // means it won't immediately self-elect like a single-node cluster).
+        RaftConfig multiNodeConfig = multiNodeConfig("follower1");
+        RaftNode follower = new RaftNode(multiNodeConfig, new InMemoryStorage(),
                 new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
         try {
+            follower.start();
+            assertEquals(ServerRole.FOLLOWER, follower.role());
             CompletableFuture<byte[]> future = follower.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
             assertTrue(future.isCompletedExceptionally());
             assertThrows(Exception.class, () -> future.get(100, TimeUnit.MILLISECONDS));
@@ -377,17 +376,12 @@ class RaftNodeTest {
 
         InMemoryStorage peerStore = new InMemoryStorage();
         KeyValueStateMachine peerSm = new KeyValueStateMachine();
-        RaftNode peerNode = new RaftNode(cfg, peerStore, peerSm, peerAddress -> {
-            ManagedChannel ch = InProcessChannelBuilder
-                    .forName(peerAddress).directExecutor().build();
-            channels.add(ch);
-            return RaftServiceGrpc.newFutureStub(ch);
-        }, RaftMetrics.noop());
+        RaftNode peerNode = new RaftNode(cfg, peerStore, peerSm, this::connectInProcess, RaftMetrics.noop());
         peerNodes.add(peerNode);
 
         Server srv = InProcessServerBuilder.forName(address)
                 .directExecutor()
-                .addService(new RaftGrpcService(peerNode))
+                .addService(new GrpcTransportServer.RaftServiceAdapter(peerNode))
                 .build()
                 .start();
         peerServers.add(srv);
@@ -426,6 +420,30 @@ class RaftNodeTest {
             Thread.sleep(10);
         }
         fail("commitIndex did not reach " + targetIndex + " within " + timeoutMs + " ms");
+    }
+
+    private static RaftConfig multiNodeConfig(String selfId) throws Exception {
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty("node.id", selfId);
+        props.setProperty("node.port", "9091");
+        props.setProperty("data.dir", "/tmp/raft-test-unused/" + selfId);
+        props.setProperty("peer." + selfId, "localhost:9091");
+        props.setProperty("peer.other1", "localhost:9092");
+        props.setProperty("peer.other2", "localhost:9093");
+        props.setProperty("snapshot.threshold", "3");
+
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile("raft-test-", ".properties");
+        try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        return RaftConfig.load(tmp);
+    }
+
+    private RaftTransport connectInProcess(String address) {
+        ManagedChannel ch = InProcessChannelBuilder.forName(address).directExecutor().build();
+        GrpcTransport t = new GrpcTransport(ch);
+        transports.add(t);
+        return t;
     }
 
     /** Sends a complete snapshot as a single chunk (offset=0, done=true). */
