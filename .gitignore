@@ -37,3 +37,7 @@ Thumbs.db
 # ── Java ──────────────────────────────────────────────────────────────────────
 hs_err_pid*
 replay_pid*
+docs/raft_comparison_v5.pdf
+docs/atomix_comparison.pdf
+docs/microraft_comparison.pdf
+docs/raft_comparison_v4.pdf
