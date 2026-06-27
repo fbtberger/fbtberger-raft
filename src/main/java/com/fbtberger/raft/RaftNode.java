@@ -1301,6 +1301,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     public String currentLeaderId() { return currentLeaderId; }
 
+    public boolean isTransferInProgress() { return leaderTransferTarget != null; }
+
     /** This server's current view of the cluster's membership ("id" -> "host:port"), including itself. */
     public Map<String, String> currentConfiguration() {
         return currentConfiguration;

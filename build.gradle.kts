@@ -43,6 +43,7 @@ dependencies {
     // Micrometer metrics
     implementation("io.micrometer:micrometer-core:$micrometerVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:$micrometerVersion")
+    implementation("io.micrometer:micrometer-registry-jmx:$micrometerVersion")
 
     // Netty (raw TCP transport)
     implementation("io.netty:netty-transport:$nettyVersion")

@@ -5,6 +5,9 @@ import com.fbtberger.raft.transport.GrpcTransportServer;
 import com.fbtberger.raft.transport.RaftTransportFactory;
 import com.fbtberger.raft.transport.RaftTransportServer;
 import com.fbtberger.raft.transport.TimeoutTransport;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.jmx.JmxConfig;
+import io.micrometer.jmx.JmxMeterRegistry;
 import com.sun.net.httpserver.HttpServer;
 import io.grpc.ServerBuilder;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
@@ -85,9 +88,19 @@ public class RaftNodeConfiguration {
         return new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
     }
 
+    @Bean(destroyMethod = "close")
+    public JmxMeterRegistry jmxMeterRegistry() {
+        return new JmxMeterRegistry(JmxConfig.DEFAULT, io.micrometer.core.instrument.Clock.SYSTEM);
+    }
+
     @Bean
-    public RaftMetrics raftMetrics(PrometheusMeterRegistry registry, RaftConfig config) {
-        return new RaftMetrics(registry, config.selfId());
+    public RaftMetrics raftMetrics(PrometheusMeterRegistry promRegistry,
+                                    JmxMeterRegistry jmxRegistry,
+                                    RaftConfig config) {
+        CompositeMeterRegistry composite = new CompositeMeterRegistry();
+        composite.add(promRegistry);
+        composite.add(jmxRegistry);
+        return new RaftMetrics(composite, config.selfId());
     }
 
     @Bean(destroyMethod = "shutdown")
@@ -97,6 +110,19 @@ public class RaftNodeConfiguration {
                               RaftTransportFactory transportFactory,
                               RaftMetrics metrics) {
         return new RaftNode(config, storage, stateMachine, transportFactory, metrics);
+    }
+
+    @Bean
+    public RaftNodeMXBean raftNodeMBean(RaftNode raftNode, RaftStorage storage) {
+        RaftNodeMBean mbean = new RaftNodeMBean(raftNode, storage);
+        try {
+            java.lang.management.ManagementFactory.getPlatformMBeanServer()
+                    .registerMBean(mbean,
+                            new javax.management.ObjectName("com.fbtberger.raft:type=RaftNode"));
+        } catch (Exception e) {
+            throw new RuntimeException("failed to register RaftNode MBean", e);
+        }
+        return mbean;
     }
 
     @Bean
