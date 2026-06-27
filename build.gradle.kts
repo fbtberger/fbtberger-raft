@@ -74,6 +74,9 @@ dependencies {
     testImplementation("org.springframework:spring-test:$springVersion")
     testImplementation("io.grpc:grpc-inprocess:$grpcVersion")
     testImplementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+    testImplementation("org.awaitility:awaitility:4.2.1")
+    testImplementation("org.openjdk.jmh:jmh-core:1.37")
+    testAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 }
 
 protobuf {

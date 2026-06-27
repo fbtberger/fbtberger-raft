@@ -86,6 +86,41 @@ class TlsAndTimeoutsTest {
     }
 
     @Test
+    void nettyTlsRoundTrip() throws Exception {
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        TlsConfig tlsConfig = new TlsConfig(true,
+                ssc.certificate(), ssc.privateKey(), ssc.certificate(), false);
+
+        int port;
+        try (java.net.ServerSocket ss = new java.net.ServerSocket(0)) { port = ss.getLocalPort(); }
+
+        StubHandler handler = new StubHandler();
+        com.fbtberger.raft.transport.NettyTransportServer server =
+                new com.fbtberger.raft.transport.NettyTransportServer(port, handler, tlsConfig);
+        server.start();
+        try {
+            io.netty.handler.ssl.SslContext clientSsl = tlsConfig.buildClientSslContext();
+            io.netty.channel.nio.NioEventLoopGroup group = new io.netty.channel.nio.NioEventLoopGroup(1);
+            com.fbtberger.raft.transport.NettyTransport client =
+                    new com.fbtberger.raft.transport.NettyTransport("localhost", port, group, clientSsl);
+            try {
+                RequestVoteResponse resp = client.requestVote(
+                        RequestVoteRequest.newBuilder()
+                                .setTerm(5).setCandidateId("n1")
+                                .setLastLogIndex(1).setLastLogTerm(1).build()
+                ).get(5, TimeUnit.SECONDS);
+                assertEquals(5, resp.getTerm());
+                assertTrue(resp.getVoteGranted());
+            } finally {
+                client.close();
+                group.shutdownGracefully().sync();
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
     void grpcTlsRoundTrip() throws Exception {
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         TlsConfig tlsConfig = new TlsConfig(true,
