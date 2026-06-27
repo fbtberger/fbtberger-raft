@@ -984,11 +984,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     // ------------------------------------------------------------------
-    // Log compaction / snapshotting (§7, §5.1 COW). Every server does
-    // this independently, not just the leader. The state machine bytes
-    // are captured under `lock` (fast, in-memory copy-on-write), then
-    // persisted and compacted on a background thread so disk I/O doesn't
-    // block replication or elections.
+    // Log compaction / COW snapshot isolation (§7, §5.1)
     // ------------------------------------------------------------------
 
     /** Takes a new snapshot if enough newly applied entries have piled up since the last one. Caller must hold {@code lock}. */
@@ -1001,9 +997,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
-     * §5.1 copy-on-write: captures a lightweight snapshot reference under
-     * the lock (fast), then serializes and persists on a background thread
-     * so the lock is NOT held during serialization or disk I/O.
+     * Copy-on-write snapshot isolation (§5.1): the expensive work
+     * (serialization + disk I/O) runs entirely outside the Raft lock.
+     * Only {@link #captureCowSnapshot} runs under the lock — it must be
+     * fast (shallow copy, not serialization).
      */
     private void takeSnapshotAsync() {
         long applied = lastApplied.get();
@@ -1011,7 +1008,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
         long includedTerm = store.getTermAt(applied);
-        java.util.function.Supplier<byte[]> cowRef = stateMachine.prepareCowSnapshot();
+        java.util.function.Supplier<byte[]> cowSnapshot = captureCowSnapshot();
         byte[] configurationData = toProto(currentConfiguration).toByteArray();
 
         snapshotInProgress = true;
@@ -1020,7 +1017,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (applied <= store.getSnapshotIndex()) {
                     return;
                 }
-                byte[] stateMachineData = cowRef.get();
+                byte[] stateMachineData = cowSnapshot.get();
                 RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
                         applied, includedTerm, stateMachineData, configurationData);
                 store.saveSnapshotAndCompact(snapshot);
@@ -1032,6 +1029,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 snapshotInProgress = false;
             }
         });
+    }
+
+    /**
+     * COW snapshot capture (§5.1): called under the Raft lock to obtain a
+     * lightweight, immutable reference to the state machine's current state.
+     * The returned supplier serializes the snapshot lazily when invoked on
+     * a background thread — keeping serialization and disk I/O out of the
+     * critical path. Implementations like {@code KeyValueStateMachine} do a
+     * fast {@code new HashMap<>(data)} here instead of serializing.
+     */
+    private java.util.function.Supplier<byte[]> captureCowSnapshot() {
+        return stateMachine.prepareCowSnapshot();
     }
 
     /** Synchronous snapshot for {@link #snapshotNow()} — blocks until complete. */
