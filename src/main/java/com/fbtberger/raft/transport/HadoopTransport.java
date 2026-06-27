@@ -14,6 +14,7 @@ import com.google.protobuf.MessageLite;
 import org.apache.hadoop.io.BytesWritable;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.concurrent.CompletableFuture;
 
 public final class HadoopTransport implements RaftTransport {
@@ -74,13 +75,13 @@ public final class HadoopTransport implements RaftTransport {
     }
 
     private static <T> CompletableFuture<T> call(RpcCall<T> rpc) {
-        CompletableFuture<T> future = new CompletableFuture<>();
-        try {
-            future.complete(rpc.call());
-        } catch (IOException e) {
-            future.completeExceptionally(e);
-        }
-        return future;
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return rpc.call();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
     }
 
     @FunctionalInterface

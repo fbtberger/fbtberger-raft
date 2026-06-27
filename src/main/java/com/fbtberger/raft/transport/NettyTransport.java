@@ -37,7 +37,7 @@ public final class NettyTransport implements RaftTransport {
     private final AtomicInteger nextReqId = new AtomicInteger(0);
     private final Map<Integer, CompletableFuture<?>> pending = new ConcurrentHashMap<>();
 
-    NettyTransport(String host, int port, NioEventLoopGroup group, SslContext sslContext) {
+    public NettyTransport(String host, int port, NioEventLoopGroup group, SslContext sslContext) {
         this.group = group;
         try {
             this.channel = new Bootstrap()
