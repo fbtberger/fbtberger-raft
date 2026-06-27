@@ -127,6 +127,14 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private volatile CompletableFuture<Void> leaderTransferResult = null;
     private volatile ScheduledFuture<?> leaderTransferTimeout = null;
 
+    // Linearizable reads (ReadIndex): pending read barriers awaiting
+    // leadership confirmation from a majority of peers.
+    private final List<ReadBarrier> pendingReadBarriers = new ArrayList<>();
+
+    // Joint consensus (§6): the old configuration during a C_old,new
+    // transition, or null when not in joint mode.
+    private volatile Map<String, String> oldConfiguration;
+
     private final Random random = new Random();
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTask;
@@ -398,6 +406,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             leaderTransferTimeout.cancel(false);
             leaderTransferTimeout = null;
         }
+        for (ReadBarrier rb : pendingReadBarriers) {
+            rb.future.completeExceptionally(new NotLeaderException(null));
+        }
+        pendingReadBarriers.clear();
+        oldConfiguration = null;
         metrics.stepDown();
         role = ServerRole.FOLLOWER;
         resetElectionTimer();
@@ -856,6 +869,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     matchIndex.put(peerId, lastSentIndex);
                 }
                 advanceCommitIndex();
+                for (ReadBarrier rb : pendingReadBarriers) rb.confirm(peerId);
+                checkReadBarriers();
                 if (peerId.equals(leaderTransferTarget)) {
                     checkTransferReadyLocked();
                 }
@@ -902,19 +917,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private void advanceCommitIndex() {
         long currentTerm = store.getCurrentTerm();
         long lastLogIndex = store.getLastLogIndex();
-        int neededForMajority = majority();
         for (long n = lastLogIndex; n > commitIndex.get(); n--) {
             LogEntry entry = store.getLogEntry(n);
             if (entry == null || entry.getTerm() != currentTerm) {
                 continue;
             }
-            // §10.2.1: count the leader's own copy only when it has been
-            // durably written to disk, rather than assuming it immediately.
-            int matches = leaderDiskMatchIndex.get() >= n ? 1 : 0;
-            for (long m : matchIndex.values()) {
-                if (m >= n) matches++;
-            }
-            if (matches >= neededForMajority) {
+            if (hasSeparateMajorities(id -> matchIndex.getOrDefault(id, 0L), n)) {
                 commitIndex.set(n);
                 applyCommittedEntries();
                 break;
@@ -942,13 +950,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             byte[] result;
             if (entry.hasConfiguration()) {
                 result = new byte[0];
-                boolean stillAMember = entry.getConfiguration().getMembersList().stream()
+                ClusterConfiguration cfg = entry.getConfiguration();
+                boolean isJoint = cfg.getOldMembersCount() > 0;
+                boolean stillAMember = cfg.getMembersList().stream()
                         .anyMatch(member -> member.getId().equals(config.selfId()));
-                if (role == ServerRole.LEADER && !stillAMember) {
-                    // §6: we've now seen the configuration that removes us
-                    // through to commitment -- our job here is done, so we
-                    // step down and let a leader be (re-)elected from
-                    // whoever is actually still a member.
+                if (role == ServerRole.LEADER && isJoint) {
+                    log("joint config C_old,new committed; proposing final C_new");
+                    appendAndReplicateLocked(LogEntry.newBuilder()
+                            .setConfiguration(toProto(currentConfiguration)));
+                }
+                if (role == ServerRole.LEADER && !stillAMember && !isJoint) {
                     log("stepping down: committed configuration no longer includes us");
                     becomeFollowerLocked(store.getCurrentTerm());
                 }
@@ -1076,6 +1087,82 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         } finally {
             lock.unlock();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Linearizable reads (ReadIndex protocol)
+    // ------------------------------------------------------------------
+
+    /**
+     * Confirms that this server is still the leader and that all entries
+     * up to the current commit index have been applied, so a subsequent
+     * read from the state machine is linearizable. The returned future
+     * completes once a majority of peers have confirmed leadership via
+     * a heartbeat round and {@code lastApplied >= commitIndex} at the
+     * time of the call.
+     */
+    public CompletableFuture<Void> readIndex() {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                CompletableFuture<Void> f = new CompletableFuture<>();
+                f.completeExceptionally(new NotLeaderException(currentLeaderId));
+                return f;
+            }
+            long ri = commitIndex.get();
+            if (majority() == 1) {
+                return lastApplied.get() >= ri
+                        ? CompletableFuture.completedFuture(null)
+                        : awaitApplied(ri);
+            }
+            ReadBarrier barrier = new ReadBarrier(ri, majority());
+            pendingReadBarriers.add(barrier);
+            for (String peerId : peerTransports.keySet()) {
+                replicateTo(peerId);
+            }
+            return barrier.future;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private CompletableFuture<Void> awaitApplied(long targetIndex) {
+        CompletableFuture<Void> f = new CompletableFuture<>();
+        scheduler.schedule(() -> {
+            if (lastApplied.get() >= targetIndex) {
+                f.complete(null);
+            } else {
+                awaitApplied(targetIndex).whenComplete((v, t) -> {
+                    if (t != null) f.completeExceptionally(t); else f.complete(null);
+                });
+            }
+        }, 5, TimeUnit.MILLISECONDS);
+        return f;
+    }
+
+    private void checkReadBarriers() {
+        pendingReadBarriers.removeIf(barrier -> {
+            if (barrier.isConfirmed() && lastApplied.get() >= barrier.readIndex) {
+                barrier.future.complete(null);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    private static final class ReadBarrier {
+        final long readIndex;
+        final int needed;
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+        final java.util.Set<String> confirmed = ConcurrentHashMap.newKeySet();
+
+        ReadBarrier(long readIndex, int needed) {
+            this.readIndex = readIndex;
+            this.needed = needed;
+        }
+
+        void confirm(String peerId) { confirmed.add(peerId); }
+        boolean isConfirmed() { return confirmed.size() + 1 >= needed; }
     }
 
     // ------------------------------------------------------------------
@@ -1245,6 +1332,38 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
+    /**
+     * Joint consensus (§6): atomically replaces the entire cluster membership.
+     * This two-phase approach is safe for arbitrary changes (adding and removing
+     * multiple servers at once). Phase 1 appends C_old,new (requiring majorities
+     * from both old and new configs); phase 2 is triggered automatically when
+     * C_old,new commits, appending C_new (the final configuration).
+     */
+    public CompletableFuture<byte[]> setConfiguration(Map<String, String> newMembers) {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                return failedFuture(new NotLeaderException(currentLeaderId));
+            }
+            if (newMembers.isEmpty()) {
+                return failedFuture(new ConfigurationChangeException("new configuration must not be empty"));
+            }
+            CompletableFuture<byte[]> rejected = rejectIfConfigurationChangePending();
+            if (rejected != null) {
+                return rejected;
+            }
+            if (newMembers.equals(currentConfiguration)) {
+                return CompletableFuture.completedFuture(new byte[0]);
+            }
+
+            log("proposing joint configuration C_old,new -> " + newMembers.keySet());
+            ClusterConfiguration joint = toJointProto(currentConfiguration, newMembers);
+            return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(joint));
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Returns a failed future if a config change isn't safe right now, or null if it's fine to proceed. */
     private CompletableFuture<byte[]> rejectIfConfigurationChangePending() {
         // §4 errata: a leader must commit an entry from its own term
@@ -1377,17 +1496,29 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         for (ClusterConfiguration.Member member : configuration.getMembersList()) {
             members.put(member.getId(), member.getAddress());
         }
+        if (configuration.getOldMembersCount() > 0) {
+            Map<String, String> old = new LinkedHashMap<>();
+            for (ClusterConfiguration.Member m : configuration.getOldMembersList()) {
+                old.put(m.getId(), m.getAddress());
+            }
+            this.oldConfiguration = Map.copyOf(old);
+        } else {
+            this.oldConfiguration = null;
+        }
         this.currentConfiguration = Map.copyOf(members);
         this.currentConfigurationIndex = index;
 
-        for (Map.Entry<String, String> member : members.entrySet()) {
+        Map<String, String> allMembers = new LinkedHashMap<>(members);
+        if (oldConfiguration != null) allMembers.putAll(oldConfiguration);
+
+        for (Map.Entry<String, String> member : allMembers.entrySet()) {
             if (member.getKey().equals(config.selfId())) continue;
             peerTransports.computeIfAbsent(member.getKey(), id -> transportFactory.connect(member.getValue()));
         }
 
         List<String> noLongerMembers = new ArrayList<>();
         for (String peerId : peerTransports.keySet()) {
-            if (!members.containsKey(peerId)) {
+            if (!allMembers.containsKey(peerId)) {
                 noLongerMembers.add(peerId);
             }
         }
@@ -1412,9 +1543,62 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         return builder.build();
     }
 
-    /** Majority size for the *current* configuration -- recomputed every time, since §6 lets this change at runtime. */
+    private static ClusterConfiguration toJointProto(Map<String, String> oldMembers,
+                                                      Map<String, String> newMembers) {
+        ClusterConfiguration.Builder builder = ClusterConfiguration.newBuilder();
+        for (Map.Entry<String, String> m : newMembers.entrySet()) {
+            builder.addMembers(ClusterConfiguration.Member.newBuilder()
+                    .setId(m.getKey()).setAddress(m.getValue()).build());
+        }
+        for (Map.Entry<String, String> m : oldMembers.entrySet()) {
+            builder.addOldMembers(ClusterConfiguration.Member.newBuilder()
+                    .setId(m.getKey()).setAddress(m.getValue()).build());
+        }
+        return builder.build();
+    }
+
+    /**
+     * Majority size for the current configuration. During joint consensus
+     * (C_old,new), returns the larger of the two majorities so that any
+     * check using {@code count >= majority()} implicitly requires
+     * majorities from both old and new configurations.
+     */
     private int majority() {
-        return currentConfiguration.size() / 2 + 1;
+        int newMajority = currentConfiguration.size() / 2 + 1;
+        Map<String, String> old = oldConfiguration;
+        if (old == null) return newMajority;
+        int oldMajority = old.size() / 2 + 1;
+        return Math.max(oldMajority, newMajority);
+    }
+
+    /**
+     * Checks whether {@code count} satisfies separate majorities in both
+     * the old and new configurations during joint consensus, or just the
+     * current majority when not in joint mode. Used by
+     * {@link #advanceCommitIndex()} for accurate commit decisions.
+     */
+    private boolean hasSeparateMajorities(java.util.function.ToLongFunction<String> matchFn, long n) {
+        Map<String, String> old = oldConfiguration;
+        int newCount = countMatches(currentConfiguration, matchFn, n);
+        if (old == null) {
+            return newCount >= currentConfiguration.size() / 2 + 1;
+        }
+        int oldCount = countMatches(old, matchFn, n);
+        return newCount >= currentConfiguration.size() / 2 + 1
+                && oldCount >= old.size() / 2 + 1;
+    }
+
+    private int countMatches(Map<String, String> config,
+                             java.util.function.ToLongFunction<String> matchFn, long n) {
+        int count = 0;
+        for (String id : config.keySet()) {
+            if (id.equals(this.config.selfId())) {
+                if (leaderDiskMatchIndex.get() >= n) count++;
+            } else {
+                if (matchFn.applyAsLong(id) >= n) count++;
+            }
+        }
+        return count;
     }
 
     private void log(String msg) {
