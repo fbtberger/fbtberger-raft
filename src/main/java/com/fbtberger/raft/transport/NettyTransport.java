@@ -8,6 +8,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.MessageLite;
 import io.netty.bootstrap.Bootstrap;
@@ -79,6 +81,11 @@ public final class NettyTransport implements RaftTransport {
     }
 
     @Override
+    public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
+        return send(NettyProtocol.TIMEOUT_NOW_REQ, request);
+    }
+
+    @Override
     public void close() {
         channel.close();
         pending.values().forEach(f -> f.completeExceptionally(new RuntimeException("transport closed")));
@@ -137,6 +144,7 @@ public final class NettyTransport implements RaftTransport {
                 case NettyProtocol.APPEND_ENTRIES_RESP -> AppendEntriesResponse.parseFrom(payload);
                 case NettyProtocol.INSTALL_SNAPSHOT_RESP -> InstallSnapshotResponse.parseFrom(payload);
                 case NettyProtocol.PRE_VOTE_RESP -> PreVoteResponse.parseFrom(payload);
+                case NettyProtocol.TIMEOUT_NOW_RESP -> TimeoutNowResponse.parseFrom(payload);
                 default -> throw new IllegalStateException("unknown response type: " + type);
             };
         }

@@ -8,6 +8,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.MessageLite;
 import io.netty.bootstrap.ServerBootstrap;
@@ -105,6 +107,10 @@ public final class NettyTransportServer implements RaftTransportServer {
                     case NettyProtocol.PRE_VOTE_REQ -> {
                         response = handler.handlePreVote(PreVoteRequest.parseFrom(payload));
                         respType = NettyProtocol.PRE_VOTE_RESP;
+                    }
+                    case NettyProtocol.TIMEOUT_NOW_REQ -> {
+                        response = handler.handleTimeoutNow(TimeoutNowRequest.parseFrom(payload));
+                        respType = NettyProtocol.TIMEOUT_NOW_RESP;
                     }
                     default -> throw new IllegalStateException("unknown request type: " + type);
                 }

@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.transport.RaftTransport;
 import com.fbtberger.raft.transport.RaftTransportFactory;
 import com.google.protobuf.ByteString;
@@ -119,6 +121,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // or AppendEntries). A server only grants a PreVote if it hasn't heard
     // from a leader within the election timeout window.
     private volatile long lastLeaderContactMs = 0;
+
+    // §3.10: ongoing leadership transfer target, or null if none.
+    private volatile String leaderTransferTarget = null;
+    private volatile CompletableFuture<Void> leaderTransferResult = null;
+    private volatile ScheduledFuture<?> leaderTransferTimeout = null;
 
     private final Random random = new Random();
     private ScheduledFuture<?> electionTimer;
@@ -384,6 +391,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         if (role == ServerRole.LEADER && heartbeatTask != null) {
             heartbeatTask.cancel(false);
+        }
+        leaderTransferTarget = null;
+        leaderTransferResult = null;
+        if (leaderTransferTimeout != null) {
+            leaderTransferTimeout.cancel(false);
+            leaderTransferTimeout = null;
         }
         metrics.stepDown();
         role = ServerRole.FOLLOWER;
@@ -842,8 +855,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (lastSentIndex > currentMatch) {
                     matchIndex.put(peerId, lastSentIndex);
                 }
-                // nextIndex was already advanced optimistically when sent.
                 advanceCommitIndex();
+                if (peerId.equals(leaderTransferTarget)) {
+                    checkTransferReadyLocked();
+                }
             } else {
                 metrics.replicationFailure();
                 // §10.2.2: revert optimistic nextIndex to last confirmed
@@ -1052,7 +1067,113 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(currentLeaderId));
             }
+            if (leaderTransferTarget != null) {
+                metrics.clientRejected();
+                return failedFuture(new NotLeaderException(leaderTransferTarget));
+            }
             return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(command)));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Leadership transfer (§3.10)
+    // ------------------------------------------------------------------
+
+    /**
+     * Transfers leadership to {@code targetId}. The leader stops accepting
+     * new client requests, ensures the target's log is fully caught up,
+     * then sends a {@code TimeoutNow} RPC so the target starts an election
+     * immediately. If the transfer doesn't complete within an election
+     * timeout, the leader aborts and resumes normal operation.
+     */
+    public CompletableFuture<Void> transferLeadership(String targetId) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                result.completeExceptionally(new NotLeaderException(currentLeaderId));
+                return result;
+            }
+            if (!currentConfiguration.containsKey(targetId)) {
+                result.completeExceptionally(new IllegalArgumentException(
+                        targetId + " is not a current cluster member"));
+                return result;
+            }
+            if (targetId.equals(config.selfId())) {
+                result.complete(null);
+                return result;
+            }
+
+            leaderTransferTarget = targetId;
+            leaderTransferResult = result;
+            log("starting leadership transfer to " + targetId);
+
+            leaderTransferTimeout = scheduler.schedule(() -> {
+                lock.lock();
+                try {
+                    if (leaderTransferTarget != null) {
+                        log("leadership transfer to " + leaderTransferTarget + " timed out, aborting");
+                        leaderTransferTarget = null;
+                        leaderTransferTimeout = null;
+                        leaderTransferResult = null;
+                        result.completeExceptionally(new RuntimeException("leadership transfer timed out"));
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }, ELECTION_TIMEOUT_MAX_MS, TimeUnit.MILLISECONDS);
+
+            replicateTo(targetId);
+            checkTransferReadyLocked();
+        } finally {
+            lock.unlock();
+        }
+        return result;
+    }
+
+    private void checkTransferReadyLocked() {
+        String targetId = leaderTransferTarget;
+        CompletableFuture<Void> result = leaderTransferResult;
+        if (targetId == null || result == null) return;
+
+        long targetMatch = matchIndex.getOrDefault(targetId, 0L);
+        if (targetMatch < store.getLastLogIndex()) return;
+
+        RaftTransport transport = peerTransports.get(targetId);
+        if (transport == null) return;
+
+        log("target " + targetId + " is caught up, sending TimeoutNow");
+        long currentTerm = store.getCurrentTerm();
+        transport.timeoutNow(TimeoutNowRequest.newBuilder()
+                .setTerm(currentTerm).build()).whenComplete((resp, t) -> {
+            lock.lock();
+            try {
+                leaderTransferTarget = null;
+                leaderTransferResult = null;
+                if (leaderTransferTimeout != null) {
+                    leaderTransferTimeout.cancel(false);
+                    leaderTransferTimeout = null;
+                }
+                if (t != null) {
+                    result.completeExceptionally(t);
+                } else {
+                    result.complete(null);
+                }
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    @Override
+    public TimeoutNowResponse handleTimeoutNow(TimeoutNowRequest request) {
+        lock.lock();
+        try {
+            log("received TimeoutNow, starting immediate election");
+            startRealElection(store.getCurrentTerm() + 1);
+            return TimeoutNowResponse.getDefaultInstance();
         } finally {
             lock.unlock();
         }

@@ -6,6 +6,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RaftServiceGrpc;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
@@ -74,6 +76,14 @@ public final class GrpcTransportServer implements RaftTransportServer {
         public void preVote(PreVoteRequest request, StreamObserver<PreVoteResponse> observer) {
             try {
                 observer.onNext(handler.handlePreVote(request));
+                observer.onCompleted();
+            } catch (RuntimeException e) { observer.onError(e); }
+        }
+
+        @Override
+        public void timeoutNow(TimeoutNowRequest request, StreamObserver<TimeoutNowResponse> observer) {
+            try {
+                observer.onNext(handler.handleTimeoutNow(request));
                 observer.onCompleted();
             } catch (RuntimeException e) { observer.onError(e); }
         }

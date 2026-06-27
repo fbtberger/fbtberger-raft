@@ -6,6 +6,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 
@@ -44,6 +46,12 @@ public final class TimeoutTransport implements RaftTransport {
     public CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request) {
         return delegate.preVote(request)
                 .orTimeout(timeouts.preVoteMs(), TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
+        return delegate.timeoutNow(request)
+                .orTimeout(timeouts.requestVoteMs(), TimeUnit.MILLISECONDS);
     }
 
     @Override

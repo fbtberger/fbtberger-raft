@@ -8,6 +8,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 
 import java.util.concurrent.CompletableFuture;
 
@@ -16,5 +18,6 @@ public interface RaftTransport extends AutoCloseable {
     CompletableFuture<AppendEntriesResponse> appendEntries(AppendEntriesRequest request);
     CompletableFuture<InstallSnapshotResponse> installSnapshot(InstallSnapshotRequest request);
     CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request);
+    CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request);
     @Override void close();
 }

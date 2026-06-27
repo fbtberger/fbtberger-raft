@@ -4,6 +4,7 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteRequest;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.ipc.ProtocolSignature;
@@ -66,6 +67,12 @@ public final class HadoopTransportServer implements RaftTransportServer {
         public BytesWritable preVote(BytesWritable request) throws IOException {
             return new BytesWritable(handler.handlePreVote(
                     PreVoteRequest.parseFrom(unwrap(request))).toByteArray());
+        }
+
+        @Override
+        public BytesWritable timeoutNow(BytesWritable request) throws IOException {
+            return new BytesWritable(handler.handleTimeoutNow(
+                    TimeoutNowRequest.parseFrom(unwrap(request))).toByteArray());
         }
 
         @Override

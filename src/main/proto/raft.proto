@@ -96,9 +96,20 @@ message PreVoteResponse {
   bool voteGranted = 2;
 }
 
+// TimeoutNow RPC (§3.10): the leader sends this to a target server to
+// trigger an immediate election, transferring leadership without waiting
+// for an election timeout.
+message TimeoutNowRequest {
+  int64 term = 1;
+}
+
+message TimeoutNowResponse {
+}
+
 service RaftService {
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
   rpc PreVote (PreVoteRequest) returns (PreVoteResponse);
+  rpc TimeoutNow (TimeoutNowRequest) returns (TimeoutNowResponse);
 }

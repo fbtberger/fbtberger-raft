@@ -22,6 +22,8 @@ final class NettyProtocol {
     static final byte INSTALL_SNAPSHOT_RESP  = 6;
     static final byte PRE_VOTE_REQ           = 7;
     static final byte PRE_VOTE_RESP          = 8;
+    static final byte TIMEOUT_NOW_REQ        = 9;
+    static final byte TIMEOUT_NOW_RESP       = 10;
 
     static final int HEADER_BYTES = 1 + 4; // type + reqId
 

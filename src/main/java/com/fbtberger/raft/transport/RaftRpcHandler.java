@@ -8,10 +8,13 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 
 public interface RaftRpcHandler {
     RequestVoteResponse handleRequestVote(RequestVoteRequest request);
     AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request);
     InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request);
     PreVoteResponse handlePreVote(PreVoteRequest request);
+    TimeoutNowResponse handleTimeoutNow(TimeoutNowRequest request);
 }

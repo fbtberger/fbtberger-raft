@@ -6,6 +6,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.TimeoutNowRequest;
+import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -46,6 +48,12 @@ public final class HadoopTransport implements RaftTransport {
     public CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request) {
         return call(() -> PreVoteResponse.parseFrom(
                 unwrap(proxy.preVote(wrap(request)))));
+    }
+
+    @Override
+    public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
+        return call(() -> TimeoutNowResponse.parseFrom(
+                unwrap(proxy.timeoutNow(wrap(request)))));
     }
 
     @Override
