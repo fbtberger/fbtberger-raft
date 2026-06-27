@@ -61,6 +61,13 @@ public class MyStateMachine
   public void restoreSnapshot(byte[] data) {
     state = deserialize(data);
   }
+
+  // Optional COW override for large state:
+  @Override
+  public Supplier<byte[]> prepareCowSnapshot() {
+    var copy = shallowCopy(state); // fast
+    return () -> serialize(copy);  // lazy
+  }
 }
 ```
 
@@ -163,13 +170,15 @@ All transports wrapped with `TimeoutTransport` automatically. gRPC and Netty sup
 | Class | Durability | Use |
 |-------|-----------|-----|
 | `BerkeleyDbStorage` | fsync | Production default |
-| `WalStorage` | Append-only WAL | Lightweight alternative |
+| `WalStorage` | Segmented WAL + CRC32 | Lightweight alternative |
 | `InMemoryStorage` | None | Tests only |
 
 ```java
 @Bean
 public RaftStorage raftStorage(RaftConfig cfg) {
   return new WalStorage(cfg.dataDir().toFile());
+  // or: new WalStorage(dir, 32*1024*1024)
+  //     for 32 MB segment size
 }
 ```
 
@@ -177,7 +186,7 @@ public RaftStorage raftStorage(RaftConfig cfg) {
 
 | Interface | Purpose |
 |-----------|---------|
-| `StateMachine` | Your app logic |
+| `StateMachine` | Your app logic (+ COW snapshot) |
 | `RaftStorage` | Durable state |
 | `RaftTransport` | Peer comms (5 RPCs) |
 | `RaftTransportFactory` | Connection factory |

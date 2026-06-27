@@ -37,8 +37,9 @@ The project implements:
 
 Each Raft node runs as a single JVM process. The **RaftNode** class owns the
 consensus algorithm. It delegates durable storage to **RaftStorage** (backed by
-Berkeley DB JE), state machine operations to **StateMachine**, and peer
-communication to the **Transport** abstraction layer.
+Berkeley DB JE, a segmented WAL, or in-memory for tests), state machine
+operations to **StateMachine**, and peer communication to the **Transport**
+abstraction layer.
 
 The transport layer is pluggable: **gRPC** (default, HTTP/2 + protobuf),
 **Netty** (raw TCP with custom framing), or **Hadoop RPC** (WritableRpcEngine
@@ -132,11 +133,12 @@ Three optimizations from §10.2 reduce latency:
 
 Snapshots are handled in two parts:
 
-**Taking snapshots (§5.1 COW)**: Automatic snapshots capture the state machine
-bytes under the Raft lock (fast, in-memory), then persist and compact the log
-on a background thread. This avoids blocking replication and elections during
-disk I/O. A staleness check prevents a background snapshot from overwriting a
-more recent `InstallSnapshot`.
+**Taking snapshots (§5.1 COW)**: `StateMachine.prepareCowSnapshot()` captures a
+lightweight copy-on-write reference under the Raft lock (e.g. a shallow `HashMap`
+copy for `KeyValueStateMachine`). The returned `Supplier<byte[]>` is invoked on a
+background thread to serialize the snapshot and persist it — neither serialization
+nor disk I/O blocks the Raft lock. A staleness check prevents a background
+snapshot from overwriting a more recent `InstallSnapshot`.
 
 **Transferring snapshots (§7, Figure 13)**: The leader packs the state machine
 data and cluster configuration into a single byte stream
@@ -193,11 +195,15 @@ Three `RaftStorage` implementations are available:
 | `WalStorage` | Append-only WAL + fsync | Lightweight alternative |
 | `InMemoryStorage` | None | Tests and demos |
 
-**WalStorage** uses an append-only file (`wal.log`) with length-prefixed protobuf
-entries and an in-memory index (log index to file offset) rebuilt on recovery.
-Metadata (term/vote) and snapshots are stored in separate files, atomically
-replaced via rename. Supports deferred fsync (§10.2.1) via a background thread.
-Compaction rewrites the WAL after a snapshot discards the prefix.
+**WalStorage** uses segmented append-only files (`wal-NNNNNN.log`) with CRC32-checked
+frames (`[4B length][4B CRC32][protobuf bytes]`). Each segment has a configurable
+maximum size (default 64 MB); a new segment is started when the active segment
+exceeds the limit. An in-memory index (log index to segment + file offset) is
+rebuilt on recovery by scanning all segments sequentially; frames with CRC32
+mismatches are truncated. Metadata (term/vote) and snapshots are stored in
+separate files, atomically replaced via rename. Supports deferred fsync (§10.2.1)
+via a background thread. Compaction deletes entire obsolete segments after a
+snapshot rather than rewriting.
 
 # 10. Errata Fix (§4)
 
@@ -248,4 +254,6 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.node.commit.index` | Gauge | Highest committed log index |
 | `raft.node.last.applied` | Gauge | Last applied log index |
 | `raft.node.role` | Gauge | Current role (0=follower, 1=candidate, 2=leader) |
+| `raft.node.log.last.index` | Gauge | Index of the last log entry |
+| `raft.node.snapshot.index` | Gauge | Snapshot boundary (last compacted index) |
 | `raft.cluster.size` | Gauge | Number of nodes in configuration |

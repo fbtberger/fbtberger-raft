@@ -34,7 +34,9 @@ For a quick API reference, see the
   the §4 errata fix (config changes rejected until leader's no-op commits)
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
-  - Copy-on-write async snapshotting (§5.1): background disk I/O
+  - Copy-on-write async snapshotting (§5.1): `prepareCowSnapshot()` captures a
+    lightweight reference under the lock; serialization and disk I/O run on a
+    background thread without blocking the Raft lock
   - Independent per-server compaction with configurable threshold
 - **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
   implementations, with per-RPC configurable timeouts and TLS/mTLS support
@@ -44,7 +46,8 @@ For a quick API reference, see the
 - **SLF4J/Logback** structured logging
 - **Durable storage** behind a `RaftStorage` interface:
   - `BerkeleyDbStorage` — Berkeley DB JE with synchronous commit
-  - `WalStorage` — append-only Write-Ahead Log with crash recovery
+  - `WalStorage` — segmented append-only WAL with CRC32 frame checksums,
+    configurable max segment size (default 64 MB), and crash recovery
   - `InMemoryStorage` — non-durable, for tests/demos
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
@@ -80,12 +83,13 @@ raft-java/
     │       ├── ServerRole.java             # FOLLOWER / CANDIDATE / LEADER
     │       ├── RaftStorage.java            # durable state interface
     │       ├── BerkeleyDbStorage.java      # Berkeley DB JE implementation
-    │       ├── WalStorage.java             # append-only WAL implementation
+    │       ├── WalStorage.java             # segmented WAL with CRC32 checksums
     │       ├── InMemoryStorage.java        # non-durable test implementation
-    │       ├── StateMachine.java           # state machine interface
+    │       ├── StateMachine.java           # state machine interface (+ COW snapshot)
     │       ├── KeyValueStateMachine.java   # demo key-value store
     │       ├── RaftClientGrpcService.java  # client-facing gRPC adapter
     │       ├── RaftNodeMXBean.java         # JMX management interface
+    │       ├── RaftNodeMBean.java          # JMX MXBean implementation
     │       ├── HealthCheck.java            # liveness + readiness checks
     │       ├── RaftNodeConfiguration.java  # Spring IoC wiring
     │       ├── RaftServer.java             # main() + interactive CLI
@@ -110,15 +114,23 @@ raft-java/
     │       │   └── HadoopRaftProtocol.java       # Hadoop protocol interface
     │       └── client/
     │           ├── RaftClient.java               # generic client with leader discovery
+    │           ├── KeyValueClient.java            # key-value convenience wrapper
+    │           ├── RaftClientException.java        # client error type
     │           └── RaftClientDemo.java            # standalone client process
     └── test/java/com/fbtberger/raft/
         ├── RaftNodeTest.java                   # unit tests (single-node + multi-node)
-        ├── ThreeNodeClusterTest.java           # integration tests (3-node in-process)
+        ├── ThreeNodeClusterTest.java           # integration tests (3-node gRPC in-process)
+        ├── MultiTransportClusterTest.java      # 3-node cluster across all transports
+        ├── TlsAndTimeoutsTest.java             # TLS/mTLS integration + timeout config
+        ├── HealthCheckTest.java                # liveness + readiness tests
         ├── RaftClientGrpcServiceTest.java      # client RPC tests
         ├── RaftNodeConfigurationTest.java      # Spring wiring tests
         ├── InMemoryStorageTest.java            # storage contract tests
-        ├── WalStorageTest.java                 # WAL storage + recovery tests
-        └── KeyValueStateMachineTest.java       # state machine tests
+        ├── WalStorageTest.java                 # WAL storage, segmentation + recovery
+        ├── KeyValueStateMachineTest.java       # state machine tests
+        └── transport/
+            ├── NettyTransportTest.java         # Netty round-trip tests
+            └── HadoopTransportTest.java        # Hadoop round-trip tests
 ```
 
 ## Configuration
