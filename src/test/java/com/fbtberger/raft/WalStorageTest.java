@@ -198,6 +198,41 @@ class WalStorageTest {
         assertNotNull(store.getLogEntry(3));
     }
 
+    @Test
+    void truncateAfterSnapshotPreservesSnapshotBoundary() {
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b")));
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(1, 1, new byte[0], new byte[0]));
+        store.truncateFrom(2);
+        assertEquals(1, store.getLastLogIndex());
+        assertEquals(1, store.getLastLogTerm());
+        assertEquals(1, store.getSnapshotIndex());
+    }
+
+    @Test
+    void appendAfterTruncateWorks() {
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b")));
+        store.truncateFrom(2);
+        store.appendEntries(List.of(entry(2, 2, "b2")));
+        assertEquals(2, store.getLastLogIndex());
+        assertEquals(2, store.getLastLogTerm());
+        assertEquals("b2", store.getLogEntry(2).getCommand().toStringUtf8());
+    }
+
+    @Test
+    void getTermAtReturnsMinus1ForCompactedEntry() {
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b")));
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(2, 1, new byte[0], new byte[0]));
+        assertEquals(-1, store.getTermAt(1));
+    }
+
+    @Test
+    void deferSyncReturnsCompletableFuture() throws Exception {
+        var future = store.appendEntriesDeferSync(List.of(entry(1, 1, "a")));
+        assertNotNull(future);
+        future.get(2, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(1, store.getLastLogIndex());
+    }
+
     private static LogEntry entry(long index, long term, String command) {
         return LogEntry.newBuilder()
                 .setIndex(index).setTerm(term)

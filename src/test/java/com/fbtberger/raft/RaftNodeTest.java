@@ -542,6 +542,68 @@ class RaftNodeTest {
         assertEquals(50, cfg.snapshotThreshold());
     }
 
+    // ---- leadership transfer (§3.10) ------------------------------------
+
+    @Test
+    void transferLeadershipToSelfCompletesImmediately() throws Exception {
+        CompletableFuture<Void> f = node.transferLeadership("n1");
+        assertNotNull(f);
+        f.get(1, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void transferLeadershipToNonMemberFails() {
+        CompletableFuture<Void> f = node.transferLeadership("nobody");
+        assertTrue(f.isCompletedExceptionally());
+    }
+
+    @Test
+    void transferLeadershipRejectsClientCommands() throws Exception {
+        startPeerNode("n2", "localhost:9092");
+        node.addServer("n2", "localhost:9092").get(2, TimeUnit.SECONDS);
+        node.transferLeadership("n2");
+        Thread.sleep(20);
+        CompletableFuture<byte[]> cmd = node.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
+        assertTrue(cmd.isCompletedExceptionally());
+    }
+
+    @Test
+    void followerRejectsTransferLeadership() throws Exception {
+        RaftNode follower = new RaftNode(multiNodeConfig("tl1"), new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            CompletableFuture<Void> f = follower.transferLeadership("n2");
+            assertTrue(f.isCompletedExceptionally());
+        } finally {
+            follower.shutdown();
+        }
+    }
+
+    // ---- recomputeEffectiveConfiguration edge cases ----------------------
+
+    @Test
+    void configurationRestoredFromSnapshotAfterCompaction() throws Exception {
+        node.submitCommand("SET a 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        node.submitCommand("SET b 2".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        node.snapshotNow();
+
+        assertTrue(node.currentConfiguration().containsKey("n1"),
+                "configuration must survive snapshot compaction");
+    }
+
+    // ---- handleInstallSnapshot term edge case ----------------------------
+
+    @Test
+    void handleInstallSnapshotRejectsOlderTerm() {
+        InstallSnapshotRequest req = InstallSnapshotRequest.newBuilder()
+                .setTerm(0).setLeaderId("old")
+                .setLastIncludedIndex(1).setLastIncludedTerm(0)
+                .setOffset(0).setData(com.google.protobuf.ByteString.EMPTY)
+                .setDone(true).build();
+        com.fbtberger.raft.proto.InstallSnapshotResponse resp = node.handleInstallSnapshot(req);
+        assertTrue(resp.getTerm() > 0);
+    }
+
     // ---- helpers --------------------------------------------------------
 
     private void startPeerNode(String id, String address) throws Exception {
