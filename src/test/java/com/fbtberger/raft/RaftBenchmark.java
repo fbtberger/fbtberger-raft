@@ -91,6 +91,44 @@ public class RaftBenchmark {
         storage.getLogEntry(idx);
     }
 
+    // ---- WalStorage benchmarks (real disk I/O) ----------------------------
+
+    @State(Scope.Thread)
+    public static class WalState {
+        private WalStorage walStorage;
+        private long walNextIndex = 1;
+
+        @Setup(Level.Trial)
+        public void setup() throws Exception {
+            java.io.File dir = Files.createTempDirectory("raft-wal-bench").toFile();
+            walStorage = new WalStorage(dir, 8 * 1024 * 1024);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() { walStorage.close(); }
+    }
+
+    @Benchmark
+    public void walStorageAppendWithFsync(WalState ws) {
+        long idx = ws.walNextIndex++;
+        LogEntry entry = LogEntry.newBuilder()
+                .setIndex(idx).setTerm(1)
+                .setCommand(ByteString.copyFromUtf8("SET k" + idx + " v" + idx))
+                .build();
+        ws.walStorage.appendEntries(List.of(entry));
+    }
+
+    @Benchmark
+    public void walStorageAppendAndReadBack(WalState ws) {
+        long idx = ws.walNextIndex++;
+        LogEntry entry = LogEntry.newBuilder()
+                .setIndex(idx).setTerm(1)
+                .setCommand(ByteString.copyFromUtf8("SET k" + idx + " v" + idx))
+                .build();
+        ws.walStorage.appendEntries(List.of(entry));
+        ws.walStorage.getLogEntry(idx);
+    }
+
     public static void main(String[] args) throws Exception {
         new Runner(new OptionsBuilder()
                 .include(RaftBenchmark.class.getSimpleName())

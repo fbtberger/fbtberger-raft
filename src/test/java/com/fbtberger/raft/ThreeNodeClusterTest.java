@@ -357,6 +357,21 @@ class ThreeNodeClusterTest {
                 "n4 should have received y via InstallSnapshot");
     }
 
+    // ---- linearizable reads -----------------------------------------------
+
+    @Test
+    void readIndexCompletesOnMultiNodeCluster() throws Exception {
+        leader().submitCommand("SET rk rv".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        leader().readIndex().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void leaseReadCompletesOnMultiNodeCluster() throws Exception {
+        leader().submitCommand("SET lk lv".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        Thread.sleep(100);
+        leader().leaseRead().get(2, TimeUnit.SECONDS);
+    }
+
     // ------------------------------------------------------------------
     // Static helpers
     // ------------------------------------------------------------------

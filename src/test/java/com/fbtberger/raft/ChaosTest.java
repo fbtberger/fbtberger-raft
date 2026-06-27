@@ -97,6 +97,25 @@ class ChaosTest {
     }
 
     @Test
+    void clusterConvergesUnderPacketLoss() throws Exception {
+        startCluster(3);
+        awaitLeader();
+        String leaderId = leaderId();
+        RaftNode leader = nodes.get(leaderId);
+
+        String lossy = otherNode(leaderId);
+        setPacketLoss(lossy, 0.5);
+
+        byte[] result = leader.submitCommand("SET k3 v3".getBytes(StandardCharsets.UTF_8))
+                .get(10, TimeUnit.SECONDS);
+        assertEquals("OK", new String(result, StandardCharsets.UTF_8));
+
+        setPacketLoss(lossy, 0.0);
+        await().atMost(5, TimeUnit.SECONDS).until(
+                () -> "v3".equals(machines.get(lossy).get("k3")));
+    }
+
+    @Test
     void leaderPartitionedFromMajorityTriggersNewElection() throws Exception {
         startCluster(3);
         awaitLeader();
@@ -179,6 +198,17 @@ class ChaosTest {
                 .map(Map.Entry::getKey).findFirst().orElse(null);
     }
 
+    private void setPacketLoss(String nodeId, double rate) {
+        for (var entry : peerTransports.entrySet()) {
+            if (entry.getKey().equals(nodeId)) {
+                entry.getValue().values().forEach(pt -> pt.setLossRate(rate));
+            } else {
+                PartitionableTransport pt = entry.getValue().get(nodeId);
+                if (pt != null) pt.setLossRate(rate);
+            }
+        }
+    }
+
     private String otherNode(String excludeId) {
         return nodes.keySet().stream().filter(id -> !id.equals(excludeId)).findFirst().orElseThrow();
     }
@@ -208,25 +238,32 @@ class ChaosTest {
     static final class PartitionableTransport implements RaftTransport {
         private final RaftTransport delegate;
         private final AtomicBoolean partitioned = new AtomicBoolean(false);
+        private volatile double lossRate = 0.0;
+        private final java.util.Random rng = new java.util.Random();
 
         PartitionableTransport(RaftTransport delegate) { this.delegate = delegate; }
         void partition() { partitioned.set(true); }
-        void heal() { partitioned.set(false); }
+        void heal() { partitioned.set(false); lossRate = 0.0; }
+        void setLossRate(double rate) { this.lossRate = rate; }
+
+        private boolean shouldDrop() {
+            return partitioned.get() || (lossRate > 0 && rng.nextDouble() < lossRate);
+        }
 
         @Override public CompletableFuture<RequestVoteResponse> requestVote(RequestVoteRequest r) {
-            return partitioned.get() ? failed() : delegate.requestVote(r);
+            return shouldDrop() ? failed() : delegate.requestVote(r);
         }
         @Override public CompletableFuture<AppendEntriesResponse> appendEntries(AppendEntriesRequest r) {
-            return partitioned.get() ? failed() : delegate.appendEntries(r);
+            return shouldDrop() ? failed() : delegate.appendEntries(r);
         }
         @Override public CompletableFuture<InstallSnapshotResponse> installSnapshot(InstallSnapshotRequest r) {
-            return partitioned.get() ? failed() : delegate.installSnapshot(r);
+            return shouldDrop() ? failed() : delegate.installSnapshot(r);
         }
         @Override public CompletableFuture<PreVoteResponse> preVote(PreVoteRequest r) {
-            return partitioned.get() ? failed() : delegate.preVote(r);
+            return shouldDrop() ? failed() : delegate.preVote(r);
         }
         @Override public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest r) {
-            return partitioned.get() ? failed() : delegate.timeoutNow(r);
+            return shouldDrop() ? failed() : delegate.timeoutNow(r);
         }
         @Override public void close() { delegate.close(); }
 

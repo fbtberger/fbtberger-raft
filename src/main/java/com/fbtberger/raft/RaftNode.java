@@ -127,9 +127,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private volatile CompletableFuture<Void> leaderTransferResult = null;
     private volatile ScheduledFuture<?> leaderTransferTimeout = null;
 
-    // Linearizable reads (ReadIndex): pending read barriers awaiting
+    // Linearizable reads (ReadIndex / Lease): pending read barriers awaiting
     // leadership confirmation from a majority of peers.
     private final List<ReadBarrier> pendingReadBarriers = new ArrayList<>();
+    // Lease-based reads: per-peer timestamp of last successful AppendEntries ack.
+    private final Map<String, Long> peerLastAckMs = new ConcurrentHashMap<>();
 
     // Joint consensus (§6): the old configuration during a C_old,new
     // transition, or null when not in joint mode.
@@ -877,6 +879,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     matchIndex.put(peerId, lastSentIndex);
                 }
                 advanceCommitIndex();
+                peerLastAckMs.put(peerId, System.currentTimeMillis());
                 for (ReadBarrier rb : pendingReadBarriers) rb.confirm(peerId);
                 checkReadBarriers();
                 if (peerId.equals(leaderTransferTarget)) {
@@ -1141,6 +1144,55 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Lease-based linearizable read: serves the read immediately (no
+     * heartbeat round-trip) if a majority of peers have acknowledged
+     * a heartbeat within the election timeout window, proving no other
+     * leader could have been elected. Falls back to {@link #readIndex()}
+     * if the lease has expired.
+     *
+     * <p>Assumes bounded clock skew across the cluster. If clocks can
+     * diverge by more than {@code ELECTION_TIMEOUT_MIN_MS}, use
+     * {@link #readIndex()} instead for safety.
+     */
+    public CompletableFuture<Void> leaseRead() {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                CompletableFuture<Void> f = new CompletableFuture<>();
+                f.completeExceptionally(new NotLeaderException(currentLeaderId));
+                return f;
+            }
+            if (majority() == 1 || hasValidLease()) {
+                long ri = commitIndex.get();
+                return lastApplied.get() >= ri
+                        ? CompletableFuture.completedFuture(null)
+                        : awaitApplied(ri);
+            }
+            return readIndex();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Lease validity: true if a majority of the current configuration
+     * (counting self) has acknowledged within the election timeout window.
+     */
+    private boolean hasValidLease() {
+        long now = System.currentTimeMillis();
+        long window = ELECTION_TIMEOUT_MIN_MS;
+        int acked = 1; // count self
+        for (String peerId : currentConfiguration.keySet()) {
+            if (peerId.equals(config.selfId())) continue;
+            Long lastAck = peerLastAckMs.get(peerId);
+            if (lastAck != null && now - lastAck < window) {
+                acked++;
+            }
+        }
+        return acked >= majority();
     }
 
     private CompletableFuture<Void> awaitApplied(long targetIndex) {

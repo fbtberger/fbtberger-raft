@@ -697,6 +697,41 @@ class RaftNodeTest {
         return t;
     }
 
+    // ---- linearizable reads ------------------------------------------------
+
+    @Test
+    void readIndexCompletesImmediatelyForSingleNode() throws Exception {
+        node.submitCommand("SET k v".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        node.readIndex().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void readIndexFailsOnFollower() throws Exception {
+        RaftNode follower = new RaftNode(
+                singleNodeConfig(), new InMemoryStorage(), new KeyValueStateMachine(),
+                addr -> null, RaftMetrics.noop());
+        // don't start — stays FOLLOWER
+        var f = follower.readIndex();
+        assertTrue(f.isCompletedExceptionally());
+        follower.shutdown();
+    }
+
+    @Test
+    void leaseReadCompletesImmediatelyForSingleNode() throws Exception {
+        node.submitCommand("SET k v".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        node.leaseRead().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void leaseReadFailsOnFollower() throws Exception {
+        RaftNode follower = new RaftNode(
+                singleNodeConfig(), new InMemoryStorage(), new KeyValueStateMachine(),
+                addr -> null, RaftMetrics.noop());
+        var f = follower.leaseRead();
+        assertTrue(f.isCompletedExceptionally());
+        follower.shutdown();
+    }
+
     /** Sends a complete snapshot as a single chunk (offset=0, done=true). */
     private static void sendFullSnapshot(RaftNode target, long term, String leaderId,
                                          long lastIncludedIndex, long lastIncludedTerm,
