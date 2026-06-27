@@ -37,11 +37,15 @@ For a quick API reference, see the
   - Copy-on-write async snapshotting (§5.1): background disk I/O
   - Independent per-server compaction with configurable threshold
 - **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
-  implementations, with per-RPC configurable timeouts
-- **Prometheus metrics**: counters, timers, and gauges for all Raft events
+  implementations, with per-RPC configurable timeouts and TLS/mTLS support
+- **Prometheus metrics + JMX**: counters, timers, and gauges published to both
+  Prometheus and JMX; `RaftNodeMXBean` for JConsole/VisualVM
+- **Health checks**: `/health` (liveness) and `/ready` (readiness) HTTP endpoints
 - **SLF4J/Logback** structured logging
-- **Durable storage** behind a `RaftStorage` interface with `BerkeleyDbStorage`
-  (synchronous-commit) and `InMemoryStorage` (tests/demos)
+- **Durable storage** behind a `RaftStorage` interface:
+  - `BerkeleyDbStorage` — Berkeley DB JE with synchronous commit
+  - `WalStorage` — append-only Write-Ahead Log with crash recovery
+  - `InMemoryStorage` — non-durable, for tests/demos
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
 - **JaCoCo** test coverage reporting
@@ -76,11 +80,13 @@ raft-java/
     │       ├── ServerRole.java             # FOLLOWER / CANDIDATE / LEADER
     │       ├── RaftStorage.java            # durable state interface
     │       ├── BerkeleyDbStorage.java      # Berkeley DB JE implementation
+    │       ├── WalStorage.java             # append-only WAL implementation
     │       ├── InMemoryStorage.java        # non-durable test implementation
     │       ├── StateMachine.java           # state machine interface
     │       ├── KeyValueStateMachine.java   # demo key-value store
-    │       ├── RaftGrpcService.java        # metrics-wrapped gRPC adapter
     │       ├── RaftClientGrpcService.java  # client-facing gRPC adapter
+    │       ├── RaftNodeMXBean.java         # JMX management interface
+    │       ├── HealthCheck.java            # liveness + readiness checks
     │       ├── RaftNodeConfiguration.java  # Spring IoC wiring
     │       ├── RaftServer.java             # main() + interactive CLI
     │       ├── transport/
@@ -90,6 +96,7 @@ raft-java/
     │       │   ├── RaftRpcHandler.java           # RPC handler interface
     │       │   ├── RpcTimeouts.java              # per-RPC timeout configuration
     │       │   ├── TimeoutTransport.java         # timeout decorator
+    │       │   ├── TlsConfig.java                # TLS/mTLS configuration
     │       │   ├── GrpcTransport.java            # gRPC implementation
     │       │   ├── GrpcTransportFactory.java
     │       │   ├── GrpcTransportServer.java
@@ -110,6 +117,7 @@ raft-java/
         ├── RaftClientGrpcServiceTest.java      # client RPC tests
         ├── RaftNodeConfigurationTest.java      # Spring wiring tests
         ├── InMemoryStorageTest.java            # storage contract tests
+        ├── WalStorageTest.java                 # WAL storage + recovery tests
         └── KeyValueStateMachineTest.java       # state machine tests
 ```
 
@@ -136,6 +144,13 @@ rpc.timeout.request.vote.ms=1000
 rpc.timeout.append.entries.ms=2000
 rpc.timeout.install.snapshot.ms=30000
 rpc.timeout.pre.vote.ms=1000
+
+# TLS (optional)
+tls.enabled=false
+tls.cert.path=/path/to/cert.pem
+tls.key.path=/path/to/key.pem
+tls.ca.path=/path/to/ca.pem
+tls.mtls.enabled=false
 ```
 
 ## Building
@@ -175,14 +190,19 @@ quit             # shut down
 docker build -f config/Dockerfile -t raft-java .
 ```
 
-## Metrics
+## Metrics & JMX
 
-When `metrics.port` is configured, a Prometheus-compatible `/metrics` endpoint
-is exposed:
+When `metrics.port` is configured, the following HTTP endpoints are exposed:
 
 ```
-curl http://localhost:10091/metrics
+curl http://localhost:10091/metrics   # Prometheus scrape
+curl http://localhost:10091/health    # liveness (always 200)
+curl http://localhost:10091/ready     # readiness (200 if leader known, 503 otherwise)
 ```
+
+All Micrometer metrics are also published to JMX. A `RaftNodeMXBean` under
+`com.fbtberger.raft:type=RaftNode` exposes role, term, cluster members, and
+operations (triggerSnapshot, transferLeadership) for JConsole/VisualVM.
 
 See [docs/architecture.pdf](docs/architecture.pdf) for the full metrics table.
 

@@ -156,7 +156,22 @@ public class MyTransport
 | Netty | TCP + len-delimited | `NettyTransportFactory` |
 | Hadoop | WritableRpcEngine | `HadoopTransportFactory` |
 
-All transports are wrapped with `TimeoutTransport` automatically.
+All transports wrapped with `TimeoutTransport` automatically. gRPC and Netty support TLS/mTLS via `TlsConfig`.
+
+## Storage Implementations
+
+| Class | Durability | Use |
+|-------|-----------|-----|
+| `BerkeleyDbStorage` | fsync | Production default |
+| `WalStorage` | Append-only WAL | Lightweight alternative |
+| `InMemoryStorage` | None | Tests only |
+
+```java
+@Bean
+public RaftStorage raftStorage(RaftConfig cfg) {
+  return new WalStorage(cfg.dataDir().toFile());
+}
+```
 
 ## Key Interfaces
 
@@ -168,6 +183,7 @@ All transports are wrapped with `TimeoutTransport` automatically.
 | `RaftTransportFactory` | Connection factory |
 | `RaftRpcHandler` | Incoming RPCs |
 | `RpcTimeouts` | Per-RPC timeouts |
+| `TlsConfig` | TLS/mTLS settings |
 
 ## Node Lifecycle
 
@@ -233,7 +249,24 @@ SLF4J + Logback. Config: `src/main/resources/logback.xml`
 
 Client RPCs: `Submit`, `AddServer`, `RemoveServer`
 
-## Metrics (Prometheus)
+## Health Checks
+
+```
+curl http://localhost:10091/health  # liveness (always 200)
+curl http://localhost:10091/ready   # readiness (200/503)
+```
+
+## JMX
+
+MBean: `com.fbtberger.raft:type=RaftNode`
+
+Attributes: role, term, commitIndex, clusterMembers, transferInProgress
+
+Operations: triggerSnapshot(), transferLeadership(targetId)
+
+All Micrometer metrics also published to JMX.
+
+## Metrics (Prometheus + JMX)
 
 ```
 curl http://localhost:10091/metrics

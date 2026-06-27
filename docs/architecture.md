@@ -25,8 +25,9 @@ The project implements:
 - **PreVote** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
 - **Copy-on-write snapshotting** (§5.1): async background compaction
-- **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts
-- **Observability**: SLF4J/Logback logging, Micrometer/Prometheus metrics
+- **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts and TLS/mTLS
+- **Storage**: BerkeleyDB JE, append-only WAL, or in-memory (pluggable via `RaftStorage`)
+- **Observability**: SLF4J/Logback logging, Micrometer metrics (Prometheus + JMX), health checks, JMX MBean
 
 \newpage
 
@@ -157,6 +158,7 @@ The transport abstraction decouples RaftNode from any specific network library:
 | `RaftRpcHandler` | Handler interface (implemented by RaftNode) |
 | `RpcTimeouts` | Per-RPC timeout configuration from `.properties` |
 | `TimeoutTransport` | Decorator applying `orTimeout()` to any transport |
+| `TlsConfig` | TLS/mTLS certificate paths and settings |
 
 **RPCs**: RequestVote, AppendEntries, InstallSnapshot, PreVote, TimeoutNow.
 
@@ -177,7 +179,27 @@ rpc.timeout.install.snapshot.ms=30000
 rpc.timeout.pre.vote.ms=1000
 ```
 
-# 9. Safety: §4 Errata Fix
+**TLS/mTLS**: gRPC and Netty transports support TLS encryption and mutual
+authentication via `TlsConfig` (parsed from `.properties`). gRPC uses
+`GrpcSslContexts` with shaded Netty; raw Netty uses `SslContextBuilder`.
+
+# 9. Storage Layer
+
+Three `RaftStorage` implementations are available:
+
+| Implementation | Durability | Use case |
+|----------------|-----------|----------|
+| `BerkeleyDbStorage` | fsync (COMMIT\_SYNC) | Production default |
+| `WalStorage` | Append-only WAL + fsync | Lightweight alternative |
+| `InMemoryStorage` | None | Tests and demos |
+
+**WalStorage** uses an append-only file (`wal.log`) with length-prefixed protobuf
+entries and an in-memory index (log index to file offset) rebuilt on recovery.
+Metadata (term/vote) and snapshots are stored in separate files, atomically
+replaced via rename. Supports deferred fsync (§10.2.1) via a background thread.
+Compaction rewrites the WAL after a snapshot discards the prefix.
+
+# 10. Errata Fix (§4)
 
 The dissertation's single-server membership change algorithm has a known safety
 bug: competing configuration changes across term boundaries in even-sized clusters
@@ -186,9 +208,22 @@ a leader must commit an entry from its current term before accepting configurati
 changes. The no-op entry appended at the start of every term (§8) serves this
 purpose -- `addServer`/`removeServer` are rejected until `commitIndex >= leaderNoOpIndex`.
 
-# 10. Metrics
+# 11. Observability
 
-All significant Raft events are instrumented via Micrometer:
+**Metrics**: All significant Raft events are instrumented via Micrometer,
+published to both **Prometheus** (`/metrics` HTTP endpoint) and **JMX**
+(via `JmxMeterRegistry` and `CompositeMeterRegistry`):
+
+**JMX MBean**: `RaftNodeMXBean` (`com.fbtberger.raft:type=RaftNode`) exposes
+role, term, commitIndex, cluster members, and operations (triggerSnapshot,
+transferLeadership) for JConsole/VisualVM.
+
+**Health checks** on the metrics port:
+
+- `GET /health` — liveness, always 200
+- `GET /ready` — readiness, 200 when leader is known, 503 during elections
+
+**Metrics table**:
 
 | Metric | Type | Description |
 |--------|------|-------------|
