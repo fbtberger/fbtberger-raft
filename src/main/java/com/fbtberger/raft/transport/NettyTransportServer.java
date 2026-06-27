@@ -1,15 +1,10 @@
 package com.fbtberger.raft.transport;
 
 import com.fbtberger.raft.proto.AppendEntriesRequest;
-import com.fbtberger.raft.proto.AppendEntriesResponse;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
-import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
-import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
-import com.fbtberger.raft.proto.RequestVoteResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
-import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.MessageLite;
 import io.netty.bootstrap.ServerBootstrap;

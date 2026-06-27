@@ -14,8 +14,7 @@ import java.util.concurrent.CompletionException;
 
 /**
  * Adapter between the client-facing {@code RaftClientService} (client.proto) and
- * {@link RaftNode}. Like {@link RaftGrpcService} for the internal RPCs, this class
- * has no Raft logic of its own: it forwards each request to the matching
+ * {@link RaftNode}. This class has no Raft logic of its own: it forwards each request to the matching
  * {@link RaftNode} method ({@link RaftNode#submitCommand}, {@link RaftNode#addServer},
  * {@link RaftNode#removeServer}), waits for the result, and translates the outcome
  * into the corresponding response message -- success, or failure with a leader hint

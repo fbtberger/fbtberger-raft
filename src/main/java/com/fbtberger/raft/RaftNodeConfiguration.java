@@ -126,11 +126,6 @@ public class RaftNodeConfiguration {
     }
 
     @Bean
-    public RaftGrpcService raftGrpcService(RaftNode raftNode) {
-        return new RaftGrpcService(raftNode);
-    }
-
-    @Bean
     public RaftClientGrpcService raftClientGrpcService(RaftNode raftNode) {
         return new RaftClientGrpcService(raftNode);
     }
