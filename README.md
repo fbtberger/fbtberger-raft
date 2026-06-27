@@ -18,8 +18,9 @@ For a quick API reference, see the
 
 - **Leader election** with randomized timeouts and the election-restriction safety
   rule (§5.2, §5.4.1)
-- **PreVote** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the
-  cluster by inflating their term on rejoin
+- **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers
+  from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid
+  leader has been heard from recently
 - **Leadership transfer** (§3.10): graceful handoff to a target server via
   `TimeoutNow` RPC, with automatic abort on timeout
 - **Log replication** via `AppendEntries`, including consistency check, conflicting
@@ -30,8 +31,11 @@ For a quick API reference, see the
   - Batching (§10.2.2): up to 1 MB per AppendEntries RPC
   - Pipelining (§10.2.2): optimistic nextIndex advancement, max 2 in-flight RPCs
 - **No-op entry** committed by every new leader (§8)
-- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes, with
-  the §4 errata fix (config changes rejected until leader's no-op commits)
+- **Cluster reconfiguration** (§6):
+  - Single-step: `addServer()` / `removeServer()` for one-at-a-time changes
+  - Joint consensus: `setConfiguration()` for arbitrary multi-server changes via
+    a two-phase C_old,new → C_new protocol with separate majorities
+  - §4 errata fix (config changes rejected until leader's no-op commits)
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
   - Copy-on-write async snapshotting (§5.1): `prepareCowSnapshot()` captures a
@@ -49,6 +53,8 @@ For a quick API reference, see the
   - `WalStorage` — segmented append-only WAL with CRC32 frame checksums,
     configurable max segment size (default 64 MB), and crash recovery
   - `InMemoryStorage` — non-durable, for tests/demos
+- **Linearizable reads** via the ReadIndex protocol: `readIndex()` confirms
+  leadership with a majority heartbeat round before allowing reads
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
 - **JaCoCo** test coverage reporting
@@ -121,6 +127,7 @@ raft-java/
         ├── RaftNodeTest.java                   # unit tests (single-node + multi-node)
         ├── ThreeNodeClusterTest.java           # integration tests (3-node gRPC in-process)
         ├── MultiTransportClusterTest.java      # 3-node cluster across all transports
+        ├── ChaosTest.java                      # partition simulation (4 scenarios)
         ├── TlsAndTimeoutsTest.java             # TLS/mTLS integration + timeout config
         ├── HealthCheckTest.java                # liveness + readiness tests
         ├── RaftClientGrpcServiceTest.java      # client RPC tests
@@ -128,6 +135,7 @@ raft-java/
         ├── InMemoryStorageTest.java            # storage contract tests
         ├── WalStorageTest.java                 # WAL storage, segmentation + recovery
         ├── KeyValueStateMachineTest.java       # state machine tests
+        ├── RaftBenchmark.java                  # JMH performance benchmarks
         └── transport/
             ├── NettyTransportTest.java         # Netty round-trip tests
             └── HadoopTransportTest.java        # Hadoop round-trip tests
@@ -187,7 +195,7 @@ Each node runs an interactive CLI:
 
 ```
 SET foo bar      # submit through Raft, wait for commit
-GET foo          # read from local state machine (non-linearizable)
+GET foo          # read from local state machine (use readIndex() for linearizable)
 ADD n4 host:port # add a voting member (§6, leader only)
 REMOVE n4        # remove a voting member (§6, leader only)
 SNAPSHOT         # force immediate log compaction (§7)
@@ -230,6 +238,9 @@ open build/reports/jacoco/test/html/index.html
 
 - **Client request de-duplication** (§8): retried commands may be applied twice.
   A production system would track per-client serial numbers.
+- **Lease-based reads**: the current `readIndex()` uses heartbeat confirmation
+  (one network round-trip); a lease-based approach could avoid the round-trip
+  under stable leadership at the cost of clock-skew assumptions.
 
 ## License
 

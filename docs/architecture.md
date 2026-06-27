@@ -19,12 +19,13 @@ The project implements:
 
 - **Core Raft** (§5): leader election, log replication, safety rules
 - **Leadership transfer** (§3.10): graceful handoff via TimeoutNow RPC
-- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes (with §4 errata fix)
+- **Cluster reconfiguration** (§6): single-step changes (`addServer`/`removeServer`) and joint consensus (`setConfiguration`) for arbitrary multi-server changes (with §4 errata fix)
 - **Log compaction** (§7): independent snapshotting with chunked InstallSnapshot
 - **Client interaction** (§8): no-op entry, leader redirection
-- **PreVote** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster
+- **Linearizable reads**: ReadIndex protocol (`readIndex()`) confirms leadership with a majority heartbeat round
+- **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid leader is active
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
-- **Copy-on-write snapshotting** (§5.1): async background compaction
+- **Copy-on-write snapshotting** (§5.1): `prepareCowSnapshot()` captures state under the lock; serialization runs on a background thread
 - **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts and TLS/mTLS
 - **Storage**: BerkeleyDB JE, append-only WAL, or in-memory (pluggable via `RaftStorage`)
 - **Observability**: SLF4J/Logback logging, Micrometer metrics (Prometheus + JMX), health checks, JMX MBean
@@ -100,6 +101,47 @@ A leader can gracefully hand off to a specific target server:
 
 ```java
 node.transferLeadership("n2").get(1, SECONDS);
+```
+
+# 5.1 Linearizable Reads (ReadIndex)
+
+A local read from the state machine is not linearizable because the node may be
+a stale leader (split-brain). `readIndex()` confirms leadership before allowing
+reads:
+
+1. **Record** `readIndex = commitIndex` at the time of the call.
+2. **Confirm leadership** by sending a heartbeat round to all peers and waiting
+   for a majority to acknowledge (via successful `AppendEntries` responses).
+3. **Wait** for `lastApplied >= readIndex` so the state machine is up to date.
+4. **Complete** the future -- the caller can now read safely.
+
+```java
+node.readIndex().thenRun(() -> {
+    String value = stateMachine.get("key"); // linearizable
+});
+```
+
+Single-node clusters complete immediately (the leader is trivially confirmed).
+
+# 5.2 Joint Consensus (§6)
+
+In addition to single-step changes (`addServer`/`removeServer`), the system
+supports arbitrary multi-server membership changes via joint consensus:
+
+1. **Phase 1 (C\_old,new)**: The leader proposes a configuration entry containing
+   both old and new member lists. During this phase, `advanceCommitIndex()`
+   requires separate majorities from both old and new configurations via
+   `hasSeparateMajorities()`.
+2. **Phase 2 (C\_new)**: When C\_old,new commits, the leader automatically proposes
+   C\_new (the final configuration with only the new members). Old-configuration
+   nodes not in C\_new step down once this entry commits.
+
+```java
+node.setConfiguration(Map.of(
+    "n1", "host1:9091",
+    "n2", "host2:9092",
+    "n5", "host5:9095"  // replaces n3
+)).get(5, SECONDS);
 ```
 
 \newpage

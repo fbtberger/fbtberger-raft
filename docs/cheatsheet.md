@@ -111,7 +111,22 @@ node.transferLeadership("n2")
 
 Leader stops accepting commands, catches up the target, sends TimeoutNow. Aborts automatically on timeout.
 
-## Cluster Reconfiguration (new)
+## Linearizable Reads (ReadIndex)
+
+```java
+node.readIndex().thenRun(() -> {
+  String v = stateMachine.get("key");
+});
+// or blocking:
+node.readIndex().get(1, SECONDS);
+String v = stateMachine.get("key");
+```
+
+Confirms leadership via heartbeat majority before allowing reads. Single-node clusters complete immediately.
+
+## Cluster Reconfiguration
+
+**Single-step** (one server at a time):
 
 ```java
 node.addServer("n4", "host4:9094")
@@ -121,7 +136,17 @@ node.removeServer("n4")
     .get(2, SECONDS);
 ```
 
-One change at a time. Rejected until leader's no-op commits (errata fix).
+**Joint consensus** (arbitrary changes):
+
+```java
+node.setConfiguration(Map.of(
+    "n1","host1:9091",
+    "n2","host2:9092",
+    "n5","host5:9095"))
+    .get(5, SECONDS);
+```
+
+Two-phase: C\_old,new (separate majorities) then auto-commits C\_new. Rejected until leader's no-op commits (errata fix).
 
 ## Transport Layer
 
@@ -187,6 +212,7 @@ public RaftStorage raftStorage(RaftConfig cfg) {
 | Interface | Purpose |
 |-----------|---------|
 | `StateMachine` | Your app logic (+ COW snapshot) |
+| `ReadBarrier` | Linearizable read tracking |
 | `RaftStorage` | Durable state |
 | `RaftTransport` | Peer comms (5 RPCs) |
 | `RaftTransportFactory` | Connection factory |
