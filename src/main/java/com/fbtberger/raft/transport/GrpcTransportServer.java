@@ -13,9 +13,13 @@ import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.ClientAuth;
 import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
+import javax.net.ssl.SSLException;
 
 public final class GrpcTransportServer implements RaftTransportServer {
 
@@ -25,6 +29,24 @@ public final class GrpcTransportServer implements RaftTransportServer {
         this.server = ServerBuilder.forPort(port)
                 .addService(new RaftServiceAdapter(handler))
                 .build();
+    }
+
+    public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) throws SSLException {
+        if (!tlsConfig.enabled()) {
+            this.server = ServerBuilder.forPort(port)
+                    .addService(new RaftServiceAdapter(handler))
+                    .build();
+        } else {
+            var sslBuilder = GrpcSslContexts.forServer(tlsConfig.certFile(), tlsConfig.keyFile())
+                    .trustManager(tlsConfig.caFile());
+            if (tlsConfig.mtlsEnabled()) {
+                sslBuilder.clientAuth(ClientAuth.REQUIRE);
+            }
+            this.server = NettyServerBuilder.forPort(port)
+                    .sslContext(sslBuilder.build())
+                    .addService(new RaftServiceAdapter(handler))
+                    .build();
+        }
     }
 
     public GrpcTransportServer(ServerBuilder<?> builder, RaftRpcHandler handler) {

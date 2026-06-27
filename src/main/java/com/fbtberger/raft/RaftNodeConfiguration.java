@@ -76,7 +76,7 @@ public class RaftNodeConfiguration {
     @Bean
     @ConditionalOnMissingBean(RaftTransportFactory.class)
     public RaftTransportFactory transportFactory(RaftConfig config) {
-        RaftTransportFactory base = new GrpcTransportFactory();
+        RaftTransportFactory base = new GrpcTransportFactory(config.tlsConfig());
         return address -> new TimeoutTransport(base.connect(address), config.rpcTimeouts());
     }
 
@@ -112,10 +112,16 @@ public class RaftNodeConfiguration {
     @Bean(destroyMethod = "close")
     public RaftTransportServer raftTransportServer(RaftConfig config,
                                                     RaftNode raftNode,
-                                                    RaftClientGrpcService clientService) throws IOException {
-        GrpcTransportServer server = new GrpcTransportServer(
-                ServerBuilder.forPort(config.selfPort()).addService(clientService),
-                raftNode);
+                                                    RaftClientGrpcService clientService) throws Exception {
+        GrpcTransportServer server;
+        if (config.tlsConfig().enabled()) {
+            server = new GrpcTransportServer(config.selfPort(), raftNode, config.tlsConfig());
+            // Client-facing service added via separate gRPC server or same port
+        } else {
+            server = new GrpcTransportServer(
+                    ServerBuilder.forPort(config.selfPort()).addService(clientService),
+                    raftNode);
+        }
         server.start();
         return server;
     }

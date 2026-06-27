@@ -23,20 +23,33 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
+import io.netty.handler.ssl.SslContext;
 
 import java.io.IOException;
+import javax.net.ssl.SSLException;
 
 public final class NettyTransportServer implements RaftTransportServer {
 
     private final int port;
     private final RaftRpcHandler handler;
+    private final SslContext sslContext;
     private final NioEventLoopGroup bossGroup;
     private final NioEventLoopGroup workerGroup;
     private Channel serverChannel;
 
     public NettyTransportServer(int port, RaftRpcHandler handler) {
+        this(port, handler, null);
+    }
+
+    public NettyTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) {
         this.port = port;
         this.handler = handler;
+        try {
+            this.sslContext = tlsConfig != null && tlsConfig.enabled()
+                    ? tlsConfig.buildServerSslContext() : null;
+        } catch (SSLException e) {
+            throw new RuntimeException("failed to create server TLS context", e);
+        }
         this.bossGroup = new NioEventLoopGroup(1, r -> {
             Thread t = new Thread(r, "raft-netty-boss");
             t.setDaemon(true);
@@ -58,6 +71,9 @@ public final class NettyTransportServer implements RaftTransportServer {
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
+                            if (sslContext != null) {
+                                ch.pipeline().addLast(sslContext.newHandler(ch.alloc()));
+                            }
                             ch.pipeline()
                                     .addLast(new LengthFieldBasedFrameDecoder(16 * 1024 * 1024, 0, 4, 0, 4))
                                     .addLast(new LengthFieldPrepender(4))

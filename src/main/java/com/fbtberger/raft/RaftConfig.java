@@ -1,6 +1,7 @@
 package com.fbtberger.raft;
 
 import com.fbtberger.raft.transport.RpcTimeouts;
+import com.fbtberger.raft.transport.TlsConfig;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -48,9 +49,11 @@ public final class RaftConfig {
     private final int snapshotChunkSize;
     private final int metricsPort;
     private final RpcTimeouts rpcTimeouts;
+    private final TlsConfig tlsConfig;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
-                       int snapshotThreshold, int snapshotChunkSize, int metricsPort, RpcTimeouts rpcTimeouts) {
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort,
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
@@ -59,6 +62,7 @@ public final class RaftConfig {
         this.snapshotChunkSize = snapshotChunkSize;
         this.metricsPort = metricsPort;
         this.rpcTimeouts = rpcTimeouts;
+        this.tlsConfig = tlsConfig;
     }
 
     public static RaftConfig load(Path propertiesFile) throws IOException {
@@ -87,7 +91,8 @@ public final class RaftConfig {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, rpcTimeouts);
+        TlsConfig tlsConfig = TlsConfig.fromProperties(props);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, rpcTimeouts, tlsConfig);
     }
 
     private static String require(Properties props, String key) {
@@ -131,4 +136,6 @@ public final class RaftConfig {
     public int metricsPort() { return metricsPort; }
 
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
+
+    public TlsConfig tlsConfig() { return tlsConfig; }
 }

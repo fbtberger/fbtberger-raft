@@ -23,6 +23,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
+import io.netty.handler.ssl.SslContext;
 
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -36,7 +37,7 @@ public final class NettyTransport implements RaftTransport {
     private final AtomicInteger nextReqId = new AtomicInteger(0);
     private final Map<Integer, CompletableFuture<?>> pending = new ConcurrentHashMap<>();
 
-    NettyTransport(String host, int port, NioEventLoopGroup group) {
+    NettyTransport(String host, int port, NioEventLoopGroup group, SslContext sslContext) {
         this.group = group;
         try {
             this.channel = new Bootstrap()
@@ -45,6 +46,9 @@ public final class NettyTransport implements RaftTransport {
                     .handler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
+                            if (sslContext != null) {
+                                ch.pipeline().addLast(sslContext.newHandler(ch.alloc(), host, port));
+                            }
                             ch.pipeline()
                                     .addLast(new LengthFieldBasedFrameDecoder(16 * 1024 * 1024, 0, 4, 0, 4))
                                     .addLast(new LengthFieldPrepender(4))
