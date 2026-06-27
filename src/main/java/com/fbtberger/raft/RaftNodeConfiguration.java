@@ -152,9 +152,15 @@ public class RaftNodeConfiguration {
         return server;
     }
 
+    @Bean
+    public HealthCheck healthCheck(RaftNode raftNode, RaftStorage storage) {
+        return new HealthCheck(raftNode, storage);
+    }
+
     @Bean(destroyMethod = "stop")
     public HttpServer metricsHttpServer(PrometheusMeterRegistry registry,
-                                        RaftConfig config) throws IOException {
+                                        RaftConfig config,
+                                        HealthCheck healthCheck) throws IOException {
         if (config.metricsPort() <= 0) {
             return null;
         }
@@ -168,7 +174,25 @@ public class RaftNodeConfiguration {
                 os.write(body);
             }
         });
+        server.createContext("/health", exchange -> {
+            HealthCheck.Status status = healthCheck.liveness();
+            respondJson(exchange, status);
+        });
+        server.createContext("/ready", exchange -> {
+            HealthCheck.Status status = healthCheck.readiness();
+            respondJson(exchange, status);
+        });
         server.start();
         return server;
+    }
+
+    private static void respondJson(com.sun.net.httpserver.HttpExchange exchange,
+                                     HealthCheck.Status status) throws IOException {
+        byte[] body = status.toJson().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(status.ok() ? 200 : 503, body.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body);
+        }
     }
 }
