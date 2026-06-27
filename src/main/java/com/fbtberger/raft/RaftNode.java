@@ -982,9 +982,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
-     * Captures the state machine snapshot under the lock, then persists
-     * and compacts on a background thread (§5.1 copy-on-write). The lock
-     * is NOT held during the disk I/O.
+     * §5.1 copy-on-write: captures a lightweight snapshot reference under
+     * the lock (fast), then serializes and persists on a background thread
+     * so the lock is NOT held during serialization or disk I/O.
      */
     private void takeSnapshotAsync() {
         long applied = lastApplied.get();
@@ -992,17 +992,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
         long includedTerm = store.getTermAt(applied);
-        byte[] stateMachineData = stateMachine.takeSnapshot();
+        java.util.function.Supplier<byte[]> cowRef = stateMachine.prepareCowSnapshot();
         byte[] configurationData = toProto(currentConfiguration).toByteArray();
-        RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
-                applied, includedTerm, stateMachineData, configurationData);
 
         snapshotInProgress = true;
         scheduler.execute(() -> {
             try {
-                if (snapshot.lastIncludedIndex <= store.getSnapshotIndex()) {
+                if (applied <= store.getSnapshotIndex()) {
                     return;
                 }
+                byte[] stateMachineData = cowRef.get();
+                RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
+                        applied, includedTerm, stateMachineData, configurationData);
                 store.saveSnapshotAndCompact(snapshot);
                 metrics.snapshotTaken();
                 log("snapshotted through index " + snapshot.lastIncludedIndex

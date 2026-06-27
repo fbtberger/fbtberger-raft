@@ -25,6 +25,23 @@ public interface StateMachine {
     byte[] takeSnapshot();
 
     /**
+     * Copy-on-write snapshot capture: returns a supplier that, when called
+     * later (possibly on a different thread, without the Raft lock), produces
+     * the serialized snapshot bytes. The method itself must be fast (O(1) or
+     * shallow-copy) because it runs under the Raft lock; the expensive
+     * serialization is deferred to the supplier.
+     *
+     * <p>The default implementation eagerly serializes via {@link #takeSnapshot()},
+     * which is correct but blocks the lock for the duration of serialization.
+     * Implementations with large state should override this to capture a
+     * lightweight copy-on-write reference and serialize lazily.
+     */
+    default java.util.function.Supplier<byte[]> prepareCowSnapshot() {
+        byte[] data = takeSnapshot();
+        return () -> data;
+    }
+
+    /**
      * Replaces this state machine's entire current state with what's encoded
      * in {@code snapshot}, as produced by a prior call to
      * {@link #takeSnapshot}. Called once, before any further {@link #apply}

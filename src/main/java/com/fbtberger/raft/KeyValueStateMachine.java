@@ -7,8 +7,10 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * A toy replicated key-value store, just to have something concrete for
@@ -73,6 +75,27 @@ public final class KeyValueStateMachine implements StateMachine {
             data.putAll(restored);
         } catch (IOException e) {
             throw new IllegalArgumentException("corrupt key-value snapshot", e);
+        }
+    }
+
+    @Override
+    public Supplier<byte[]> prepareCowSnapshot() {
+        Map<String, String> copy = new HashMap<>(data);
+        return () -> serialize(copy);
+    }
+
+    private static byte[] serialize(Map<String, String> map) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(out);
+            dos.writeInt(map.size());
+            for (Map.Entry<String, String> entry : map.entrySet()) {
+                dos.writeUTF(entry.getKey());
+                dos.writeUTF(entry.getValue());
+            }
+            return out.toByteArray();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
     }
 
