@@ -10,6 +10,7 @@ interface "RaftRpcHandler" as Handler {
     +handleAppendEntries(req): AppendEntriesResponse
     +handleInstallSnapshot(req): InstallSnapshotResponse
     +handlePreVote(req): PreVoteResponse
+    +handleTimeoutNow(req): TimeoutNowResponse
 }
 
 interface "RaftTransport" as Transport {
@@ -17,6 +18,7 @@ interface "RaftTransport" as Transport {
     +appendEntries(req): CompletableFuture
     +installSnapshot(req): CompletableFuture
     +preVote(req): CompletableFuture
+    +timeoutNow(req): CompletableFuture
     +close()
 }
 
@@ -56,9 +58,11 @@ class "RaftNode" as Node {
     -leaderDiskMatchIndex: AtomicLong
     -lastLeaderContactMs: long
     -snapshotInProgress: boolean
+    -leaderTransferTarget: String
     +start()
     +shutdown()
     +submitCommand(cmd): CompletableFuture
+    +transferLeadership(targetId): CompletableFuture
     +addServer(id, addr): CompletableFuture
     +removeServer(id): CompletableFuture
     +snapshotNow()
@@ -71,6 +75,7 @@ class "RaftNode" as Node {
     -advanceCommitIndex()
     -takeSnapshotAsync()
     -onLeaderDiskSyncComplete(idx, term)
+    -checkTransferReadyLocked()
 }
 
 class "RaftConfig" as Config {
@@ -81,8 +86,18 @@ class "RaftConfig" as Config {
     +snapshotThreshold(): int
     +snapshotChunkSize(): int
     +metricsPort(): int
+    +rpcTimeouts(): RpcTimeouts
     +majority(): int
     {static} +load(path): RaftConfig
+}
+
+class "RpcTimeouts" as Timeouts {
+    +requestVoteMs(): long
+    +appendEntriesMs(): long
+    +installSnapshotMs(): long
+    +preVoteMs(): long
+    {static} +fromProperties(props): RpcTimeouts
+    {static} +defaults(): RpcTimeouts
 }
 
 class "RaftMetrics" as Metrics {
@@ -120,6 +135,10 @@ class "GrpcTransportServer" as GTS
 class "NettyTransport" as NT
 class "NettyTransportFactory" as NTF
 class "NettyTransportServer" as NTS
+class "HadoopTransport" as HT
+class "HadoopTransportFactory" as HTF
+class "HadoopTransportServer" as HTS
+class "TimeoutTransport" as TT
 
 Node .up.|> Handler
 Node --> Config
@@ -128,15 +147,21 @@ Node --> SM
 Node --> Factory
 Node --> Metrics
 Node --> Role
+Config --> Timeouts
 
 Storage <|.. BDB
 Storage <|.. IMS
 SM <|.. KV
 Transport <|.. GT
 Transport <|.. NT
+Transport <|.. HT
+Transport <|.. TT
+TT --> Transport : delegates
 Factory <|.. GTF
 Factory <|.. NTF
+Factory <|.. HTF
 TServer <|.. GTS
 TServer <|.. NTS
+TServer <|.. HTS
 
 @enduml

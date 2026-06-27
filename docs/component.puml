@@ -13,31 +13,39 @@ package "Raft Node Process" {
 
     package "Transport Layer" {
         [RaftTransportServer] as TServer
+        [TimeoutTransport\n(per-RPC timeouts)] as Timeout
         [RaftTransport] as TClient
 
-        package "gRPC Implementation" {
+        package "gRPC" {
             [GrpcTransportServer] as GrpcS
             [GrpcTransport] as GrpcC
         }
-        package "Netty Implementation" {
+        package "Netty TCP" {
             [NettyTransportServer] as NettyS
             [NettyTransport] as NettyC
+        }
+        package "Hadoop RPC" {
+            [HadoopTransportServer] as HadoopS
+            [HadoopTransport] as HadoopC
         }
 
         TServer <|.. GrpcS
         TServer <|.. NettyS
+        TServer <|.. HadoopS
         TClient <|.. GrpcC
         TClient <|.. NettyC
+        TClient <|.. HadoopC
+        Timeout --> TClient : delegates
     }
 
     [RaftClientGrpcService\n(client-facing RPCs)] as ClientSvc
 
-    Server --> Node : start / shutdown
+    Server --> Node : start / shutdown\ntransferLeadership
     Node --> SM : apply / takeSnapshot
     Node --> Storage : appendEntries / setTermAndVote
-    Node --> TClient : requestVote / appendEntries\ninstallSnapshot / preVote
+    Node --> Timeout : requestVote / appendEntries\ninstallSnapshot / preVote\ntimeoutNow
     Node --> Metrics : counters / timers / gauges
-    TServer --> Node : handleRequestVote\nhandleAppendEntries\nhandleInstallSnapshot\nhandlePreVote
+    TServer --> Node : handleRequestVote\nhandleAppendEntries\nhandleInstallSnapshot\nhandlePreVote\nhandleTimeoutNow
     ClientSvc --> Node : submitCommand\naddServer / removeServer
 }
 
@@ -45,7 +53,7 @@ cloud "Other Raft Nodes" as Peers
 actor "Client" as Client
 database "Prometheus" as Prom
 
-TClient --> Peers : RPC
+Timeout --> Peers : RPC
 TServer <-- Peers : RPC
 ClientSvc <-- Client : gRPC
 Metrics --> Prom : /metrics HTTP

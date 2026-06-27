@@ -15,10 +15,8 @@ header-includes:
 ## Quick Start
 
 ```java
-// 1. Build
 ./gradlew build
 
-// 2. Run 3-node cluster
 java -jar build/libs/raft-java-1.0.0-all.jar \
   config/node1.properties
 ```
@@ -26,7 +24,6 @@ java -jar build/libs/raft-java-1.0.0-all.jar \
 ## Configuration (.properties)
 
 ```properties
-# Required
 node.id=node1
 node.port=9091
 data.dir=/var/raft/node1
@@ -34,10 +31,14 @@ peer.node1=host1:9091
 peer.node2=host2:9092
 peer.node3=host3:9093
 
-# Optional (defaults shown)
 snapshot.threshold=100
 snapshot.chunk.size=1048576
 metrics.port=0
+
+rpc.timeout.request.vote.ms=1000
+rpc.timeout.append.entries.ms=2000
+rpc.timeout.install.snapshot.ms=30000
+rpc.timeout.pre.vote.ms=1000
 ```
 
 ## Custom State Machine
@@ -48,26 +49,22 @@ public class MyStateMachine
 
   @Override
   public byte[] apply(byte[] command) {
-    // Apply committed command
-    // Return result bytes to client
     return "OK".getBytes();
   }
 
   @Override
   public byte[] takeSnapshot() {
-    // Serialize entire state
     return serialize(state);
   }
 
   @Override
   public void restoreSnapshot(byte[] data) {
-    // Deserialize and replace state
     state = deserialize(data);
   }
 }
 ```
 
-Register as a Spring bean to override the default `KeyValueStateMachine`:
+Register as a Spring bean:
 
 ```java
 @Bean
@@ -98,32 +95,40 @@ RaftClient client = new RaftClient(
 byte[] result = client.submit(cmd);
 ```
 
-## Cluster Reconfiguration (§6)
+## Leadership Transfer (new)
 
 ```java
-// Add a member (leader only)
+node.transferLeadership("n2")
+    .get(1, SECONDS);
+```
+
+Leader stops accepting commands, catches up the target, sends TimeoutNow. Aborts automatically on timeout.
+
+## Cluster Reconfiguration (new)
+
+```java
 node.addServer("n4", "host4:9094")
     .get(2, SECONDS);
 
-// Remove a member (leader only)
 node.removeServer("n4")
     .get(2, SECONDS);
 ```
 
-One change at a time. Wait for commit before the next.
+One change at a time. Rejected until leader's no-op commits (errata fix).
 
 ## Transport Layer
 
-**Switch to Netty TCP** (instead of gRPC):
+**Switch transport** (instead of default gRPC):
 
 ```java
 @Bean
 public RaftTransportFactory transportFactory() {
   return new NettyTransportFactory();
+  // or: new HadoopTransportFactory();
 }
 ```
 
-**Custom transport:**
+**Custom transport** -- implement `RaftTransport`:
 
 ```java
 public class MyTransport
@@ -131,19 +136,27 @@ public class MyTransport
 
   CompletableFuture<RequestVoteResponse>
     requestVote(RequestVoteRequest req);
-
   CompletableFuture<AppendEntriesResponse>
     appendEntries(AppendEntriesRequest req);
-
   CompletableFuture<InstallSnapshotResponse>
     installSnapshot(InstallSnapshotRequest r);
-
   CompletableFuture<PreVoteResponse>
     preVote(PreVoteRequest req);
-
+  CompletableFuture<TimeoutNowResponse>
+    timeoutNow(TimeoutNowRequest req);
   void close();
 }
 ```
+
+## Available Transports
+
+| Transport | Protocol | Bean class |
+|-----------|----------|------------|
+| gRPC | HTTP/2 + protobuf | `GrpcTransportFactory` |
+| Netty | TCP + len-delimited | `NettyTransportFactory` |
+| Hadoop | WritableRpcEngine | `HadoopTransportFactory` |
+
+All transports are wrapped with `TimeoutTransport` automatically.
 
 ## Key Interfaces
 
@@ -151,31 +164,23 @@ public class MyTransport
 |-----------|---------|
 | `StateMachine` | Your app logic |
 | `RaftStorage` | Durable state |
-| `RaftTransport` | Peer comms |
+| `RaftTransport` | Peer comms (5 RPCs) |
 | `RaftTransportFactory` | Connection factory |
 | `RaftRpcHandler` | Incoming RPCs |
-
-## Storage Implementations
-
-| Class | Use |
-|-------|-----|
-| `BerkeleyDbStorage` | Production (fsync) |
-| `InMemoryStorage` | Tests only |
+| `RpcTimeouts` | Per-RPC timeouts |
 
 ## Node Lifecycle
 
 ```java
-// Spring wiring (production)
 System.setProperty("raft.config.path",
     "config/node1.properties");
 var ctx = new AnnotationConfigApplicationContext(
     RaftNodeConfiguration.class);
 RaftNode node = ctx.getBean(RaftNode.class);
 node.start();
-// ... use node ...
-ctx.close(); // orderly shutdown
+ctx.close();
 
-// Manual wiring (tests)
+// Manual (tests)
 RaftNode node = new RaftNode(
     config, storage, stateMachine,
     transportFactory, RaftMetrics.noop());
@@ -186,26 +191,47 @@ node.shutdown();
 ## Testing
 
 ```java
-// Single-node (instant leader)
-RaftConfig cfg = RaftConfig.load(tmpFile);
 RaftNode node = new RaftNode(cfg,
     new InMemoryStorage(),
     new KeyValueStateMachine(),
-    addr -> null,  // no peers
+    addr -> null,
     RaftMetrics.noop());
-node.start(); // immediately leader
+node.start();
 
 // In-process gRPC (multi-node)
-ManagedChannel ch = InProcessChannelBuilder
-    .forName(addr).directExecutor().build();
-RaftTransport t = new GrpcTransport(ch);
-
-Server srv = InProcessServerBuilder
-    .forName(addr).directExecutor()
-    .addService(new GrpcTransportServer
-        .RaftServiceAdapter(node))
-    .build().start();
+RaftTransport t = new GrpcTransport(
+    InProcessChannelBuilder
+        .forName(addr).directExecutor()
+        .build());
 ```
+
+```
+./gradlew test
+./gradlew jacocoTestReport
+```
+
+## Logging
+
+SLF4J + Logback. Config: `src/main/resources/logback.xml`
+
+| Logger | Default level |
+|--------|---------------|
+| `com.fbtberger.raft` | INFO |
+| `io.grpc` | WARN |
+| `io.netty` | WARN |
+| `com.sleepycat` | WARN |
+
+## Proto RPCs (raft.proto)
+
+| RPC | Direction | Purpose |
+|-----|-----------|---------|
+| `RequestVote` | peer | Election |
+| `PreVote` | peer | Pre-election |
+| `AppendEntries` | leader | Replication |
+| `InstallSnapshot` | leader | Catch-up |
+| `TimeoutNow` | leader | Transfer |
+
+Client RPCs: `Submit`, `AddServer`, `RemoveServer`
 
 ## Metrics (Prometheus)
 
@@ -219,25 +245,14 @@ curl http://localhost:10091/metrics
 
 **Gauges:** `raft.node.term`, `.commit.index`, `.last.applied`, `.role`, `.log.last.index`, `.snapshot.index` | `raft.cluster.size`
 
-## Proto RPCs (raft.proto)
-
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| `RequestVote` | peer→peer | Election |
-| `AppendEntries` | leader→follower | Replication + heartbeat |
-| `InstallSnapshot` | leader→follower | Catch-up |
-| `PreVote` | candidate→peer | Pre-election check |
-
-Client RPCs in `client.proto`: `Submit`, `AddServer`, `RemoveServer`
-
 ## Performance Tuning
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | `snapshot.threshold` | 100 | Entries before auto-snapshot |
 | `snapshot.chunk.size` | 1 MB | InstallSnapshot chunk size |
+| `rpc.timeout.*.ms` | 1-30s | Per-RPC timeout |
 | `HEARTBEAT_INTERVAL_MS` | 50 | Heartbeat frequency |
 | `ELECTION_TIMEOUT_*_MS` | 150-300 | Election timeout range |
 | `MAX_BATCH_BYTES` | 1 MB | Max AppendEntries size |
 | `MAX_INFLIGHT_APPENDS` | 2 | Pipeline depth per peer |
-

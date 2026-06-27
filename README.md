@@ -5,9 +5,9 @@ Ongaro & Ousterhout's *"In Search of an Understandable Consensus Algorithm"* and
 the PhD dissertation *"Consensus: Bridging Theory and Practice"*.
 
 RPCs are defined with Protocol Buffers and transported over a pluggable transport
-layer (gRPC or Netty TCP); persistent state is stored in Berkeley DB Java Edition
-with synchronous durability. Observability is provided via Micrometer/Prometheus
-metrics.
+layer (gRPC, Netty TCP, or Hadoop RPC); persistent state is stored in Berkeley DB
+Java Edition with synchronous durability. Logging uses SLF4J/Logback; observability
+is provided via Micrometer/Prometheus metrics.
 
 For a detailed system architecture with UML diagrams, see
 [docs/architecture.pdf](docs/architecture.pdf).
@@ -20,6 +20,8 @@ For a quick API reference, see the
   rule (§5.2, §5.4.1)
 - **PreVote** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the
   cluster by inflating their term on rejoin
+- **Leadership transfer** (§3.10): graceful handoff to a target server via
+  `TimeoutNow` RPC, with automatic abort on timeout
 - **Log replication** via `AppendEntries`, including consistency check, conflicting
   entry truncation, and the "only commit entries from the current term" safety
   rule (§5.3, §5.4.2)
@@ -28,17 +30,21 @@ For a quick API reference, see the
   - Batching (§10.2.2): up to 1 MB per AppendEntries RPC
   - Pipelining (§10.2.2): optimistic nextIndex advancement, max 2 in-flight RPCs
 - **No-op entry** committed by every new leader (§8)
-- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes
+- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes, with
+  the §4 errata fix (config changes rejected until leader's no-op commits)
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
   - Copy-on-write async snapshotting (§5.1): background disk I/O
   - Independent per-server compaction with configurable threshold
-- **Transport abstraction layer**: pluggable gRPC and Netty TCP implementations
+- **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
+  implementations, with per-RPC configurable timeouts
 - **Prometheus metrics**: counters, timers, and gauges for all Raft events
+- **SLF4J/Logback** structured logging
 - **Durable storage** behind a `RaftStorage` interface with `BerkeleyDbStorage`
   (synchronous-commit) and `InMemoryStorage` (tests/demos)
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
+- **JaCoCo** test coverage reporting
 
 ## Project layout
 
@@ -53,17 +59,16 @@ raft-java/
 │   └── node3.properties
 ├── docs/
 │   ├── architecture.pdf            # system architecture with UML diagrams
-│   ├── architecture.md             # source for the PDF
-│   ├── component.puml              # PlantUML: system overview
-│   ├── class.puml                  # PlantUML: core class diagram
-│   ├── election.puml               # PlantUML: PreVote + election sequence
-│   ├── replication.puml            # PlantUML: replication pipeline
-│   └── snapshot.puml               # PlantUML: chunked snapshot transfer
+│   ├── cheatsheet.pdf              # developer quick reference
+│   └── *.puml / *.png              # PlantUML diagram sources and renders
 └── src/
     ├── main/
     │   ├── proto/
-    │   │   ├── raft.proto              # RequestVote, AppendEntries, InstallSnapshot, PreVote
+    │   │   ├── raft.proto              # RequestVote, AppendEntries, InstallSnapshot,
+    │   │   │                           # PreVote, TimeoutNow
     │   │   └── client.proto            # Submit, AddServer, RemoveServer
+    │   ├── resources/
+    │   │   └── logback.xml             # logging configuration
     │   └── java/com/fbtberger/raft/
     │       ├── RaftNode.java               # core algorithm
     │       ├── RaftConfig.java             # node configuration from .properties
@@ -83,13 +88,19 @@ raft-java/
     │       │   ├── RaftTransportFactory.java     # connection factory interface
     │       │   ├── RaftTransportServer.java      # inbound server interface
     │       │   ├── RaftRpcHandler.java           # RPC handler interface
-    │       │   ├── GrpcTransport.java            # gRPC client implementation
-    │       │   ├── GrpcTransportFactory.java     # gRPC factory
-    │       │   ├── GrpcTransportServer.java      # gRPC server
-    │       │   ├── NettyTransport.java           # Netty TCP client
-    │       │   ├── NettyTransportFactory.java    # Netty factory
-    │       │   ├── NettyTransportServer.java     # Netty TCP server
-    │       │   └── NettyProtocol.java            # wire format constants
+    │       │   ├── RpcTimeouts.java              # per-RPC timeout configuration
+    │       │   ├── TimeoutTransport.java         # timeout decorator
+    │       │   ├── GrpcTransport.java            # gRPC implementation
+    │       │   ├── GrpcTransportFactory.java
+    │       │   ├── GrpcTransportServer.java
+    │       │   ├── NettyTransport.java           # Netty TCP implementation
+    │       │   ├── NettyTransportFactory.java
+    │       │   ├── NettyTransportServer.java
+    │       │   ├── NettyProtocol.java            # wire format constants
+    │       │   ├── HadoopTransport.java          # Hadoop RPC implementation
+    │       │   ├── HadoopTransportFactory.java
+    │       │   ├── HadoopTransportServer.java
+    │       │   └── HadoopRaftProtocol.java       # Hadoop protocol interface
     │       └── client/
     │           ├── RaftClient.java               # generic client with leader discovery
     │           └── RaftClientDemo.java            # standalone client process
@@ -100,6 +111,31 @@ raft-java/
         ├── RaftNodeConfigurationTest.java      # Spring wiring tests
         ├── InMemoryStorageTest.java            # storage contract tests
         └── KeyValueStateMachineTest.java       # state machine tests
+```
+
+## Configuration
+
+All settings are loaded from a `.properties` file:
+
+```properties
+# Required
+node.id=node1
+node.port=9091
+data.dir=/var/raft/node1
+peer.node1=host1:9091
+peer.node2=host2:9092
+peer.node3=host3:9093
+
+# Optional (defaults shown)
+snapshot.threshold=100          # entries before auto-snapshot
+snapshot.chunk.size=1048576     # InstallSnapshot chunk size (bytes)
+metrics.port=0                  # Prometheus endpoint (0 = disabled)
+
+# Per-RPC timeouts (ms)
+rpc.timeout.request.vote.ms=1000
+rpc.timeout.append.entries.ms=2000
+rpc.timeout.install.snapshot.ms=30000
+rpc.timeout.pre.vote.ms=1000
 ```
 
 ## Building
@@ -141,14 +177,22 @@ docker build -f config/Dockerfile -t raft-java .
 
 ## Metrics
 
-When `metrics.port` is configured in the node's `.properties` file, a
-Prometheus-compatible `/metrics` endpoint is exposed:
+When `metrics.port` is configured, a Prometheus-compatible `/metrics` endpoint
+is exposed:
 
 ```
 curl http://localhost:10091/metrics
 ```
 
 See [docs/architecture.pdf](docs/architecture.pdf) for the full metrics table.
+
+## Testing
+
+```
+./gradlew test                    # run all tests
+./gradlew jacocoTestReport        # generate coverage report
+open build/reports/jacoco/test/html/index.html
+```
 
 ## What is *not* implemented
 

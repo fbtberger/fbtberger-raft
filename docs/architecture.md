@@ -18,12 +18,15 @@ and the PhD dissertation *"Consensus: Bridging Theory and Practice"*.
 The project implements:
 
 - **Core Raft** (§5): leader election, log replication, safety rules
-- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes
+- **Leadership transfer** (§3.10): graceful handoff via TimeoutNow RPC
+- **Cluster reconfiguration** (§6): one-server-at-a-time membership changes (with §4 errata fix)
 - **Log compaction** (§7): independent snapshotting with chunked InstallSnapshot
 - **Client interaction** (§8): no-op entry, leader redirection
 - **PreVote** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
 - **Copy-on-write snapshotting** (§5.1): async background compaction
+- **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts
+- **Observability**: SLF4J/Logback logging, Micrometer/Prometheus metrics
 
 \newpage
 
@@ -36,12 +39,13 @@ consensus algorithm. It delegates durable storage to **RaftStorage** (backed by
 Berkeley DB JE), state machine operations to **StateMachine**, and peer
 communication to the **Transport** abstraction layer.
 
-The transport layer is pluggable: a **gRPC** implementation (default) uses HTTP/2
-with protobuf encoding, while a **Netty** implementation provides a lightweight
-TCP transport with custom length-delimited framing.
+The transport layer is pluggable: **gRPC** (default, HTTP/2 + protobuf),
+**Netty** (raw TCP with custom framing), or **Hadoop RPC** (WritableRpcEngine
+with BytesWritable-wrapped protobuf). A **TimeoutTransport** decorator applies
+per-RPC configurable timeouts to any transport implementation.
 
-Prometheus metrics are exposed via Micrometer counters, timers, and gauges on a
-configurable HTTP endpoint.
+Logging uses SLF4J with Logback. Prometheus metrics are exposed via Micrometer
+counters, timers, and gauges on a configurable HTTP endpoint.
 
 \newpage
 
@@ -55,6 +59,7 @@ Key design principles:
 - All dependencies are injected (Spring IoC in production, manual wiring in tests)
 - `RaftStorage` separates durable state from the algorithm
 - `RaftTransport` / `RaftTransportFactory` abstract the network layer
+- `TimeoutTransport` decorates any transport with per-RPC timeouts
 - `RaftMetrics` instruments all significant state transitions
 
 \newpage
@@ -77,9 +82,27 @@ The election process has two phases:
 
 Single-node clusters skip PreVote and elect immediately.
 
+# 5. Leadership Transfer (§3.10)
+
+A leader can gracefully hand off to a specific target server:
+
+1. **Stop accepting client requests** -- `submitCommand` returns
+   `NotLeaderException` with the target as leader hint.
+2. **Catch up the target** -- normal heartbeat replication continues until
+   `matchIndex[target] >= lastLogIndex`.
+3. **Send TimeoutNow** -- the target immediately starts a real election
+   (skipping PreVote and election timeout), wins, and the prior leader
+   steps down on seeing the higher term.
+4. **Abort on timeout** -- if transfer doesn't complete within
+   `ELECTION_TIMEOUT_MAX_MS`, the leader aborts and resumes normal operation.
+
+```java
+node.transferLeadership("n2").get(1, SECONDS);
+```
+
 \newpage
 
-# 5. Log Replication Pipeline
+# 6. Log Replication Pipeline
 
 ![Replication with Parallel Disk Writes and Pipelining](replication.png){width=85%}
 
@@ -102,7 +125,7 @@ Three optimizations from §10.2 reduce latency:
 
 \newpage
 
-# 6. Snapshot Transfer
+# 7. Snapshot Transfer
 
 ![Chunked Snapshot Transfer](snapshot.png){width=85%}
 
@@ -122,35 +145,48 @@ applies the reassembled snapshot when the final chunk arrives (`done=true`).
 
 \newpage
 
-# 7. Transport Layer
+# 8. Transport Layer
 
 The transport abstraction decouples RaftNode from any specific network library:
 
 | Interface | Purpose |
 |-----------|---------|
-| `RaftTransport` | Outbound peer connection (requestVote, appendEntries, installSnapshot, preVote) |
+| `RaftTransport` | Outbound peer connection (5 RPCs) |
 | `RaftTransportFactory` | Creates outbound connections from an address string |
 | `RaftTransportServer` | Inbound server that routes RPCs to `RaftRpcHandler` |
-| `RaftRpcHandler` | Handler interface for incoming RPCs (implemented by RaftNode) |
+| `RaftRpcHandler` | Handler interface (implemented by RaftNode) |
+| `RpcTimeouts` | Per-RPC timeout configuration from `.properties` |
+| `TimeoutTransport` | Decorator applying `orTimeout()` to any transport |
 
-**gRPC implementation** (default): Uses HTTP/2 with protobuf encoding.
-`GrpcTransport` wraps `RaftServiceGrpc.RaftServiceFutureStub` and converts
-`ListenableFuture` to `CompletableFuture`. `GrpcTransportServer` embeds a
-`RaftServiceAdapter` that delegates to `RaftRpcHandler`.
+**RPCs**: RequestVote, AppendEntries, InstallSnapshot, PreVote, TimeoutNow.
 
-**Netty implementation**: Custom TCP protocol with length-delimited framing:
+**Implementations**:
+
+| Transport | Protocol | Use case |
+|-----------|----------|----------|
+| gRPC (default) | HTTP/2 + protobuf | Standard deployments |
+| Netty TCP | Length-delimited + protobuf | Lightweight, no HTTP overhead |
+| Hadoop RPC | WritableRpcEngine + BytesWritable | Hadoop ecosystem integration |
+
+**Per-RPC timeouts** are configurable via `.properties`:
 
 ```
-+----------+------+-------+---------+
-| len (4B) | type | reqId | payload |
-+----------+------+-------+---------+
+rpc.timeout.request.vote.ms=1000
+rpc.timeout.append.entries.ms=2000
+rpc.timeout.install.snapshot.ms=30000
+rpc.timeout.pre.vote.ms=1000
 ```
 
-Request IDs correlate responses to pending `CompletableFuture`s. Message types
-1-8 cover the four RPC pairs (RequestVote, AppendEntries, InstallSnapshot,
-PreVote). A shared `NioEventLoopGroup` serves all outbound connections.
+# 9. Safety: §4 Errata Fix
 
-# 8. Metrics
+The dissertation's single-server membership change algorithm has a known safety
+bug: competing configuration changes across term boundaries in even-sized clusters
+can use non-overlapping majorities. The fix (from the raft-dev mailing list):
+a leader must commit an entry from its current term before accepting configuration
+changes. The no-op entry appended at the start of every term (§8) serves this
+purpose -- `addServer`/`removeServer` are rejected until `commitIndex >= leaderNoOpIndex`.
+
+# 10. Metrics
 
 All significant Raft events are instrumented via Micrometer:
 
