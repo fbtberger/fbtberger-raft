@@ -1,10 +1,13 @@
 package com.fbtberger.raft;
 
-import com.fbtberger.raft.transport.RpcTimeouts;
-import com.fbtberger.raft.transport.TlsConfig;
+import com.fbtberger.raft.proto.*;
+import com.fbtberger.raft.transport.*;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.junit.jupiter.api.Test;
 
+import java.net.ServerSocket;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -80,5 +83,90 @@ class TlsAndTimeoutsTest {
         RpcTimeouts t = RpcTimeouts.fromProperties(new Properties());
         assertEquals(RpcTimeouts.DEFAULT_REQUEST_VOTE_MS, t.requestVoteMs());
         assertEquals(RpcTimeouts.DEFAULT_APPEND_ENTRIES_MS, t.appendEntriesMs());
+    }
+
+    @Test
+    void grpcTlsRoundTrip() throws Exception {
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        TlsConfig tlsConfig = new TlsConfig(true,
+                ssc.certificate(), ssc.privateKey(), ssc.certificate(), false);
+
+        int port;
+        try (ServerSocket ss = new ServerSocket(0)) { port = ss.getLocalPort(); }
+
+        StubHandler handler = new StubHandler();
+        GrpcTransportServer server = new GrpcTransportServer(port, handler, tlsConfig);
+        server.start();
+        try {
+            GrpcTransportFactory factory = new GrpcTransportFactory(tlsConfig);
+            RaftTransport client = factory.connect("localhost:" + port);
+            try {
+                RequestVoteResponse resp = client.requestVote(
+                        RequestVoteRequest.newBuilder()
+                                .setTerm(3).setCandidateId("n1")
+                                .setLastLogIndex(1).setLastLogTerm(1).build()
+                ).get(5, TimeUnit.SECONDS);
+                assertEquals(3, resp.getTerm());
+                assertTrue(resp.getVoteGranted());
+            } finally {
+                client.close();
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    void grpcMtlsRoundTrip() throws Exception {
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        TlsConfig tlsConfig = new TlsConfig(true,
+                ssc.certificate(), ssc.privateKey(), ssc.certificate(), true);
+
+        int port;
+        try (ServerSocket ss = new ServerSocket(0)) { port = ss.getLocalPort(); }
+
+        StubHandler handler = new StubHandler();
+        GrpcTransportServer server = new GrpcTransportServer(port, handler, tlsConfig);
+        server.start();
+        try {
+            GrpcTransportFactory factory = new GrpcTransportFactory(tlsConfig);
+            RaftTransport client = factory.connect("localhost:" + port);
+            try {
+                AppendEntriesResponse resp = client.appendEntries(
+                        AppendEntriesRequest.newBuilder()
+                                .setTerm(2).setLeaderId("leader")
+                                .setPrevLogIndex(0).setPrevLogTerm(0).build()
+                ).get(5, TimeUnit.SECONDS);
+                assertEquals(2, resp.getTerm());
+                assertTrue(resp.getSuccess());
+            } finally {
+                client.close();
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    private static final class StubHandler implements RaftRpcHandler {
+        @Override
+        public RequestVoteResponse handleRequestVote(RequestVoteRequest req) {
+            return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build();
+        }
+        @Override
+        public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
+            return AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).build();
+        }
+        @Override
+        public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest req) {
+            return InstallSnapshotResponse.newBuilder().setTerm(req.getTerm()).build();
+        }
+        @Override
+        public PreVoteResponse handlePreVote(PreVoteRequest req) {
+            return PreVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build();
+        }
+        @Override
+        public TimeoutNowResponse handleTimeoutNow(TimeoutNowRequest req) {
+            return TimeoutNowResponse.getDefaultInstance();
+        }
     }
 }

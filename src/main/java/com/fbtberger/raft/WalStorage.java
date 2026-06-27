@@ -12,39 +12,48 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.zip.CRC32;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * {@link RaftStorage} backed by an append-only Write-Ahead Log file.
+ * {@link RaftStorage} backed by a segmented, append-only Write-Ahead Log.
  *
  * <p>Layout on disk:
  * <ul>
- *   <li>{@code wal.log} — append-only sequence of length-prefixed protobuf
- *       {@link LogEntry} records: {@code [4B length][protobuf bytes]...}</li>
+ *   <li>{@code wal-NNNNNN.log} — numbered segment files, each an append-only
+ *       sequence of CRC32-checked protobuf {@link LogEntry} frames:
+ *       {@code [4B length][4B CRC32][protobuf bytes]...}. A new segment is
+ *       started when the active segment exceeds {@code maxSegmentBytes}.</li>
  *   <li>{@code meta} — currentTerm (8B) + votedFor length (4B) + votedFor
  *       UTF-8 bytes; atomically replaced on each update via rename</li>
  *   <li>{@code snapshot} — snapshot metadata + payload; atomically
  *       replaced via rename</li>
  * </ul>
- *
- * <p>On startup, the WAL file is scanned sequentially to rebuild the
- * in-memory index (log index → file offset). This is intentionally simple:
- * no checkpointing or segment rotation, suitable for the same demo/learning
- * scope as the rest of this project.
  */
 public final class WalStorage implements RaftStorage {
 
+    static final int FRAME_HEADER_SIZE = 8; // 4B length + 4B CRC32
+    static final long DEFAULT_MAX_SEGMENT_BYTES = 64 * 1024 * 1024; // 64 MB
+    private static final Pattern SEGMENT_PATTERN = Pattern.compile("wal-(\\d{6})\\.log");
+
     private final File dataDir;
-    private final File walFile;
     private final File metaFile;
     private final File snapshotFile;
+    private final long maxSegmentBytes;
     private final ExecutorService syncExecutor;
 
-    private RandomAccessFile wal;
+    private final TreeMap<Integer, File> segmentFiles = new TreeMap<>();
+    private int activeSegmentId;
+    private RandomAccessFile activeSegment;
     private final NavigableMap<Long, WalEntry> index = new TreeMap<>();
 
     private long currentTerm;
@@ -53,13 +62,17 @@ public final class WalStorage implements RaftStorage {
     private long lastLogIndex;
     private long lastLogTerm;
 
-    private record WalEntry(long fileOffset, int length) {}
+    private record WalEntry(int segmentId, long fileOffset, int length) {}
 
     public WalStorage(File dataDir) {
+        this(dataDir, DEFAULT_MAX_SEGMENT_BYTES);
+    }
+
+    public WalStorage(File dataDir, long maxSegmentBytes) {
         this.dataDir = dataDir;
-        this.walFile = new File(dataDir, "wal.log");
         this.metaFile = new File(dataDir, "meta");
         this.snapshotFile = new File(dataDir, "snapshot");
+        this.maxSegmentBytes = maxSegmentBytes;
         this.syncExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "wal-sync");
             t.setDaemon(true);
@@ -73,8 +86,15 @@ public final class WalStorage implements RaftStorage {
         try {
             recoverMeta();
             recoverSnapshot();
-            this.wal = new RandomAccessFile(walFile, "rw");
-            recoverWal();
+            migrateOldWalIfNeeded();
+            discoverSegments();
+            if (segmentFiles.isEmpty()) {
+                createSegment(1);
+            } else {
+                activeSegmentId = segmentFiles.lastKey();
+                activeSegment = new RandomAccessFile(segmentFiles.get(activeSegmentId), "rw");
+            }
+            recoverAllSegments();
         } catch (IOException e) {
             throw new UncheckedIOException("WAL recovery failed", e);
         }
@@ -133,47 +153,61 @@ public final class WalStorage implements RaftStorage {
         WalEntry we = index.get(idx);
         if (we == null) return null;
         try {
-            wal.seek(we.fileOffset);
-            byte[] buf = new byte[we.length];
-            wal.readFully(buf);
-            return LogEntry.parseFrom(buf);
+            return readEntry(we);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
-    @Override
-    public synchronized long getLastLogIndex() {
-        return lastLogIndex;
+    private LogEntry readEntry(WalEntry we) throws IOException {
+        if (we.segmentId == activeSegmentId) {
+            long savedPos = activeSegment.getFilePointer();
+            activeSegment.seek(we.fileOffset);
+            byte[] buf = new byte[we.length];
+            activeSegment.readFully(buf);
+            activeSegment.seek(savedPos);
+            return LogEntry.parseFrom(buf);
+        }
+        File segFile = segmentFiles.get(we.segmentId);
+        if (segFile == null) return null;
+        try (RandomAccessFile raf = new RandomAccessFile(segFile, "r")) {
+            raf.seek(we.fileOffset);
+            byte[] buf = new byte[we.length];
+            raf.readFully(buf);
+            return LogEntry.parseFrom(buf);
+        }
     }
 
     @Override
-    public synchronized long getLastLogTerm() {
-        return lastLogTerm;
-    }
+    public synchronized long getLastLogIndex() { return lastLogIndex; }
+
+    @Override
+    public synchronized long getLastLogTerm() { return lastLogTerm; }
 
     @Override
     public synchronized void appendEntries(Iterable<LogEntry> entries) {
         appendToWal(entries);
-        syncWal();
+        syncActiveSegment();
     }
 
     @Override
     public synchronized CompletableFuture<Void> appendEntriesDeferSync(Iterable<LogEntry> entries) {
         appendToWal(entries);
-        return CompletableFuture.runAsync(this::syncWal, syncExecutor);
+        return CompletableFuture.runAsync(this::syncActiveSegment, syncExecutor);
     }
 
     private void appendToWal(Iterable<LogEntry> entries) {
         try {
-            long pos = wal.length();
-            wal.seek(pos);
             for (LogEntry entry : entries) {
+                maybeRotateSegment();
                 byte[] bytes = entry.toByteArray();
-                long entryOffset = wal.getFilePointer();
-                wal.writeInt(bytes.length);
-                wal.write(bytes);
-                index.put(entry.getIndex(), new WalEntry(entryOffset + 4, bytes.length));
+                long entryOffset = activeSegment.length();
+                activeSegment.seek(entryOffset);
+                activeSegment.writeInt(bytes.length);
+                activeSegment.writeInt(crc32(bytes));
+                activeSegment.write(bytes);
+                index.put(entry.getIndex(), new WalEntry(activeSegmentId,
+                        entryOffset + FRAME_HEADER_SIZE, bytes.length));
                 lastLogIndex = entry.getIndex();
                 lastLogTerm = entry.getTerm();
             }
@@ -182,9 +216,34 @@ public final class WalStorage implements RaftStorage {
         }
     }
 
-    private synchronized void syncWal() {
+    private void maybeRotateSegment() throws IOException {
+        if (activeSegment.length() >= maxSegmentBytes) {
+            syncActiveSegment();
+            activeSegment.close();
+            createSegment(activeSegmentId + 1);
+        }
+    }
+
+    private void createSegment(int segId) throws IOException {
+        File segFile = segmentFile(segId);
+        segmentFiles.put(segId, segFile);
+        activeSegmentId = segId;
+        activeSegment = new RandomAccessFile(segFile, "rw");
+    }
+
+    private File segmentFile(int segId) {
+        return new File(dataDir, String.format("wal-%06d.log", segId));
+    }
+
+    static int crc32(byte[] data) {
+        CRC32 crc = new CRC32();
+        crc.update(data);
+        return (int) crc.getValue();
+    }
+
+    private synchronized void syncActiveSegment() {
         try {
-            wal.getFD().sync();
+            activeSegment.getFD().sync();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -196,11 +255,31 @@ public final class WalStorage implements RaftStorage {
         if (tail.isEmpty()) return;
 
         WalEntry first = tail.firstEntry().getValue();
-        long truncateOffset = first.fileOffset - 4;
+        int firstSegId = first.segmentId;
+        long truncateOffset = first.fileOffset - FRAME_HEADER_SIZE;
         tail.clear();
 
         try {
-            wal.setLength(truncateOffset);
+            // Delete all segments after the one containing the truncation point
+            List<Integer> toRemove = new ArrayList<>(segmentFiles.tailMap(firstSegId, false).keySet());
+            for (int segId : toRemove) {
+                if (segId == activeSegmentId) {
+                    activeSegment.close();
+                }
+                segmentFiles.remove(segId).delete();
+            }
+
+            // Truncate the segment containing the first removed entry
+            if (firstSegId == activeSegmentId) {
+                activeSegment.setLength(truncateOffset);
+            } else {
+                activeSegment.close();
+                try (RandomAccessFile raf = new RandomAccessFile(segmentFiles.get(firstSegId), "rw")) {
+                    raf.setLength(truncateOffset);
+                }
+                activeSegmentId = firstSegId;
+                activeSegment = new RandomAccessFile(segmentFiles.get(firstSegId), "rw");
+            }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -252,7 +331,6 @@ public final class WalStorage implements RaftStorage {
         }
         this.snapshot = snap;
 
-        // Remove compacted entries from index and rewrite WAL without them
         index.headMap(snap.lastIncludedIndex, true).clear();
 
         if (lastLogIndex <= snap.lastIncludedIndex) {
@@ -260,41 +338,22 @@ public final class WalStorage implements RaftStorage {
             lastLogTerm = snap.lastIncludedTerm;
         }
 
-        compactWalFile();
+        deleteObsoleteSegments();
     }
 
-    private void compactWalFile() {
-        try {
-            if (index.isEmpty()) {
-                wal.setLength(0);
-                return;
+    private void deleteObsoleteSegments() {
+        List<Integer> toDelete = new ArrayList<>();
+        for (var entry : segmentFiles.entrySet()) {
+            int segId = entry.getKey();
+            if (segId == activeSegmentId) continue;
+            boolean hasLiveEntries = index.values().stream()
+                    .anyMatch(we -> we.segmentId == segId);
+            if (!hasLiveEntries) {
+                toDelete.add(segId);
             }
-            long firstOffset = index.firstEntry().getValue().fileOffset - 4;
-            if (firstOffset <= 0) return;
-
-            File tmp = new File(dataDir, "wal.tmp");
-            try (RandomAccessFile src = new RandomAccessFile(walFile, "r");
-                 FileOutputStream dst = new FileOutputStream(tmp)) {
-                src.seek(firstOffset);
-                byte[] buf = new byte[8192];
-                int read;
-                while ((read = src.read(buf)) > 0) {
-                    dst.write(buf, 0, read);
-                }
-                dst.getFD().sync();
-            }
-
-            wal.close();
-            if (!tmp.renameTo(walFile)) {
-                throw new IOException("rename wal.tmp -> wal.log failed");
-            }
-            wal = new RandomAccessFile(walFile, "rw");
-
-            // Rebuild offsets after compaction
-            index.clear();
-            recoverWal();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
+        }
+        for (int segId : toDelete) {
+            segmentFiles.remove(segId).delete();
         }
     }
 
@@ -323,29 +382,75 @@ public final class WalStorage implements RaftStorage {
         }
     }
 
-    private void recoverWal() throws IOException {
-        long fileLen = wal.length();
+    private void migrateOldWalIfNeeded() {
+        File oldWal = new File(dataDir, "wal.log");
+        if (oldWal.exists() && oldWal.length() > 0) {
+            File newName = segmentFile(1);
+            if (!oldWal.renameTo(newName)) {
+                throw new UncheckedIOException(
+                        new IOException("failed to migrate wal.log -> " + newName.getName()));
+            }
+        } else if (oldWal.exists()) {
+            oldWal.delete();
+        }
+    }
+
+    private void discoverSegments() {
+        File[] files = dataDir.listFiles();
+        if (files == null) return;
+        for (File f : files) {
+            Matcher m = SEGMENT_PATTERN.matcher(f.getName());
+            if (m.matches()) {
+                segmentFiles.put(Integer.parseInt(m.group(1)), f);
+            }
+        }
+    }
+
+    private void recoverAllSegments() throws IOException {
+        for (var entry : segmentFiles.entrySet()) {
+            int segId = entry.getKey();
+            File segFile = entry.getValue();
+            if (segId == activeSegmentId) {
+                recoverSegment(segId, activeSegment);
+            } else {
+                try (RandomAccessFile raf = new RandomAccessFile(segFile, "rw")) {
+                    recoverSegment(segId, raf);
+                }
+            }
+        }
+    }
+
+    private void recoverSegment(int segId, RandomAccessFile raf) throws IOException {
+        long fileLen = raf.length();
         long pos = 0;
-        wal.seek(0);
+        raf.seek(0);
         while (pos < fileLen) {
-            if (fileLen - pos < 4) break;
-            int len = wal.readInt();
-            if (len <= 0 || pos + 4 + len > fileLen) {
-                wal.setLength(pos);
+            if (fileLen - pos < FRAME_HEADER_SIZE) break;
+            int len = raf.readInt();
+            int expectedCrc = raf.readInt();
+            if (len <= 0 || pos + FRAME_HEADER_SIZE + len > fileLen) {
+                raf.setLength(pos);
                 break;
             }
             byte[] buf = new byte[len];
-            wal.readFully(buf);
+            raf.readFully(buf);
+            if (crc32(buf) != expectedCrc) {
+                raf.setLength(pos);
+                break;
+            }
             try {
                 LogEntry entry = LogEntry.parseFrom(buf);
-                index.put(entry.getIndex(), new WalEntry(pos + 4, len));
+                long snapshotIdx = snapshot != null ? snapshot.lastIncludedIndex : 0;
+                if (entry.getIndex() > snapshotIdx) {
+                    index.put(entry.getIndex(), new WalEntry(segId, pos + FRAME_HEADER_SIZE, len));
+                }
                 lastLogIndex = entry.getIndex();
                 lastLogTerm = entry.getTerm();
             } catch (InvalidProtocolBufferException e) {
-                wal.setLength(pos);
+                raf.setLength(pos);
                 break;
             }
-            pos += 4 + len;
+            pos += FRAME_HEADER_SIZE + len;
         }
     }
 
@@ -353,7 +458,7 @@ public final class WalStorage implements RaftStorage {
     public synchronized void close() {
         syncExecutor.shutdown();
         try {
-            wal.close();
+            activeSegment.close();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

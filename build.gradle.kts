@@ -73,6 +73,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testImplementation("org.springframework:spring-test:$springVersion")
     testImplementation("io.grpc:grpc-inprocess:$grpcVersion")
+    testImplementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 }
 
 protobuf {
