@@ -53,8 +53,11 @@ For a quick API reference, see the
   - `WalStorage` — segmented append-only WAL with CRC32 frame checksums,
     configurable max segment size (default 64 MB), and crash recovery
   - `InMemoryStorage` — non-durable, for tests/demos
-- **Linearizable reads** via the ReadIndex protocol: `readIndex()` confirms
-  leadership with a majority heartbeat round before allowing reads
+- **Linearizable reads**:
+  - ReadIndex protocol: `readIndex()` confirms leadership with a majority
+    heartbeat round before allowing reads
+  - Lease-based: `leaseRead()` serves reads immediately when the leader's lease
+    is valid (majority acked within election timeout); falls back to ReadIndex
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
 - **JaCoCo** test coverage reporting
@@ -238,9 +241,6 @@ open build/reports/jacoco/test/html/index.html
 
 - **Client request de-duplication** (§8): retried commands may be applied twice.
   A production system would track per-client serial numbers.
-- **Lease-based reads**: the current `readIndex()` uses heartbeat confirmation
-  (one network round-trip); a lease-based approach could avoid the round-trip
-  under stable leadership at the cost of clock-skew assumptions.
 
 ## License
 

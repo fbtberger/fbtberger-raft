@@ -22,7 +22,7 @@ The project implements:
 - **Cluster reconfiguration** (§6): single-step changes (`addServer`/`removeServer`) and joint consensus (`setConfiguration`) for arbitrary multi-server changes (with §4 errata fix)
 - **Log compaction** (§7): independent snapshotting with chunked InstallSnapshot
 - **Client interaction** (§8): no-op entry, leader redirection
-- **Linearizable reads**: ReadIndex protocol (`readIndex()`) confirms leadership with a majority heartbeat round
+- **Linearizable reads**: ReadIndex protocol (`readIndex()`) and lease-based reads (`leaseRead()`) for zero-round-trip reads under stable leadership
 - **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid leader is active
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
 - **Copy-on-write snapshotting** (§5.1): `prepareCowSnapshot()` captures state under the lock; serialization runs on a background thread
@@ -103,11 +103,12 @@ A leader can gracefully hand off to a specific target server:
 node.transferLeadership("n2").get(1, SECONDS);
 ```
 
-# 5.1 Linearizable Reads (ReadIndex)
+# 5.1 Linearizable Reads (ReadIndex + Lease)
 
 A local read from the state machine is not linearizable because the node may be
-a stale leader (split-brain). `readIndex()` confirms leadership before allowing
-reads:
+a stale leader (split-brain). Two mechanisms are provided:
+
+**ReadIndex** (`readIndex()`): confirms leadership before allowing reads.
 
 1. **Record** `readIndex = commitIndex` at the time of the call.
 2. **Confirm leadership** by sending a heartbeat round to all peers and waiting
@@ -121,7 +122,19 @@ node.readIndex().thenRun(() -> {
 });
 ```
 
-Single-node clusters complete immediately (the leader is trivially confirmed).
+**Lease-based reads** (`leaseRead()`): serves reads immediately (no heartbeat
+round-trip) when the leader holds a valid lease -- i.e., a majority of peers have
+acknowledged a heartbeat within the election timeout window. If the lease has
+expired, falls back to `readIndex()` transparently.
+
+```java
+node.leaseRead().thenRun(() -> {
+    String value = stateMachine.get("key"); // linearizable, zero RTT if lease valid
+});
+```
+
+Lease reads assume bounded clock skew. Use `readIndex()` if clocks may diverge
+significantly. Single-node clusters complete immediately for both methods.
 
 # 5.2 Joint Consensus (§6)
 

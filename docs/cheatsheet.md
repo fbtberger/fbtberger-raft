@@ -111,18 +111,23 @@ node.transferLeadership("n2")
 
 Leader stops accepting commands, catches up the target, sends TimeoutNow. Aborts automatically on timeout.
 
-## Linearizable Reads (ReadIndex)
+## Linearizable Reads
+
+**ReadIndex** (one heartbeat round-trip):
 
 ```java
-node.readIndex().thenRun(() -> {
-  String v = stateMachine.get("key");
-});
-// or blocking:
 node.readIndex().get(1, SECONDS);
 String v = stateMachine.get("key");
 ```
 
-Confirms leadership via heartbeat majority before allowing reads. Single-node clusters complete immediately.
+**Lease-based** (zero RTT if lease valid):
+
+```java
+node.leaseRead().get(1, SECONDS);
+String v = stateMachine.get("key");
+```
+
+`leaseRead()` serves instantly if majority acked within election timeout; falls back to `readIndex()` otherwise. Assumes bounded clock skew.
 
 ## Cluster Reconfiguration
 
