@@ -468,8 +468,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     // ------------------------------------------------------------------
-    // PreVote RPC (§4.2.3 / §9.6)
+    // PreVote RPC (§4.2.3 / §9.6) + Leader Stickiness
     // ------------------------------------------------------------------
+
+    /**
+     * Leader stickiness: returns true if this server has heard from a valid
+     * leader recently enough that it should refuse to grant (Pre)Votes.
+     * This prevents a candidate from disrupting a functioning cluster --
+     * especially a partitioned node whose term inflated while isolated.
+     */
+    private boolean hasLeaderStickiness() {
+        return System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
+    }
 
     @Override
     public PreVoteResponse handlePreVote(PreVoteRequest request) {
@@ -482,9 +492,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
 
             boolean logOk = isLogAtLeastAsUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
-            boolean leaderActive = System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
-
-            boolean grant = logOk && !leaderActive;
+            boolean grant = logOk && !hasLeaderStickiness();
             return PreVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(grant).build();
         } finally {
             lock.unlock();
