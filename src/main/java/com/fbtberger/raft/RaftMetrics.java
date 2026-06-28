@@ -1,3 +1,7 @@
+/*
+ * Copyright 2026 FbtBerger Technology. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 package com.fbtberger.raft;
 
 import io.micrometer.core.instrument.Counter;
