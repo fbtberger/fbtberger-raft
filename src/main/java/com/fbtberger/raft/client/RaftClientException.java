@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 FbtBerger Technology. All rights reserved.
+ * Copyright 2026 fbtBerger Technology. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 package com.fbtberger.raft.client;
