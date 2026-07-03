@@ -1085,6 +1085,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         return store.getSnapshotIndex();
     }
 
+    /**
+     * The current commit index — the highest log index known to be committed on this node.
+     * A direct read; for a linearizable, leader-confirmed value use {@link #readIndex()}.
+     */
+    public long commitIndex() {
+        return commitIndex.get();
+    }
+
+    /** The current applied index — the highest log index applied to the state machine. */
+    public long appliedIndex() {
+        return lastApplied.get();
+    }
+
     // ------------------------------------------------------------------
     // Client interaction (§8, simplified: no per-client serial-number
     // de-duplication, so a retried command can in principle be applied
@@ -1121,23 +1134,24 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * Confirms that this server is still the leader and that all entries
      * up to the current commit index have been applied, so a subsequent
      * read from the state machine is linearizable. The returned future
-     * completes once a majority of peers have confirmed leadership via
-     * a heartbeat round and {@code lastApplied >= commitIndex} at the
-     * time of the call.
+     * completes with the leader-confirmed <em>read index</em> (the commit
+     * index captured at the time of the call) once a majority of peers have
+     * confirmed leadership via a heartbeat round and {@code lastApplied >=}
+     * that index. Clients use this index as a linearizable read barrier.
      */
-    public CompletableFuture<Void> readIndex() {
+    public CompletableFuture<Long> readIndex() {
         lock.lock();
         try {
             if (role != ServerRole.LEADER) {
-                CompletableFuture<Void> f = new CompletableFuture<>();
+                CompletableFuture<Long> f = new CompletableFuture<>();
                 f.completeExceptionally(new NotLeaderException(currentLeaderId));
                 return f;
             }
             long ri = commitIndex.get();
             if (majority() == 1) {
                 return lastApplied.get() >= ri
-                        ? CompletableFuture.completedFuture(null)
-                        : awaitApplied(ri);
+                        ? CompletableFuture.completedFuture(ri)
+                        : awaitApplied(ri).thenApply(v -> ri);
             }
             ReadBarrier barrier = new ReadBarrier(ri, majority());
             pendingReadBarriers.add(barrier);
@@ -1216,7 +1230,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private void checkReadBarriers() {
         pendingReadBarriers.removeIf(barrier -> {
             if (barrier.isConfirmed() && lastApplied.get() >= barrier.readIndex) {
-                barrier.future.complete(null);
+                barrier.future.complete(barrier.readIndex);
                 return true;
             }
             return false;
@@ -1226,7 +1240,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private static final class ReadBarrier {
         final long readIndex;
         final int needed;
-        final CompletableFuture<Void> future = new CompletableFuture<>();
+        final CompletableFuture<Long> future = new CompletableFuture<>();
         final java.util.Set<String> confirmed = ConcurrentHashMap.newKeySet();
 
         ReadBarrier(long readIndex, int needed) {

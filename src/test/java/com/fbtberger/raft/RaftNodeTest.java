@@ -694,6 +694,29 @@ class RaftNodeTest {
         return RaftConfig.load(tmp);
     }
 
+    // ---- ReadIndex / leader index (client-visible) ----------------------
+
+    @Test
+    void commitAndAppliedIndexAreExposed() throws Exception {
+        long before = node.commitIndex();
+        node.submitCommand("SET a 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        node.submitCommand("SET b 2".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+
+        assertTrue(node.commitIndex() >= before + 2);
+        // Single-node applies immediately, so applied catches up to committed.
+        assertEquals(node.commitIndex(), node.appliedIndex());
+    }
+
+    @Test
+    void readIndexReturnsLeaderConfirmedCommitIndex() throws Exception {
+        node.submitCommand("SET k v".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+
+        long committed = node.commitIndex();
+        long readIndex = node.readIndex().get(2, TimeUnit.SECONDS);
+
+        assertEquals(committed, readIndex);
+    }
+
     private RaftTransport connectInProcess(String address) {
         ManagedChannel ch = InProcessChannelBuilder.forName(address).directExecutor().build();
         GrpcTransport t = new GrpcTransport(ch);
