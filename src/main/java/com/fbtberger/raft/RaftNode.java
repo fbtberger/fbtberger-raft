@@ -1189,7 +1189,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         ? CompletableFuture.completedFuture(null)
                         : awaitApplied(ri);
             }
-            return readIndex();
+            return readIndex().thenApply(ignored -> null);
         } finally {
             lock.unlock();
         }
