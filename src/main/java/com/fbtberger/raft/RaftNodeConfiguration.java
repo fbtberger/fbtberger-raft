@@ -157,7 +157,7 @@ public class RaftNodeConfiguration {
     }
 
     @Bean(destroyMethod = "stop")
-    public HttpServer metricsHttpServer(PrometheusMeterRegistry registry,
+    public MetricsHttpServer metricsHttpServer(PrometheusMeterRegistry registry,
                                         RaftConfig config,
                                         HealthCheck healthCheck) throws IOException {
         if (config.metricsPort() <= 0) {
@@ -182,7 +182,7 @@ public class RaftNodeConfiguration {
             respondJson(exchange, status);
         });
         server.start();
-        return server;
+        return new MetricsHttpServer(server);
     }
 
     private static void respondJson(com.sun.net.httpserver.HttpExchange exchange,
