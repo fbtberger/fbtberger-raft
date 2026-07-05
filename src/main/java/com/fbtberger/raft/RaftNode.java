@@ -270,10 +270,28 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     .build();
 
             AtomicLong preVotesGranted = new AtomicLong(1); // count self
-            for (RaftTransport peer : peerTransports.values()) {
-                peer.preVote(preVoteRequest).whenComplete((response, t) -> {
-                    if (t == null) handlePreVoteResponse(proposedTerm, response, preVotesGranted);
-                });
+            try {
+                for (RaftTransport peer : peerTransports.values()) {
+                    peer.preVote(preVoteRequest).whenComplete((response, t) -> {
+                        if (t == null) {
+                            handlePreVoteResponse(proposedTerm, response, preVotesGranted);
+                        } else {
+                            log("PreVote RPC failed: " + t);
+                        }
+                    });
+                }
+            } catch (RuntimeException e) {
+                // A SYNCHRONOUS failure here (e.g. lazy peer-channel/TLS-context construction
+                // throwing, rather than the RPC itself failing asynchronously above) used to
+                // propagate straight out of this method — which is the Runnable passed to
+                // scheduler.schedule(). ScheduledExecutorService swallows an uncaught exception
+                // from a scheduled task completely silently: no log, no retry, nothing. The
+                // node would log its one "starting as FOLLOWER" line and then go dark forever,
+                // since resetElectionTimer() below — the only thing that schedules the NEXT
+                // election attempt — would never run either. Confirmed the hard way: a live
+                // 3-node cluster went silent immediately after boot with zero further raft
+                // logging, even at DEBUG, until this was found by reading the source directly.
+                log("startElection() failed to reach peers, will retry: " + e);
             }
             resetElectionTimer();
         } finally {
