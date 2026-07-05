@@ -7,6 +7,7 @@ package com.fbtberger.raft.transport;
 import io.netty.handler.ssl.ClientAuth;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslProvider;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
@@ -55,8 +56,21 @@ public final class TlsConfig {
     public File caFile()         { return caFile; }
     public boolean mtlsEnabled() { return mtlsEnabled; }
 
+    /**
+     * Explicitly {@link SslProvider#JDK} on both contexts below — found live on a real 3-node
+     * cluster: without this, Netty (via {@code grpc-netty-shaded}, which bundles its own native
+     * BoringSSL/OpenSSL engine) auto-selects that native engine over the JDK's own, and it
+     * failed every single handshake with {@code SSLHandshakeException: General OpenSslEngine
+     * problem} — a notoriously unhelpful, generic error from netty-tcnative's native PEM/key
+     * parsing being stricter (or just different) than the JDK's own SunJSSE parser, for reasons
+     * that proved impractical to pin down further at the native level. Forcing the JDK provider
+     * sidesteps this entire class of native-engine issues; the JDK's own TLS implementation is
+     * well-tested and portable, and raft-java's peer transport correctness matters far more
+     * here than the native engine's modest throughput edge.
+     */
     public SslContext buildServerSslContext() throws SSLException {
         SslContextBuilder builder = SslContextBuilder.forServer(certFile, keyFile)
+                .sslProvider(SslProvider.JDK)
                 .trustManager(caFile);
         if (mtlsEnabled) {
             builder.clientAuth(ClientAuth.REQUIRE);
@@ -66,6 +80,7 @@ public final class TlsConfig {
 
     public SslContext buildClientSslContext() throws SSLException {
         SslContextBuilder builder = SslContextBuilder.forClient()
+                .sslProvider(SslProvider.JDK)
                 .keyManager(certFile, keyFile)
                 .trustManager(caFile);
         return builder.build();
