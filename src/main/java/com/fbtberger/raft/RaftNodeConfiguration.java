@@ -13,6 +13,8 @@ import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import io.micrometer.jmx.JmxConfig;
 import io.micrometer.jmx.JmxMeterRegistry;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsServer;
 import io.grpc.ServerBuilder;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
@@ -159,11 +161,20 @@ public class RaftNodeConfiguration {
     @Bean(destroyMethod = "stop")
     public MetricsHttpServer metricsHttpServer(PrometheusMeterRegistry registry,
                                         RaftConfig config,
-                                        HealthCheck healthCheck) throws IOException {
+                                        HealthCheck healthCheck) throws Exception {
         if (config.metricsPort() <= 0) {
             return null;
         }
-        HttpServer server = HttpServer.create(new InetSocketAddress(config.metricsPort()), 0);
+        HttpServer server;
+        if (config.tlsConfig().enabled()) {
+            // Change 78: same node identity as the peer transport (TlsConfig.buildJdkSslContext
+            // reuses the same PEM cert/key), so the metrics/health endpoint speaks HTTPS too.
+            HttpsServer httpsServer = HttpsServer.create(new InetSocketAddress(config.metricsPort()), 0);
+            httpsServer.setHttpsConfigurator(new HttpsConfigurator(config.tlsConfig().buildJdkSslContext()));
+            server = httpsServer;
+        } else {
+            server = HttpServer.create(new InetSocketAddress(config.metricsPort()), 0);
+        }
         server.createContext("/metrics", exchange -> {
             String scrape = registry.scrape();
             byte[] body = scrape.getBytes(StandardCharsets.UTF_8);

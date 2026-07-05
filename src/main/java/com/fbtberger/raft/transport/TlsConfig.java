@@ -70,4 +70,43 @@ public final class TlsConfig {
                 .trustManager(caFile);
         return builder.build();
     }
+
+    /**
+     * Builds a JDK {@link javax.net.ssl.SSLContext} from the SAME PEM cert/key this class
+     * already holds for the Netty peer transport — used by the metrics HTTPS server (Change 78,
+     * {@code com.sun.net.httpserver.HttpsServer}), which needs a JDK SSLContext, not Netty's own
+     * {@link SslContext} type. Reusing the same node identity avoids needing a second,
+     * separately-managed keystore just for the metrics endpoint.
+     *
+     * <p>Expects the private key in PKCS#8 PEM form ({@code BEGIN PRIVATE KEY}, not
+     * {@code BEGIN RSA PRIVATE KEY}) — the default output of {@code openssl req -newkey rsa}
+     * on OpenSSL 1.1.1+/3.x without {@code -traditional}.
+     */
+    public javax.net.ssl.SSLContext buildJdkSslContext() throws Exception {
+        java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+        java.security.cert.X509Certificate cert;
+        try (java.io.InputStream in = new java.io.FileInputStream(certFile)) {
+            cert = (java.security.cert.X509Certificate) cf.generateCertificate(in);
+        }
+
+        String keyPem = new String(java.nio.file.Files.readAllBytes(keyFile.toPath()), java.nio.charset.StandardCharsets.US_ASCII)
+                .replace("-----BEGIN PRIVATE KEY-----", "")
+                .replace("-----END PRIVATE KEY-----", "")
+                .replaceAll("\\s", "");
+        byte[] keyBytes = java.util.Base64.getDecoder().decode(keyPem);
+        java.security.PrivateKey privateKey = java.security.KeyFactory.getInstance("RSA")
+                .generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
+
+        java.security.KeyStore keyStore = java.security.KeyStore.getInstance("PKCS12");
+        keyStore.load(null, null);
+        keyStore.setKeyEntry("node", privateKey, new char[0], new java.security.cert.Certificate[]{cert});
+
+        javax.net.ssl.KeyManagerFactory kmf =
+                javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(keyStore, new char[0]);
+
+        javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), null, null);
+        return sslContext;
+    }
 }
