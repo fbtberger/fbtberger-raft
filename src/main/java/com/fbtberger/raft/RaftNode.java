@@ -276,7 +276,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         if (t == null) {
                             handlePreVoteResponse(proposedTerm, response, preVotesGranted);
                         } else {
-                            log("PreVote RPC failed: " + t);
+                            log("PreVote RPC failed", t);
                         }
                     });
                 }
@@ -1708,6 +1708,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     private void log(String msg) {
         LOG.info("[{}] {}", config.selfId(), msg);
+    }
+
+    /**
+     * Like {@link #log(String)}, but for a Throwable — logs the full cause chain (SLF4J's
+     * trailing-Throwable convention prints the complete stack trace, not just
+     * {@code t.toString()}). Change 78/79: a bare {@code log("... " + t)} only ever showed
+     * gRPC's generic wrapper (e.g. "UNAVAILABLE: io exception"), never the actual underlying
+     * cause (a TLS handshake failure, hostname mismatch, etc.) buried in {@code t.getCause()} —
+     * which made a real live TLS misconfiguration on a 3-node cluster look like an opaque,
+     * undiagnosable network error for an extended live debugging session.
+     */
+    private void log(String msg, Throwable t) {
+        LOG.warn("[{}] {}", config.selfId(), msg, t);
     }
 
     // ------------------------------------------------------------------
