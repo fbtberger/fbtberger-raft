@@ -1528,6 +1528,32 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     public boolean isTransferInProgress() { return leaderTransferTarget != null; }
 
+    /**
+     * Health/readiness signal: can this node currently make progress on client work?
+     *
+     * <p>Quorum-aware, unlike a bare {@code role}/{@code currentLeaderId} check:
+     * <ul>
+     *   <li>a {@code LEADER} is ready only while it holds a fresh lease — a majority of the
+     *       configuration (counting itself) acknowledged within the election-timeout window
+     *       ({@link #hasValidLease()}); a leader that has lost quorum is <em>not</em> ready even
+     *       though it still reports {@code role=LEADER};</li>
+     *   <li>a follower/candidate is ready only if it has heard from a valid leader within the
+     *       election-timeout window ({@link #hasLeaderStickiness()}); a node that still remembers a
+     *       now-unreachable leader ({@code currentLeaderId != null}) is <em>not</em> ready;</li>
+     *   <li>a single-node cluster ({@code majority() == 1}) is always ready while leader.</li>
+     * </ul>
+     *
+     * <p>Reads volatile/concurrent state without taking the node lock, so a health probe never
+     * contends with consensus work; the result may be momentarily stale, which is acceptable for
+     * a readiness signal.
+     */
+    public boolean isReadyToServe() {
+        if (role == ServerRole.LEADER) {
+            return majority() == 1 || hasValidLease();
+        }
+        return hasLeaderStickiness();
+    }
+
     /** This server's current view of the cluster's membership ("id" -> "host:port"), including itself. */
     public Map<String, String> currentConfiguration() {
         return currentConfiguration;

@@ -47,6 +47,58 @@ class HealthCheckTest {
         } finally { node.shutdown(); }
     }
 
+    // ── quorum-aware readiness mapping (pure) ─────────────────────────────────
+
+    @Test
+    void readinessStatusLeaderWithQuorumIsUp() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, true, null);
+        assertTrue(s.ok());
+        assertEquals("leader", s.message());
+    }
+
+    @Test
+    void readinessStatusFollowerWithFreshLeaderIsUp() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, true, "n2");
+        assertTrue(s.ok());
+        assertTrue(s.message().contains("leader=n2"));
+    }
+
+    @Test
+    void readinessStatusLeaderWithoutQuorumIsDown() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, false, null);
+        assertFalse(s.ok());
+        assertEquals("leader without quorum", s.message());
+    }
+
+    @Test
+    void readinessStatusFollowerWithStaleLeaderIsDown() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, false, "n3");
+        assertFalse(s.ok());
+        assertTrue(s.message().contains("no recent leader contact"));
+    }
+
+    // ── isReadyToServe integration (achievable node states) ───────────────────
+
+    @Test
+    void isReadyToServeIsFalseForAFreshFollowerWithNoLeaderContact() {
+        RaftNode node = createFollower();
+        try {
+            assertFalse(node.isReadyToServe());
+        } finally { node.shutdown(); }
+    }
+
+    @Test
+    void isReadyToServeIsTrueForASingleNodeLeader() throws Exception {
+        RaftConfig cfg = singleNodeConfig();
+        RaftNode node = new RaftNode(cfg, new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+        try {
+            node.start();
+            Thread.sleep(200);
+            assertTrue(node.isReadyToServe());
+        } finally { node.shutdown(); }
+    }
+
     private static RaftNode createFollower() {
         try {
             return new RaftNode(multiNodeConfig(), new InMemoryStorage(),
