@@ -21,7 +21,7 @@ public final class RaftServer {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 1) {
-            LOG.error("Usage: java -jar raft-java.jar <path-to-node.properties>");
+            LOG.error("Usage: java -jar fbtberger-raft.jar <path-to-node.properties>");
             System.exit(1);
         }
 

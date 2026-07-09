@@ -58,7 +58,7 @@
         "name": "RaftServer — node1",
         "request": "launch",
         "mainClass": "com.fbtberger.raft.RaftServer",
-        "projectName": "raft-java",
+        "projectName": "fbtberger-raft",
         "args": [
           "config/node1.properties"
         ],
@@ -69,7 +69,7 @@
         "name": "RaftServer — node2",
         "request": "launch",
         "mainClass": "com.fbtberger.raft.RaftServer",
-        "projectName": "raft-java",
+        "projectName": "fbtberger-raft",
         "args": [
           "config/node2.properties"
         ],
@@ -80,7 +80,7 @@
         "name": "RaftServer — node3",
         "request": "launch",
         "mainClass": "com.fbtberger.raft.RaftServer",
-        "projectName": "raft-java",
+        "projectName": "fbtberger-raft",
         "args": [
           "config/node3.properties"
         ],
@@ -91,7 +91,7 @@
         "name": "RaftClientDemo",
         "request": "launch",
         "mainClass": "com.fbtberger.raft.client.RaftClientDemo",
-        "projectName": "raft-java",
+        "projectName": "fbtberger-raft",
         "console": "integratedTerminal"
       }
     ]

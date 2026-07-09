@@ -1,5 +1,5 @@
 ---
-title: "raft-java System Architecture"
+title: "fbtberger-raft System Architecture"
 author: "Felix Berger"
 date: "June 2026"
 geometry: margin=2.5cm
@@ -11,7 +11,7 @@ header-includes:
 
 # 1. Overview
 
-**raft-java** is a from-scratch Java 17 implementation of the Raft consensus algorithm,
+**fbtberger-raft** is a from-scratch Java 17 implementation of the Raft consensus algorithm,
 following Ongaro & Ousterhout's *"In Search of an Understandable Consensus Algorithm"*
 and the PhD dissertation *"Consensus: Bridging Theory and Practice"*.
 

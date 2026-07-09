@@ -1,4 +1,4 @@
-# raft-java
+# fbtberger-raft
 
 A from-scratch Java 17 implementation of the Raft consensus algorithm, following
 Ongaro & Ousterhout's *"In Search of an Understandable Consensus Algorithm"* and
@@ -65,7 +65,7 @@ For a quick API reference, see the
 ## Project layout
 
 ```
-raft-java/
+fbtberger-raft/
 ├── build.gradle.kts
 ├── LICENSE                         # Apache 2.0
 ├── config/
@@ -182,16 +182,16 @@ tls.mtls.enabled=false
 ./gradlew build
 ```
 
-This produces a shadow JAR at `build/libs/raft-java-1.0.0-all.jar`.
+This produces a shadow JAR at `build/libs/fbtberger-raft-1.0.0-all.jar`.
 
 ## Running a demo cluster
 
 Open three terminals, one per node:
 
 ```
-java -jar build/libs/raft-java-1.0.0-all.jar config/node1.properties
-java -jar build/libs/raft-java-1.0.0-all.jar config/node2.properties
-java -jar build/libs/raft-java-1.0.0-all.jar config/node3.properties
+java -jar build/libs/fbtberger-raft-1.0.0-all.jar config/node1.properties
+java -jar build/libs/fbtberger-raft-1.0.0-all.jar config/node2.properties
+java -jar build/libs/fbtberger-raft-1.0.0-all.jar config/node3.properties
 ```
 
 Each node runs an interactive CLI:
@@ -210,7 +210,7 @@ quit             # shut down
 
 ```
 ./gradlew shadowJar
-docker build -f config/Dockerfile -t raft-java .
+docker build -f config/Dockerfile -t fbtberger-raft .
 ```
 
 ## Metrics & JMX

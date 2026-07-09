@@ -31,13 +31,13 @@ import java.nio.file.Path;
  * server added after that won't be directly reachable from here until you also
  * add it to that file and restart -- see {@link RaftClient}'s class doc for why.
  * <p>
- * Usage: {@code java -cp raft-java.jar com.fbtberger.raft.client.RaftClientDemo config/node1.properties}
+ * Usage: {@code java -cp fbtberger-raft.jar com.fbtberger.raft.client.RaftClientDemo config/node1.properties}
  */
 public final class RaftClientDemo {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 1) {
-            System.err.println("Usage: java -cp raft-java.jar com.fbtberger.raft.client.RaftClientDemo <path-to-any-node.properties>");
+            System.err.println("Usage: java -cp fbtberger-raft.jar com.fbtberger.raft.client.RaftClientDemo <path-to-any-node.properties>");
             System.exit(1);
         }
 

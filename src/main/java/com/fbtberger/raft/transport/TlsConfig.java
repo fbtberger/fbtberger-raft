@@ -65,7 +65,7 @@ public final class TlsConfig {
      * parsing being stricter (or just different) than the JDK's own SunJSSE parser, for reasons
      * that proved impractical to pin down further at the native level. Forcing the JDK provider
      * sidesteps this entire class of native-engine issues; the JDK's own TLS implementation is
-     * well-tested and portable, and raft-java's peer transport correctness matters far more
+     * well-tested and portable, and fbtberger-raft's peer transport correctness matters far more
      * here than the native engine's modest throughput edge.
      */
     public SslContext buildServerSslContext() throws SSLException {

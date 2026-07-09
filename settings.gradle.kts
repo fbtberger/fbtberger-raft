@@ -1,1 +1,1 @@
-rootProject.name = "raft-java"
+rootProject.name = "fbtberger-raft"

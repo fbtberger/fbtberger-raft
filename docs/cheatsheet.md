@@ -1,5 +1,5 @@
 ---
-title: "raft-java Developer Cheatsheet"
+title: "fbtberger-raft Developer Cheatsheet"
 author: "Felix Berger"
 date: "June 2026"
 geometry: margin=2cm
@@ -17,7 +17,7 @@ header-includes:
 ```java
 ./gradlew build
 
-java -jar build/libs/raft-java-1.0.0-all.jar \
+java -jar build/libs/fbtberger-raft-1.0.0-all.jar \
   config/node1.properties
 ```
 

@@ -19,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * JMH benchmarks for Raft hot paths. Run via:
- * {@code java -cp build/libs/raft-java-1.0.0-all.jar org.openjdk.jmh.Main com.fbtberger.raft.RaftBenchmark}
+ * {@code java -cp build/libs/fbtberger-raft-1.0.0-all.jar org.openjdk.jmh.Main com.fbtberger.raft.RaftBenchmark}
  * or directly: {@code RaftBenchmark.main(new String[0])}
  */
 @BenchmarkMode(Mode.Throughput)
