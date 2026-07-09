@@ -5,7 +5,7 @@ plugins {
     id("com.github.johnrengelman.shadow") version "8.1.1"
 }
 
-group = "com.fbtberger.raft"
+group = "com.fbtberger"
 version = "1.0.0"
 
 java {
