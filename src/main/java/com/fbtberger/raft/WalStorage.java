@@ -316,6 +316,14 @@ public final class WalStorage implements RaftStorage {
 
     @Override
     public synchronized void saveSnapshotAndCompact(Snapshot snap) {
+        // The snapshot boundary must never move backwards: a background (COW)
+        // snapshot in RaftNode decides to save off-lock, so if a newer snapshot
+        // (e.g. one just installed by InstallSnapshot after a step-down/
+        // re-election) landed in between, that stale save is dropped here rather
+        // than overwriting the higher boundary and rewinding the compaction.
+        if (this.snapshot != null && snap.lastIncludedIndex <= this.snapshot.lastIncludedIndex) {
+            return;
+        }
         File tmp = new File(dataDir, "snapshot.tmp");
         try (FileOutputStream fos = new FileOutputStream(tmp);
              DataOutputStream dos = new DataOutputStream(fos)) {

@@ -61,6 +61,7 @@ public final class RaftServer {
                 if (line.equalsIgnoreCase("STATUS")) {
                     System.out.println("role=" + raftNode.role() + " leader=" + raftNode.currentLeaderId()
                             + " configuration=" + raftNode.currentConfiguration().keySet()
+                            + " learners=" + raftNode.currentLearners().keySet()
                             + " snapshotIndex=" + raftNode.snapshotIndex());
                 } else if (line.regionMatches(true, 0, "GET ", 0, 4)) {
                     String value = stateMachine.get(line.substring(4).trim());
@@ -77,12 +78,25 @@ public final class RaftServer {
                 } else if (line.regionMatches(true, 0, "REMOVE ", 0, 7)) {
                     raftNode.removeServer(line.substring(7).trim()).get(2, TimeUnit.SECONDS);
                     System.out.println("OK");
+                } else if (line.regionMatches(true, 0, "ADDLEARNER ", 0, 11)) {
+                    String[] parts = line.substring(11).trim().split("\\s+", 2);
+                    if (parts.length != 2) { System.out.println("usage: ADDLEARNER <id> <host:port>"); continue; }
+                    raftNode.addLearner(parts[0], parts[1]).get(2, TimeUnit.SECONDS);
+                    System.out.println("OK");
+                } else if (line.regionMatches(true, 0, "PROMOTE ", 0, 8)) {
+                    raftNode.promoteLearner(line.substring(8).trim()).get(2, TimeUnit.SECONDS);
+                    System.out.println("OK");
+                } else if (line.regionMatches(true, 0, "REMOVELEARNER ", 0, 14)) {
+                    raftNode.removeLearner(line.substring(14).trim()).get(2, TimeUnit.SECONDS);
+                    System.out.println("OK");
                 } else if (line.equalsIgnoreCase("SNAPSHOT")) {
                     raftNode.snapshotNow();
                     System.out.println("OK");
                 } else {
                     System.out.println("unknown command, try SET <key> <value> | GET <key>"
-                            + " | ADD <id> <host:port> | REMOVE <id> | SNAPSHOT | STATUS | quit");
+                            + " | ADD <id> <host:port> | REMOVE <id>"
+                            + " | ADDLEARNER <id> <host:port> | PROMOTE <id> | REMOVELEARNER <id>"
+                            + " | SNAPSHOT | STATUS | quit");
                 }
             } catch (ExecutionException e) {
                 System.out.println(describe(e.getCause()));

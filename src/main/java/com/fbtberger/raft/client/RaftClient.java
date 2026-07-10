@@ -4,9 +4,12 @@
  */
 package com.fbtberger.raft.client;
 
+import com.fbtberger.raft.client.proto.AddLearnerRequest;
 import com.fbtberger.raft.client.proto.AddServerRequest;
+import com.fbtberger.raft.client.proto.PromoteLearnerRequest;
 import com.fbtberger.raft.client.proto.RaftClientServiceGrpc;
 import com.fbtberger.raft.client.proto.ReconfigurationResponse;
+import com.fbtberger.raft.client.proto.RemoveLearnerRequest;
 import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
@@ -141,8 +144,48 @@ public final class RaftClient implements AutoCloseable {
                 .removeServer(request));
     }
 
+    /** Adds a non-voting learner (§4.2.1), with the default timeout per attempted node. */
+    public void addLearner(String id, String address) throws RaftClientException {
+        addLearner(id, address, DEFAULT_TIMEOUT);
+    }
+
+    /** Adds a non-voting learner (§4.2.1). The new server should already be running, ideally with node.learner=true. */
+    public void addLearner(String id, String address, Duration perAttemptTimeout) throws RaftClientException {
+        AddLearnerRequest request = AddLearnerRequest.newBuilder().setId(id).setAddress(address).build();
+        reconfigure(nodeId -> stubFor(nodeId)
+                .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .addLearner(request));
+    }
+
+    /** Promotes a caught-up learner to a voting member (§4.2.1), with the default timeout per attempted node. */
+    public void promoteLearner(String id) throws RaftClientException {
+        promoteLearner(id, DEFAULT_TIMEOUT);
+    }
+
+    /** Promotes a caught-up learner to a voting member (§4.2.1). Rejected until the learner has caught up. */
+    public void promoteLearner(String id, Duration perAttemptTimeout) throws RaftClientException {
+        PromoteLearnerRequest request = PromoteLearnerRequest.newBuilder().setId(id).build();
+        reconfigure(nodeId -> stubFor(nodeId)
+                .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .promoteLearner(request));
+    }
+
+    /** Removes a non-voting learner (§4.2.1), with the default timeout per attempted node. */
+    public void removeLearner(String id) throws RaftClientException {
+        removeLearner(id, DEFAULT_TIMEOUT);
+    }
+
+    /** Removes a non-voting learner (§4.2.1). */
+    public void removeLearner(String id, Duration perAttemptTimeout) throws RaftClientException {
+        RemoveLearnerRequest request = RemoveLearnerRequest.newBuilder().setId(id).build();
+        reconfigure(nodeId -> stubFor(nodeId)
+                .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .removeLearner(request));
+    }
+
     /**
-     * Shared retry loop for {@link #addServer} / {@link #removeServer}: the same
+     * Shared retry loop for {@link #addServer} / {@link #removeServer} and the
+     * learner operations: the same
      * leader-hint-following strategy as {@link #submit}, just adapted to the
      * reconfiguration RPCs' response shape (no result payload, only success/failure).
      */

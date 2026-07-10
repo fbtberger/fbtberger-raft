@@ -52,11 +52,12 @@ public final class RaftConfig {
     private final int snapshotThreshold;
     private final int snapshotChunkSize;
     private final int metricsPort;
+    private final boolean learner;
     private final RpcTimeouts rpcTimeouts;
     private final TlsConfig tlsConfig;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
-                       int snapshotThreshold, int snapshotChunkSize, int metricsPort,
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
                        RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
         this.selfId = selfId;
         this.selfPort = selfPort;
@@ -65,6 +66,7 @@ public final class RaftConfig {
         this.snapshotThreshold = snapshotThreshold;
         this.snapshotChunkSize = snapshotChunkSize;
         this.metricsPort = metricsPort;
+        this.learner = learner;
         this.rpcTimeouts = rpcTimeouts;
         this.tlsConfig = tlsConfig;
     }
@@ -83,6 +85,13 @@ public final class RaftConfig {
         int snapshotChunkSize = chunkSizeProp == null ? DEFAULT_SNAPSHOT_CHUNK_SIZE : Integer.parseInt(chunkSizeProp);
         String metricsPortProp = props.getProperty("metrics.port");
         int metricsPort = metricsPortProp == null ? 0 : Integer.parseInt(metricsPortProp);
+        // §4.2.1: a node started with node.learner=true bootstraps as a
+        // non-voting learner -- it lists the existing voters as peers but
+        // never adds itself to the voting configuration, so it never stands
+        // for or is counted in an election. Defaults to false (a normal
+        // voting member). Once the leader promotes it, the committed
+        // configuration entry overrides this bootstrap role.
+        boolean learner = Boolean.parseBoolean(props.getProperty("node.learner", "false"));
 
         Map<String, String> peers = new LinkedHashMap<>();
         for (String name : props.stringPropertyNames()) {
@@ -96,7 +105,7 @@ public final class RaftConfig {
         }
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
         TlsConfig tlsConfig = TlsConfig.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, rpcTimeouts, tlsConfig);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
     }
 
     private static String require(Properties props, String key) {
@@ -138,6 +147,15 @@ public final class RaftConfig {
      * to 0 (disabled) if {@code metrics.port} isn't set in the .properties file.
      */
     public int metricsPort() { return metricsPort; }
+
+    /**
+     * Whether this node bootstraps as a non-voting learner (§4.2.1). Set via
+     * {@code node.learner=true} in the .properties file; defaults to false.
+     * Only affects the <em>bootstrap</em> configuration a fresh node starts
+     * with -- once a committed configuration entry places (or promotes) this
+     * node, {@link RaftNode}'s live membership governs instead.
+     */
+    public boolean isLearner() { return learner; }
 
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 

@@ -115,6 +115,17 @@ public final class InMemoryStorage implements RaftStorage {
     @Override
     public void saveSnapshotAndCompact(Snapshot snapshot) {
         synchronized (lock) {
+            // The snapshot boundary must never move backwards. A background
+            // (COW) snapshot in RaftNode does its "is this still worth saving?"
+            // check off-lock and then saves here; if a newer snapshot -- e.g.
+            // one just installed by InstallSnapshot, possibly after a
+            // step-down/re-election -- committed in between, that stale save
+            // must be dropped rather than clobbering the higher boundary.
+            // Making the check-and-set atomic under this monitor closes that
+            // race for every caller.
+            if (this.snapshot != null && snapshot.lastIncludedIndex <= this.snapshot.lastIncludedIndex) {
+                return;
+            }
             this.snapshot = snapshot;
             // Removes every entry at or before lastIncludedIndex; anything
             // newer, if the caller already had some, is left untouched.

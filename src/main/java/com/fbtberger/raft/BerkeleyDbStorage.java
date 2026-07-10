@@ -279,6 +279,14 @@ public final class BerkeleyDbStorage implements RaftStorage {
      */
     @Override
     public synchronized void saveSnapshotAndCompact(Snapshot snapshot) {
+        // The snapshot boundary must never move backwards: a background (COW)
+        // snapshot in RaftNode decides to save off-lock, so if a newer snapshot
+        // (e.g. one just installed by InstallSnapshot after a step-down/
+        // re-election) landed in between, that stale save is dropped here rather
+        // than overwriting the higher boundary and rewinding compaction.
+        if (snapshotIndex != 0 && snapshot.lastIncludedIndex <= snapshotIndex) {
+            return;
+        }
         Transaction txn = env.beginTransaction(null, null);
         try {
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_INDEX), new DatabaseEntry(longToBytes(snapshot.lastIncludedIndex)));

@@ -28,6 +28,14 @@ service RaftClientService {
   // rejects the request and reports a leader_hint if it has one.
   rpc AddServer(AddServerRequest) returns (ReconfigurationResponse);
   rpc RemoveServer(RemoveServerRequest) returns (ReconfigurationResponse);
+
+  // Non-voting learners (§4.2.1): AddLearner starts replicating to a new
+  // server without adding it to the voting majority; PromoteLearner turns a
+  // caught-up learner into a voting member; RemoveLearner drops one. Same
+  // leader-only semantics as the reconfiguration RPCs above.
+  rpc AddLearner(AddLearnerRequest) returns (ReconfigurationResponse);
+  rpc PromoteLearner(PromoteLearnerRequest) returns (ReconfigurationResponse);
+  rpc RemoveLearner(RemoveLearnerRequest) returns (ReconfigurationResponse);
 }
 
 message SubmitRequest {
@@ -55,6 +63,19 @@ message AddServerRequest {
 }
 
 message RemoveServerRequest {
+  string id = 1;
+}
+
+message AddLearnerRequest {
+  string id = 1;
+  string address = 2; // host:port
+}
+
+message PromoteLearnerRequest {
+  string id = 1;
+}
+
+message RemoveLearnerRequest {
   string id = 1;
 }
 
