@@ -35,6 +35,10 @@ For a quick API reference, see the
   - Single-step: `addServer()` / `removeServer()` for one-at-a-time changes
   - Joint consensus: `setConfiguration()` for arbitrary multi-server changes via
     a two-phase C_old,new → C_new protocol with separate majorities
+  - Non-voting learners (§4.2.1): `addLearner()` / `promoteLearner()` /
+    `removeLearner()` — a new server catches up as a learner (replicated to, but
+    excluded from every majority) and is promoted to a voter only once caught up,
+    so adding capacity never opens an availability gap
   - §4 errata fix (config changes rejected until leader's no-op commits)
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
@@ -199,8 +203,11 @@ Each node runs an interactive CLI:
 ```
 SET foo bar      # submit through Raft, wait for commit
 GET foo          # read from local state machine (use readIndex() for linearizable)
-ADD n4 host:port # add a voting member (§6, leader only)
-REMOVE n4        # remove a voting member (§6, leader only)
+ADD n4 host:port        # add a voting member (§6, leader only)
+REMOVE n4               # remove a voting member (§6, leader only)
+ADDLEARNER n4 host:port # add a non-voting learner (§4.2.1, leader only)
+PROMOTE n4             # promote a caught-up learner to a voting member (leader only)
+REMOVELEARNER n4       # remove a non-voting learner (leader only)
 SNAPSHOT         # force immediate log compaction (§7)
 STATUS           # print role, leader, configuration, snapshot boundary
 quit             # shut down

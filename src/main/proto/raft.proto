@@ -26,6 +26,15 @@ message ClusterConfiguration {
   }
   repeated Member members = 1;
   repeated Member old_members = 2;
+  // Non-voting learners (§4.2.1 of Ongaro's dissertation): servers the leader
+  // replicates the log to but that do NOT count toward election or commit
+  // majorities and are never solicited for (Pre)Votes. Their purpose is to let
+  // a new server catch up its log before being promoted to a voting member, so
+  // adding capacity never opens an availability gap. The learner set is carried
+  // through every configuration entry -- including both joint-consensus phases
+  // -- and is persisted inside snapshots, so it survives reconfiguration and
+  // log compaction exactly like the voting membership does.
+  repeated Member learners = 3;
 }
 
 // One entry in the replicated log (paper, Figure 2 / Figure 6): either a

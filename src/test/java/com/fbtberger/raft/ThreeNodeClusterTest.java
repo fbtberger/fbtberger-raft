@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
@@ -374,6 +375,113 @@ class ThreeNodeClusterTest {
         leader().submitCommand("SET lk lv".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
         Thread.sleep(100);
         leader().leaseRead().get(2, TimeUnit.SECONDS);
+    }
+
+    // ------------------------------------------------------------------
+    // Non-voting learners (§4.2.1)
+    // ------------------------------------------------------------------
+
+    @Test
+    void learnerReceivesReplicationWithoutAffectingQuorumThenIsPromoted() throws Exception {
+        awaitLeaderReady(2_000);
+
+        // Commit a value before the learner exists, so the learner has to
+        // catch up on log it never saw live.
+        leader().submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+
+        // Bring up n4 as a non-voting learner: gRPC server running, but not
+        // start()ed yet (started=false keeps its election timer disarmed).
+        startLearnerNode("n4", "localhost:9094", INITIAL_PEERS, 5);
+        leader().addLearner("n4", "localhost:9094").get(2, TimeUnit.SECONDS);
+        nodes.get("n4").start();
+
+        // n4 is a learner, not a voting member, on the leader's view.
+        assertTrue(leader().currentLearners().containsKey("n4"),
+                "n4 should be a learner on the leader");
+        assertFalse(leader().currentConfiguration().containsKey("n4"),
+                "n4 must NOT be a voting member yet");
+
+        // A fresh command still commits: it only needs the 3 voters, proving
+        // the learner does not enlarge the majority. It must also reach the
+        // learner's own state machine, catching up the earlier entry too.
+        leader().submitCommand("SET y 2".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+        awaitCondition(() -> "2".equals(machines.get("n4").get("y"))
+                && "1".equals(machines.get("n4").get("x")), 1_000);
+
+        // The learner never runs for or wins leadership.
+        assertSame(ServerRole.FOLLOWER, nodes.get("n4").role(), "a learner must never become leader");
+        assertTrue(nodes.get("n4").isLearner(), "n4 should report itself as a learner");
+
+        // Once caught up, promotion succeeds and moves n4 into the voting set.
+        awaitCondition(() -> {
+            try {
+                leader().promoteLearner("n4").get(500, TimeUnit.MILLISECONDS);
+                return true;
+            } catch (Exception e) {
+                return false; // still catching up: matchIndex < commitIndex
+            }
+        }, 2_000);
+        assertTrue(leader().currentConfiguration().containsKey("n4"),
+                "n4 should be a voting member after promotion");
+        assertFalse(leader().currentLearners().containsKey("n4"),
+                "n4 should no longer be listed as a learner after promotion");
+    }
+
+    @Test
+    void promoteRejectsUnknownLearner() throws Exception {
+        awaitLeaderReady(2_000);
+        ExecutionException ex = assertThrows(ExecutionException.class,
+                () -> leader().promoteLearner("does-not-exist").get(2, TimeUnit.SECONDS));
+        assertInstanceOf(RaftNode.ConfigurationChangeException.class, ex.getCause());
+    }
+
+    /**
+     * Creates a RaftNode configured as a non-voting learner (node.learner=true)
+     * plus its in-process gRPC server, mirroring {@link #startNodes} but for a
+     * single learner. Not start()ed here: the caller starts it only after the
+     * leader has admitted it, exactly like the addServer flow.
+     */
+    private void startLearnerNode(String id, String address, Map<String, String> voters, int threshold)
+            throws Exception {
+        InMemoryStorage store = new InMemoryStorage();
+        KeyValueStateMachine sm = new KeyValueStateMachine();
+        stores.put(id, store);
+        machines.put(id, sm);
+
+        RaftConfig cfg = learnerConfig(id, address, voters, threshold);
+        RaftNode node = new RaftNode(cfg, store, sm, peerAddress -> {
+            ManagedChannel ch = InProcessChannelBuilder.forName(peerAddress).directExecutor().build();
+            GrpcTransport t = new GrpcTransport(ch);
+            transports.add(t);
+            return t;
+        }, RaftMetrics.noop());
+        nodes.put(id, node);
+
+        Server srv = InProcessServerBuilder.forName(address)
+                .addService(new GrpcTransportServer.RaftServiceAdapter(node))
+                .build()
+                .start();
+        grpcServers.put(id, srv);
+    }
+
+    private static RaftConfig learnerConfig(String id, String address, Map<String, String> voters, int threshold)
+            throws Exception {
+        Properties props = new Properties();
+        props.setProperty("node.id", id);
+        props.setProperty("node.port", String.valueOf(Integer.parseInt(address.split(":")[1])));
+        props.setProperty("data.dir", "/tmp/raft-cluster-test-unused/" + id);
+        for (Map.Entry<String, String> e : voters.entrySet()) {
+            props.setProperty("peer." + e.getKey(), e.getValue());
+        }
+        props.setProperty("peer." + id, address);
+        props.setProperty("node.learner", "true");
+        props.setProperty("snapshot.threshold", String.valueOf(threshold));
+
+        Path tmp = Files.createTempFile("raft-learner-" + id + "-", ".properties");
+        try (OutputStream out = Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        return RaftConfig.load(tmp);
     }
 
     // ------------------------------------------------------------------

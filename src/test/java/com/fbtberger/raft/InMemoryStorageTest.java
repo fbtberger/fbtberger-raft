@@ -191,6 +191,23 @@ class InMemoryStorageTest {
 
     // ---- helpers --------------------------------------------------------
 
+    @Test
+    void saveSnapshotNeverMovesBoundaryBackwards() {
+        // A newer snapshot (e.g. one installed via InstallSnapshot after a
+        // step-down/re-election) sets the boundary to 10.
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(10, 5, new byte[]{1}, new byte[0]));
+
+        // A stale, lower-index snapshot -- e.g. a background (COW) snapshot in
+        // RaftNode that decided to save off-lock before losing the race -- must
+        // NOT rewind the boundary or replace the payload.
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(3, 2, new byte[]{9}, new byte[0]));
+
+        assertEquals(10, store.getSnapshotIndex(), "snapshot boundary must not move backwards");
+        assertEquals(5, store.getSnapshotTerm());
+        assertArrayEquals(new byte[]{1}, store.getSnapshot().stateMachineData,
+                "stale snapshot payload must not overwrite the newer one");
+    }
+
     private static LogEntry entry(long index, long term, String command) {
         return LogEntry.newBuilder()
                 .setIndex(index)

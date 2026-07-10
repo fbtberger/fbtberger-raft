@@ -4,9 +4,12 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.client.proto.AddLearnerRequest;
 import com.fbtberger.raft.client.proto.AddServerRequest;
+import com.fbtberger.raft.client.proto.PromoteLearnerRequest;
 import com.fbtberger.raft.client.proto.RaftClientServiceGrpc;
 import com.fbtberger.raft.client.proto.ReconfigurationResponse;
+import com.fbtberger.raft.client.proto.RemoveLearnerRequest;
 import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
@@ -55,6 +58,30 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
     @Override
     public void removeServer(RemoveServerRequest request, StreamObserver<ReconfigurationResponse> responseObserver) {
         raftNode.removeServer(request.getId()).whenComplete((result, throwable) -> {
+            responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
+            responseObserver.onCompleted();
+        });
+    }
+
+    @Override
+    public void addLearner(AddLearnerRequest request, StreamObserver<ReconfigurationResponse> responseObserver) {
+        raftNode.addLearner(request.getId(), request.getAddress()).whenComplete((result, throwable) -> {
+            responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
+            responseObserver.onCompleted();
+        });
+    }
+
+    @Override
+    public void promoteLearner(PromoteLearnerRequest request, StreamObserver<ReconfigurationResponse> responseObserver) {
+        raftNode.promoteLearner(request.getId()).whenComplete((result, throwable) -> {
+            responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
+            responseObserver.onCompleted();
+        });
+    }
+
+    @Override
+    public void removeLearner(RemoveLearnerRequest request, StreamObserver<ReconfigurationResponse> responseObserver) {
+        raftNode.removeLearner(request.getId()).whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
             responseObserver.onCompleted();
         });

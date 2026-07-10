@@ -118,6 +118,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private volatile Map<String, String> currentConfiguration;
     private volatile long currentConfigurationIndex;
 
+    // §4.2.1 Non-voting learners: id -> "host:port" of every learner in the
+    // effective configuration. The leader replicates to these exactly like
+    // followers (they live in {@link #peerTransports} too), but they are
+    // excluded from every majority decision -- election vote solicitation,
+    // commit counting, ReadIndex confirmation and the leader lease -- and are
+    // never counted in {@link #majority()}. A learner is promoted to a voting
+    // member via {@link #promoteLearner} once it has caught up. Always kept
+    // disjoint from {@link #currentConfiguration}.
+    private volatile Map<String, String> currentLearners = Map.of();
+
     // Guards against overlapping background snapshots (§5.1 COW).
     private volatile boolean snapshotInProgress = false;
 
@@ -271,7 +281,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
             AtomicLong preVotesGranted = new AtomicLong(1); // count self
             try {
-                for (RaftTransport peer : peerTransports.values()) {
+                // §4.2.1: solicit (Pre)Votes only from voting members -- never
+                // from learners, which do not participate in elections.
+                for (String peerId : votingPeerIdsExcludingSelf()) {
+                    RaftTransport peer = peerTransports.get(peerId);
+                    if (peer == null) continue;
                     peer.preVote(preVoteRequest).whenComplete((response, t) -> {
                         if (t == null) {
                             handlePreVoteResponse(proposedTerm, response, preVotesGranted);
@@ -330,7 +344,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 .build();
 
         AtomicLong votesGranted = new AtomicLong(1);
-        for (RaftTransport peer : peerTransports.values()) {
+        // §4.2.1: request votes only from voting members, never from learners.
+        for (String peerId : votingPeerIdsExcludingSelf()) {
+            RaftTransport peer = peerTransports.get(peerId);
+            if (peer == null) continue;
             peer.requestVote(request).whenComplete((response, t) -> {
                 if (t == null) handleRequestVoteResponse(newTerm, response, votesGranted);
             });
@@ -902,7 +919,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 }
                 advanceCommitIndex();
                 peerLastAckMs.put(peerId, System.currentTimeMillis());
-                for (ReadBarrier rb : pendingReadBarriers) rb.confirm(peerId);
+                // §4.2.1: only a voting member's acknowledgement counts toward
+                // the leadership-confirmation majority behind a ReadIndex; a
+                // learner's ack must never help satisfy a read barrier.
+                if (isVotingMember(peerId)) {
+                    for (ReadBarrier rb : pendingReadBarriers) rb.confirm(peerId);
+                }
                 checkReadBarriers();
                 if (peerId.equals(leaderTransferTarget)) {
                     checkTransferReadyLocked();
@@ -990,7 +1012,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (role == ServerRole.LEADER && isJoint) {
                     log("joint config C_old,new committed; proposing final C_new");
                     appendAndReplicateLocked(LogEntry.newBuilder()
-                            .setConfiguration(toProto(currentConfiguration)));
+                            .setConfiguration(configProto(currentConfiguration, currentLearners)));
                 }
                 if (role == ServerRole.LEADER && !stillAMember && !isJoint) {
                     log("stepping down: committed configuration no longer includes us");
@@ -1034,7 +1056,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         long includedTerm = store.getTermAt(applied);
         java.util.function.Supplier<byte[]> cowSnapshot = captureCowSnapshot();
-        byte[] configurationData = toProto(currentConfiguration).toByteArray();
+        byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
 
         snapshotInProgress = true;
         scheduler.execute(() -> {
@@ -1076,7 +1098,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         long includedTerm = store.getTermAt(applied);
         byte[] stateMachineData = stateMachine.takeSnapshot();
-        byte[] configurationData = toProto(currentConfiguration).toByteArray();
+        byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
         store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
         metrics.snapshotTaken();
         log("snapshotted through index " + applied + " (term " + includedTerm
@@ -1403,8 +1425,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
             Map<String, String> updated = new LinkedHashMap<>(currentConfiguration);
             updated.put(id, address);
+            // If the id is currently a learner, adding it as a voter also
+            // removes it from the learner set (that is exactly what
+            // promoteLearner does; addServer of a known learner is treated the
+            // same, since a member is never simultaneously a learner).
+            Map<String, String> updatedLearners = withoutKey(currentLearners, id);
             log("proposing to add " + id + " (" + address + ")");
-            return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(toProto(updated)));
+            return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(configProto(updated, updatedLearners)));
         } finally {
             lock.unlock();
         }
@@ -1431,10 +1458,127 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             Map<String, String> updated = new LinkedHashMap<>(currentConfiguration);
             updated.remove(id);
             log("proposing to remove " + id);
-            return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(toProto(updated)));
+            return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(configProto(updated, currentLearners)));
         } finally {
             lock.unlock();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Non-voting learners (§4.2.1 of Ongaro's dissertation)
+    // ------------------------------------------------------------------
+
+    /**
+     * Adds a non-voting learner: the leader begins replicating the log to
+     * {@code id} immediately, but it takes no part in elections or commit
+     * majorities. This is the safe way to introduce a server that starts far
+     * behind -- it catches up as a learner and is only later promoted to a
+     * voting member with {@link #promoteLearner}, so the voting majority is
+     * never enlarged to include a server that has yet to receive the log.
+     * Only the leader can do this.
+     */
+    public CompletableFuture<byte[]> addLearner(String id, String address) {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                return failedFuture(new NotLeaderException(currentLeaderId));
+            }
+            if (currentConfiguration.containsKey(id)) {
+                return failedFuture(new ConfigurationChangeException(id + " is already a voting member"));
+            }
+            if (currentLearners.containsKey(id)) {
+                return failedFuture(new ConfigurationChangeException(id + " is already a learner"));
+            }
+            CompletableFuture<byte[]> rejected = rejectIfConfigurationChangePending();
+            if (rejected != null) {
+                return rejected;
+            }
+
+            Map<String, String> updatedLearners = new LinkedHashMap<>(currentLearners);
+            updatedLearners.put(id, address);
+            log("proposing to add learner " + id + " (" + address + ")");
+            return appendAndReplicateLocked(
+                    LogEntry.newBuilder().setConfiguration(configProto(currentConfiguration, updatedLearners)));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Removes a non-voting learner (e.g. one that will not be promoted). Only the leader can do this. */
+    public CompletableFuture<byte[]> removeLearner(String id) {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                return failedFuture(new NotLeaderException(currentLeaderId));
+            }
+            if (!currentLearners.containsKey(id)) {
+                return failedFuture(new ConfigurationChangeException(id + " is not a current learner"));
+            }
+            CompletableFuture<byte[]> rejected = rejectIfConfigurationChangePending();
+            if (rejected != null) {
+                return rejected;
+            }
+
+            Map<String, String> updatedLearners = new LinkedHashMap<>(currentLearners);
+            updatedLearners.remove(id);
+            log("proposing to remove learner " + id);
+            return appendAndReplicateLocked(
+                    LogEntry.newBuilder().setConfiguration(configProto(currentConfiguration, updatedLearners)));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Promotes a caught-up learner to a voting member (§4.2.1): a single-server
+     * membership change moving {@code id} from the learner set into the voting
+     * configuration. Rejected unless the learner's {@code matchIndex} has
+     * reached the leader's commit index, so the enlarged majority never
+     * includes a server that is still missing committed entries (which could
+     * otherwise stall commits until it catches up). Only the leader can do
+     * this.
+     */
+    public CompletableFuture<byte[]> promoteLearner(String id) {
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                return failedFuture(new NotLeaderException(currentLeaderId));
+            }
+            if (currentConfiguration.containsKey(id)) {
+                return failedFuture(new ConfigurationChangeException(id + " is already a voting member"));
+            }
+            if (!currentLearners.containsKey(id)) {
+                return failedFuture(new ConfigurationChangeException(id + " is not a learner"));
+            }
+            CompletableFuture<byte[]> rejected = rejectIfConfigurationChangePending();
+            if (rejected != null) {
+                return rejected;
+            }
+            long match = matchIndex.getOrDefault(id, 0L);
+            long target = commitIndex.get();
+            if (match < target) {
+                return failedFuture(new ConfigurationChangeException(
+                        "learner " + id + " has not caught up yet (matchIndex " + match
+                                + " < commitIndex " + target + "); retry once it has"));
+            }
+
+            String address = currentLearners.get(id);
+            Map<String, String> updatedMembers = new LinkedHashMap<>(currentConfiguration);
+            updatedMembers.put(id, address);
+            Map<String, String> updatedLearners = withoutKey(currentLearners, id);
+            log("promoting learner " + id + " to voting member");
+            return appendAndReplicateLocked(
+                    LogEntry.newBuilder().setConfiguration(configProto(updatedMembers, updatedLearners)));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static Map<String, String> withoutKey(Map<String, String> map, String key) {
+        if (!map.containsKey(key)) return map;
+        Map<String, String> copy = new LinkedHashMap<>(map);
+        copy.remove(key);
+        return copy;
     }
 
     /**
@@ -1462,7 +1606,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
 
             log("proposing joint configuration C_old,new -> " + newMembers.keySet());
-            ClusterConfiguration joint = toJointProto(currentConfiguration, newMembers);
+            ClusterConfiguration joint = toJointProto(currentConfiguration, newMembers, currentLearners);
             return appendAndReplicateLocked(LogEntry.newBuilder().setConfiguration(joint));
         } finally {
             lock.unlock();
@@ -1554,9 +1698,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         return hasLeaderStickiness();
     }
 
-    /** This server's current view of the cluster's membership ("id" -> "host:port"), including itself. */
+    /** This server's current view of the cluster's <em>voting</em> membership ("id" -> "host:port"), including itself if it is a voter. */
     public Map<String, String> currentConfiguration() {
         return currentConfiguration;
+    }
+
+    /** This server's current view of the non-voting learner set ("id" -> "host:port"), §4.2.1. */
+    public Map<String, String> currentLearners() {
+        return currentLearners;
+    }
+
+    /** True if this node is itself currently a non-voting learner (§4.2.1). */
+    public boolean isLearner() {
+        return currentLearners.containsKey(config.selfId());
     }
 
     public static final class NotLeaderException extends RuntimeException {
@@ -1612,7 +1766,21 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 throw new IllegalStateException("corrupt configuration in snapshot", e);
             }
         }
-        applyConfigurationLocked(0, toProto(config.peerAddresses()));
+        // No configuration entry and no snapshot: fall back to the bootstrap
+        // membership from the .properties file. A node started with
+        // node.learner=true bootstraps itself as a non-voting learner (§4.2.1)
+        // -- every other peer is a voting member and this node stays out of
+        // the voting configuration until a committed entry promotes it, so it
+        // never stands for election on its own.
+        if (config.isLearner()) {
+            Map<String, String> members = new LinkedHashMap<>(config.peerAddresses());
+            String selfAddress = members.remove(config.selfId());
+            Map<String, String> learners = new LinkedHashMap<>();
+            if (selfAddress != null) learners.put(config.selfId(), selfAddress);
+            applyConfigurationLocked(0, configProto(members, learners));
+        } else {
+            applyConfigurationLocked(0, toProto(config.peerAddresses()));
+        }
     }
 
     /**
@@ -1636,11 +1804,24 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         } else {
             this.oldConfiguration = null;
         }
+        // §4.2.1: parse the non-voting learner set carried by this entry.
+        Map<String, String> learners = new LinkedHashMap<>();
+        for (ClusterConfiguration.Member m : configuration.getLearnersList()) {
+            // Defensive: a server that is a voting member is never also a
+            // learner, so drop any such overlap in favour of the voting role.
+            if (!members.containsKey(m.getId())) {
+                learners.put(m.getId(), m.getAddress());
+            }
+        }
+        this.currentLearners = Map.copyOf(learners);
         this.currentConfiguration = Map.copyOf(members);
         this.currentConfigurationIndex = index;
 
+        // The leader replicates to voters, joint-mode old voters AND learners
+        // alike, so a transport must exist for every one of them.
         Map<String, String> allMembers = new LinkedHashMap<>(members);
         if (oldConfiguration != null) allMembers.putAll(oldConfiguration);
+        allMembers.putAll(learners);
 
         for (Map.Entry<String, String> member : allMembers.entrySet()) {
             if (member.getKey().equals(config.selfId())) continue;
@@ -1664,28 +1845,61 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     private static ClusterConfiguration toProto(Map<String, String> members) {
+        return configProto(members, Map.of());
+    }
+
+    /**
+     * Builds a (non-joint) configuration entry carrying both the voting
+     * {@code members} and the non-voting {@code learners} (§4.2.1). Every
+     * leader-initiated configuration change routes through here so the learner
+     * set is preserved across membership changes and log compaction rather
+     * than being silently dropped.
+     */
+    private static ClusterConfiguration configProto(Map<String, String> members,
+                                                     Map<String, String> learners) {
         ClusterConfiguration.Builder builder = ClusterConfiguration.newBuilder();
-        for (Map.Entry<String, String> member : members.entrySet()) {
-            builder.addMembers(ClusterConfiguration.Member.newBuilder()
-                    .setId(member.getKey())
-                    .setAddress(member.getValue())
-                    .build());
-        }
+        addMembers(builder::addMembers, members);
+        addMembers(builder::addLearners, learners);
         return builder.build();
     }
 
     private static ClusterConfiguration toJointProto(Map<String, String> oldMembers,
-                                                      Map<String, String> newMembers) {
+                                                      Map<String, String> newMembers,
+                                                      Map<String, String> learners) {
         ClusterConfiguration.Builder builder = ClusterConfiguration.newBuilder();
-        for (Map.Entry<String, String> m : newMembers.entrySet()) {
-            builder.addMembers(ClusterConfiguration.Member.newBuilder()
-                    .setId(m.getKey()).setAddress(m.getValue()).build());
-        }
-        for (Map.Entry<String, String> m : oldMembers.entrySet()) {
-            builder.addOldMembers(ClusterConfiguration.Member.newBuilder()
-                    .setId(m.getKey()).setAddress(m.getValue()).build());
-        }
+        addMembers(builder::addMembers, newMembers);
+        addMembers(builder::addOldMembers, oldMembers);
+        addMembers(builder::addLearners, learners);
         return builder.build();
+    }
+
+    private static void addMembers(java.util.function.Consumer<ClusterConfiguration.Member> sink,
+                                   Map<String, String> members) {
+        for (Map.Entry<String, String> m : members.entrySet()) {
+            sink.accept(ClusterConfiguration.Member.newBuilder()
+                    .setId(m.getKey()).setAddress(m.getValue()).build());
+        }
+    }
+
+    /**
+     * True if {@code peerId} is a voting member of the effective configuration
+     * (including the old configuration during a joint-consensus transition).
+     * Learners return false. Used to keep learners out of every majority
+     * decision.
+     */
+    private boolean isVotingMember(String peerId) {
+        if (currentConfiguration.containsKey(peerId)) return true;
+        Map<String, String> old = oldConfiguration;
+        return old != null && old.containsKey(peerId);
+    }
+
+    /** The voting peers (current + joint old configuration), excluding self and learners. */
+    private List<String> votingPeerIdsExcludingSelf() {
+        java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<>(currentConfiguration.keySet());
+        Map<String, String> old = oldConfiguration;
+        if (old != null) ids.addAll(old.keySet());
+        ids.remove(config.selfId());
+        return new ArrayList<>(ids);
     }
 
     /**

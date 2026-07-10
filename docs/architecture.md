@@ -159,6 +159,38 @@ node.setConfiguration(Map.of(
 
 \newpage
 
+# 5.3 Non-voting Learners (§4.2.1)
+
+A **learner** is a server the leader replicates the log to, but which is
+excluded from every majority decision: it is never solicited for (Pre)Votes,
+never counted toward the commit quorum, never counts toward a ReadIndex
+leadership confirmation or the leader lease, and is never part of
+`majority()`. Learners live in the `learners` field of `ClusterConfiguration`
+alongside `members` and `old_members`, are carried through both joint-consensus
+phases, and are persisted inside snapshots, so the learner set survives
+reconfiguration and log compaction exactly like the voting membership.
+
+The purpose is to add a server without an availability gap: a new node joins as
+a learner, catches up its log via the ordinary `AppendEntries` / `InstallSnapshot`
+path while the cluster keeps its original majority, and is only then promoted to
+a voting member. `promoteLearner()` refuses until the learner's `matchIndex` has
+reached the leader's commit index, so the enlarged majority never includes a
+server that is still missing committed entries.
+
+A node started with `node.learner=true` bootstraps as a learner: it lists the
+existing voters as peers but keeps itself out of the voting configuration, so it
+never stands for election on its own until a committed configuration entry
+promotes it.
+
+```java
+node.addLearner("n4", "host4:9094").get(5, SECONDS);  // leader only; starts catch-up
+// ... n4 catches up ...
+node.promoteLearner("n4").get(5, SECONDS);            // once matchIndex >= commitIndex
+node.removeLearner("n4").get(5, SECONDS);             // or drop it without promoting
+```
+
+\newpage
+
 # 6. Log Replication Pipeline
 
 ![Replication with Parallel Disk Writes and Pipelining](replication.png){width=85%}
