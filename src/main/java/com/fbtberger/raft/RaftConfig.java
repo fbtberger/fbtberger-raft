@@ -108,6 +108,40 @@ public final class RaftConfig {
         return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
     }
 
+    /**
+     * Programmatic factory for callers that assemble configuration in code rather than from a
+     * {@code .properties} file (e.g. a Spring service wiring the node from its own
+     * {@code @ConfigurationProperties}). Uses the same defaults as {@link #load(Path)}: default
+     * snapshot sizing, no metrics endpoint, a voting member (not a learner), default RPC timeouts
+     * and TLS disabled.
+     *
+     * @param selfId   this node's id (must appear in {@code peers})
+     * @param selfPort this node's Raft transport port
+     * @param dataDir  the node's storage directory
+     * @param peers    all cluster nodes, including self (id → host:port)
+     */
+    public static RaftConfig of(String selfId, int selfPort, Path dataDir, Map<String, String> peers) {
+        return of(selfId, selfPort, dataDir, peers,
+                DEFAULT_SNAPSHOT_THRESHOLD, DEFAULT_SNAPSHOT_CHUNK_SIZE,
+                0, false, RpcTimeouts.defaults(), TlsConfig.disabled());
+    }
+
+    /**
+     * Full programmatic factory, mirroring the {@code .properties} contract of {@link #load(Path)}
+     * (including the self-in-peers invariant). A very large {@code snapshotThreshold} effectively
+     * disables automatic log compaction, so the node relies on full log replay on restart.
+     */
+    public static RaftConfig of(String selfId, int selfPort, Path dataDir, Map<String, String> peers,
+                                int snapshotThreshold, int snapshotChunkSize, int metricsPort,
+                                boolean learner, RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
+        Map<String, String> copy = new LinkedHashMap<>(peers);
+        if (!copy.containsKey(selfId)) {
+            throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
+        }
+        return new RaftConfig(selfId, selfPort, dataDir, copy,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
+    }
+
     private static String require(Properties props, String key) {
         String v = props.getProperty(key);
         if (v == null) {
