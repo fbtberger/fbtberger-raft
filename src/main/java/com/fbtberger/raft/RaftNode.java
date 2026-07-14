@@ -86,6 +86,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
     // §10.2.2: in-flight AppendEntries RPCs per peer for pipelining.
     private final Map<String, Integer> peerInflight = new ConcurrentHashMap<>();
+    // v101 — replication diagnostics. Until now BOTH ways a peer can fall out of
+    // replication were silent: a missing transport made replicateTo() return without a
+    // word, and a failed AppendEntries future was swallowed in whenComplete(). A follower
+    // could therefore sit at a stale index for hours with nothing in any log to show for
+    // it (seen on kwatro-1: log stuck at 336, state machine empty, leader silent).
+    private final Map<String, Long> peerLastFailureLogMs = new ConcurrentHashMap<>();
+    private final Map<String, String> peerLastFailure = new ConcurrentHashMap<>();
+    private volatile long lastReplicationStatusLogMs = 0;
+    private static final long FAILURE_LOG_THROTTLE_MS = 5_000;
+    private static final long REPLICATION_STATUS_INTERVAL_MS = 10_000;
 
     // §10.2.1: tracks how far the leader's own disk writes have been
     // durably synced, so the leader can replicate to followers in
@@ -423,9 +433,70 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             for (String peerId : peerTransports.keySet()) {
                 replicateTo(peerId);
             }
+            logReplicationStatus();
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * v101 — every {@value #REPLICATION_STATUS_INTERVAL_MS} ms the leader states, for each
+     * member it is responsible for, how far it has actually got. This is the line that was
+     * missing when a follower sat at a stale index for hours: from the outside the cluster
+     * looked healthy (writes committed on the remaining majority) while a third of the nodes
+     * silently received nothing.
+     *
+     * <p>Members with a transport are listed with match/next index; members of the
+     * configuration WITHOUT a transport are called out separately — that is a defect, not a
+     * lag. A peer whose matchIndex trails the leader's last log index is flagged.
+     */
+    private void logReplicationStatus() {
+        long now = System.currentTimeMillis();
+        if (now - lastReplicationStatusLogMs < REPLICATION_STATUS_INTERVAL_MS) return;
+        lastReplicationStatusLogMs = now;
+
+        long lastLogIndex = store.getLastLogIndex();
+        StringBuilder sb = new StringBuilder("replication: lastLogIndex=").append(lastLogIndex)
+                .append(" commitIndex=").append(commitIndex.get());
+
+        for (Map.Entry<String, String> member : currentConfiguration.entrySet()) {
+            String id = member.getKey();
+            if (id.equals(config.selfId())) continue;
+            appendPeerStatus(sb, id, lastLogIndex, "voter");
+        }
+        for (Map.Entry<String, String> learner : currentLearners.entrySet()) {
+            appendPeerStatus(sb, learner.getKey(), lastLogIndex, "learner");
+        }
+        log(sb.toString());
+    }
+
+    private void appendPeerStatus(StringBuilder sb, String id, long lastLogIndex, String role) {
+        sb.append(" | ").append(id).append('(').append(role).append(')');
+        if (!peerTransports.containsKey(id)) {
+            sb.append(" NO-TRANSPORT!");     // never replicated to — a defect
+            return;
+        }
+        long match = matchIndex.getOrDefault(id, 0L);
+        long next = nextIndex.getOrDefault(id, 1L);
+        int inflight = peerInflight.getOrDefault(id, 0);
+        Long lastAck = peerLastAckMs.get(id);
+        sb.append(" match=").append(match)
+          .append(" next=").append(next)
+          .append(" inflight=").append(inflight)
+          .append(" lastAck=").append(lastAck == null ? "never"
+                  : (System.currentTimeMillis() - lastAck) + "ms");
+        if (match < lastLogIndex) sb.append(" LAGGING");
+        String failure = peerLastFailure.get(id);
+        if (failure != null) sb.append(" lastError=").append(failure);
+    }
+
+    /** One line per peer per {@value #FAILURE_LOG_THROTTLE_MS} ms — enough to see it, not a flood. */
+    private void logThrottled(String peerId, String message) {
+        long now = System.currentTimeMillis();
+        Long last = peerLastFailureLogMs.get(peerId);
+        if (last != null && now - last < FAILURE_LOG_THROTTLE_MS) return;
+        peerLastFailureLogMs.put(peerId, now);
+        logWarn(peerId + ": " + message);
     }
 
     /**
@@ -734,6 +805,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private void replicateTo(String peerId) {
         RaftTransport transport = peerTransports.get(peerId);
         if (transport == null) {
+            // A configured member with no transport is replicated to by NOBODY — it will
+            // never receive an entry again. That must not be silent (v101).
+            logThrottled(peerId, "kein Transport vorhanden — dieser Peer wird NICHT repliziert");
             return;
         }
         long peerNextIndex = nextIndex.getOrDefault(peerId, 1L);
@@ -800,6 +874,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 } finally {
                     lock.unlock();
                 }
+                metrics.replicationFailure();
+                // v101: a replication failure used to vanish here without a trace.
+                peerLastFailure.put(peerId, String.valueOf(t));
+                logThrottled(peerId, "AppendEntries fehlgeschlagen (prevLogIndex=" + prevLogIndex
+                        + ", entries=" + entries.size() + "): " + t);
             } else {
                 handleAppendEntriesResponse(peerId, currentTerm, lastSentIndex, response);
             }
@@ -1948,6 +2027,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     private void log(String msg) {
         LOG.info("[{}] {}", config.selfId(), msg);
+    }
+
+    /** v101: replication problems belong at WARN — they used to be logged nowhere at all. */
+    private void logWarn(String msg) {
+        LOG.warn("[{}] {}", config.selfId(), msg);
     }
 
     /**
