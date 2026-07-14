@@ -51,30 +51,67 @@ class HealthCheckTest {
 
     @Test
     void readinessStatusLeaderWithQuorumIsUp() {
-        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, true, null);
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, false, true, null);
         assertTrue(s.ok());
         assertEquals("leader", s.message());
     }
 
     @Test
     void readinessStatusFollowerWithFreshLeaderIsUp() {
-        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, true, "n2");
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, false, true, "n2");
         assertTrue(s.ok());
         assertTrue(s.message().contains("leader=n2"));
     }
 
     @Test
     void readinessStatusLeaderWithoutQuorumIsDown() {
-        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, false, null);
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.LEADER, false, false, null);
         assertFalse(s.ok());
         assertEquals("leader without quorum", s.message());
     }
 
     @Test
     void readinessStatusFollowerWithStaleLeaderIsDown() {
-        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, false, "n3");
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, false, false, "n3");
         assertFalse(s.ok());
         assertTrue(s.message().contains("no recent leader contact"));
+    }
+
+    // ── learners are reported as such (v107) ──────────────────────────────────
+    //
+    // Every non-leader used to report "follower", so a learner and a voting follower looked
+    // identical from outside. They are not the same thing when one of them disappears: a missing
+    // voter eats into the quorum, a missing learner only costs read capacity. During the July
+    // outage, "which of the empty nodes are voters?" was exactly the question the health endpoint
+    // could not answer.
+
+    @Test
+    void aHealthyLearnerSaysLearner_notFollower() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, true, true, "n2");
+        assertTrue(s.ok());
+        assertEquals("learner, leader=n2", s.message());
+    }
+
+    @Test
+    void aVotingFollowerStillSaysFollower() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, false, true, "n2");
+        assertEquals("follower, leader=n2", s.message());
+    }
+
+    @Test
+    void aLearnerThatLostTheLeaderSaysSo_butIsStillIdentifiableAsALearner() {
+        HealthCheck.Status s = HealthCheck.readinessStatus(ServerRole.FOLLOWER, true, false, "n3");
+        assertFalse(s.ok());
+        assertTrue(s.message().startsWith("learner"), s.message());
+        assertTrue(s.message().contains("no recent leader contact"), s.message());
+    }
+
+    @Test
+    void aLearnerIsNotAFourthRole() {
+        // §4.2.1: a learner is a non-voting MEMBER, and its role is FOLLOWER like any other.
+        // Membership and role are different questions; ServerRole stays exactly as Figure 4
+        // has it, and the learner flag rides alongside rather than inside it.
+        assertEquals(3, ServerRole.values().length);
     }
 
     // ── isReadyToServe integration (achievable node states) ───────────────────
