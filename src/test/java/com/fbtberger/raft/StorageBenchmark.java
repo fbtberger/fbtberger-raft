@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -71,96 +72,145 @@ import java.util.concurrent.TimeUnit;
  * benchmark that fails a CI build for being 8% slower on a loaded machine teaches people to ignore
  * CI. They are a measuring instrument, not a gate.
  */
-@State(Scope.Thread)
 @Fork(1)
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
+@Warmup(iterations = 2)
+@Measurement(iterations = 5)
 public class StorageBenchmark {
 
-    /** Every implementation, so the comparison is on evidence rather than on which one we wrote first. */
-    @Param({"wal", "bdb", "memory"})
-    public String impl;
+    // ── 1 & 2: appends — rebuilt in v114 ─────────────────────────────────────
+    //
+    // The first version of these was wrong, and wrong in a way worth recording, because the
+    // numbers it produced looked like numbers:
+    //
+    //   * The store was created per ITERATION, but every invocation appended to it. Within a
+    //     one-second iteration that is tens of thousands of appends, so the log grew by millions
+    //     of entries while being measured. Later invocations paid for segment rollover and a
+    //     larger B-tree than earlier ones. The benchmark measured a moving target.
+    //
+    //   * appendDeferringTheSync was fire-and-forget: it queued fsyncs faster than the disk could
+    //     retire them, the backlog grew until it collapsed, and the error bars came out several
+    //     times larger than the scores. It also compared two different promises — one variant
+    //     returned when the data was durable, the other when it had merely been asked to be.
+    //
+    // The result was BDB appearing FOUR TIMES SLOWER with a deferred fsync than with a blocking
+    // one. A measurement that violates physics is not measuring physics.
+    //
+    // The rebuild: a fresh store per invocation (set up, but not timed), a fixed amount of work,
+    // and both variants must reach the SAME durability before the clock stops. Then the only thing
+    // left between them is whether deferring lets the fsyncs pipeline — which is the actual
+    // question §10.2.1 poses.
 
-    /**
-     * Entries per append. Raft batches AppendEntries, and a batch pays for <b>one</b> fsync no
-     * matter how large it is — so this parameter is really asking how much of the cost is the
-     * disk barrier and how much is the data.
-     */
-    @Param({"1", "10", "100"})
-    public int batchSize;
+    /** How many batches each timed invocation appends. Fixed work, so growth cannot drift. */
+    private static final int BATCHES_PER_INVOCATION = 200;
 
-    private Path dir;
-    private RaftStorage store;
-    private List<LogEntry> batch;
-    private long nextIndex = 1;
+    @State(Scope.Thread)
+    public static class AppendState {
 
-    @Setup(Level.Iteration)
-    public void openStore() throws IOException {
-        dir = Files.createTempDirectory("raft-bench-");
-        store = open(impl, dir);
-        nextIndex = 1;
-        batch = new ArrayList<>(batchSize);
-    }
+        @Param({"wal", "bdb"})
+        public String impl;
 
-    @TearDown(Level.Iteration)
-    public void closeStore() throws IOException {
-        if (store != null) store.close();
-        deleteRecursively(dir);
-    }
+        /** Raft batches AppendEntries, and one batch pays for ONE fsync however large it is. */
+        @Param({"1", "10", "100"})
+        public int batchSize;
 
-    // ── 1. what the fsync costs ──────────────────────────────────────────────
+        /**
+         * Entries already in the log before the clock starts. An append into an empty store and an
+         * append into a store with a real log behind it are different operations — and it is the
+         * second one that a running cluster actually performs.
+         */
+        @Param({"0", "10000"})
+        public int prefill;
 
-    /** The full cost: the entries are on disk and synced when this returns. */
-    @Benchmark
-    @BenchmarkMode(Mode.AverageTime)
-    @OutputTimeUnit(TimeUnit.MICROSECONDS)
-    public long appendAndSync() {
-        store.appendEntries(nextBatch());
-        return store.getLastLogIndex();
-    }
+        Path dir;
+        RaftStorage store;
+        long nextIndex;
+        List<LogEntry> batch;
 
-    /**
-     * §10.2.1: what the Raft lock actually pays. The fsync is still coming — it is simply not on
-     * this path. The gap between this and {@link #appendAndSync} IS the justification for the
-     * deferred-sync machinery; if the gap is small, the machinery is not paying for itself.
-     */
-    @Benchmark
-    @BenchmarkMode(Mode.AverageTime)
-    @OutputTimeUnit(TimeUnit.MICROSECONDS)
-    public long appendDeferringTheSync() {
-        store.appendEntriesDeferSync(nextBatch());
-        return store.getLastLogIndex();
-    }
-
-    // ── 2. the follower catch-up path ────────────────────────────────────────
-
-    /**
-     * AppendEntries rule 3 — the path that took the cluster down in July, and the one a healthy
-     * cluster never walks. Worth knowing what it costs when it finally does: a follower that has
-     * to discard a conflicting suffix and re-take the leader's.
-     */
-    @Benchmark
-    @BenchmarkMode(Mode.AverageTime)
-    @OutputTimeUnit(TimeUnit.MICROSECONDS)
-    public long truncateAndReAppend() {
-        store.appendEntries(nextBatch());
-        long from = Math.max(1, store.getLastLogIndex() - batchSize + 1);
-        store.truncateFrom(from);
-        nextIndex = from;
-        store.appendEntries(nextBatch());
-        return store.getLastLogIndex();
-    }
-
-    private List<LogEntry> nextBatch() {
-        batch.clear();
-        for (int i = 0; i < batchSize; i++) {
-            batch.add(LogEntry.newBuilder()
-                    .setIndex(nextIndex++)
-                    .setTerm(1)
-                    .setCommand(PAYLOAD)
-                    .build());
+        @Setup(Level.Invocation)
+        public void freshStore() throws IOException {
+            dir = Files.createTempDirectory("raft-bench-append-");
+            store = open(impl, dir);
+            batch = new ArrayList<>(batchSize);
+            nextIndex = 1;
+            if (prefill > 0) {
+                List<LogEntry> chunk = new ArrayList<>(500);
+                for (int written = 0; written < prefill; written += 500) {
+                    chunk.clear();
+                    for (int i = 0; i < Math.min(500, prefill - written); i++) {
+                        chunk.add(LogEntry.newBuilder()
+                                .setIndex(nextIndex++).setTerm(1).setCommand(PAYLOAD).build());
+                    }
+                    store.appendEntries(chunk);
+                }
+            }
         }
-        return batch;
+
+        @TearDown(Level.Invocation)
+        public void discardStore() throws IOException {
+            if (store != null) {
+                store.close();
+                store = null;
+            }
+            deleteRecursively(dir);
+        }
+
+        List<LogEntry> nextBatch() {
+            batch.clear();
+            for (int i = 0; i < batchSize; i++) {
+                batch.add(LogEntry.newBuilder()
+                        .setIndex(nextIndex++).setTerm(1).setCommand(PAYLOAD).build());
+            }
+            return batch;
+        }
+    }
+
+    /** Blocking fsync per batch: durable when the call returns. */
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    @OutputTimeUnit(TimeUnit.MILLISECONDS)
+    public long appendAndSync(AppendState s) {
+        for (int i = 0; i < BATCHES_PER_INVOCATION; i++) {
+            s.store.appendEntries(s.nextBatch());
+        }
+        return s.store.getLastLogIndex();
+    }
+
+    /**
+     * §10.2.1: the same work, the same durability by the time we stop the clock — but the fsyncs
+     * were allowed to overlap with the appends instead of serialising behind them.
+     *
+     * <p>The {@code join()} at the end is not a formality. Without it this measures how fast we can
+     * make promises, not how fast the disk can keep them, and the backlog quietly turns the numbers
+     * into noise. That is precisely what the first version of this benchmark did.
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    @OutputTimeUnit(TimeUnit.MILLISECONDS)
+    public long appendDeferringTheSync(AppendState s) {
+        List<CompletableFuture<Void>> pending = new ArrayList<>(BATCHES_PER_INVOCATION);
+        for (int i = 0; i < BATCHES_PER_INVOCATION; i++) {
+            pending.add(s.store.appendEntriesDeferSync(s.nextBatch()));
+        }
+        CompletableFuture.allOf(pending.toArray(new CompletableFuture[0])).join();
+        return s.store.getLastLogIndex();
+    }
+
+    /**
+     * AppendEntries rule 3 — the follower catch-up path that took the cluster down in July, and
+     * that a healthy cluster never walks. Worth knowing what it costs when it finally does.
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    @OutputTimeUnit(TimeUnit.MILLISECONDS)
+    public long truncateAndReAppend(AppendState s) {
+        for (int i = 0; i < BATCHES_PER_INVOCATION; i++) {
+            s.store.appendEntries(s.nextBatch());
+            long from = Math.max(1, s.store.getLastLogIndex() - s.batchSize + 1);
+            s.store.truncateFrom(from);
+            s.nextIndex = from;
+            s.store.appendEntries(s.nextBatch());
+        }
+        return s.store.getLastLogIndex();
     }
 
     // ── 3. the cost of every deploy, forever ─────────────────────────────────
@@ -174,9 +224,6 @@ public class StorageBenchmark {
      * thing entirely.
      */
     @State(Scope.Thread)
-    @Fork(1)
-    @Warmup(iterations = 1)
-    @Measurement(iterations = 5)
     public static class RecoveryState {
 
         @Param({"wal", "bdb"})
