@@ -4,78 +4,99 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.RaftStorageFactory.StorageType;
 import com.fbtberger.raft.proto.LogEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.function.Predicate;
 
 /**
- * Moves a Raft log from one {@link RaftStorage} implementation to another.
+ * Keeps the on-disk log correct when the storage backend changes.
  *
- * <h2>Why this has to exist before the default can change</h2>
- * With snapshots disabled — which is how kwatro runs — <b>the log IS the persistence</b>. Swapping
- * the storage backend is therefore not a configuration change; it is a data migration. A node
- * restarted onto an empty WAL directory comes up with an empty log and an empty state machine,
- * while the cluster cheerfully reports {@code UP} because the remaining voters still form a
- * majority.
+ * <h2>Why this is not just "copy A to B"</h2>
+ * With snapshots disabled — how kwatro runs — <b>the log IS the persistence</b>. Switching backends
+ * is a data migration, and a node that starts on an empty or stale log comes up with a wrong state
+ * machine while the cluster reports {@code UP}, because the remaining voters still form a majority.
+ * That is the July picture, self-inflicted.
  *
- * <p>That is not a hypothetical: it is exactly the picture from July, when three of five nodes ran
- * for hours with an empty state machine and everything looked healthy. The difference is that this
- * time there would be no Berkeley DB log left to heal from.
+ * <h2>The rule (v115): whichever log is further ahead wins</h2>
+ * The first version only asked "does a WAL exist yet?". That is enough exactly once — on the way
+ * OUT of Berkeley DB. It sets a trap for the way back: after the node has run on the WAL, the
+ * {@code .jdb} files are frozen at the moment of that first migration, and a naive switch back to
+ * {@code bdb} would load that stale log <b>on all five nodes at once</b>. No majority would hold the
+ * current state, so Raft would have nothing to heal from. Everything since the migration would be
+ * gone — and the cluster would look perfectly healthy while it happened.
  *
- * <h2>Why it is only ~40 lines</h2>
- * Because {@link RaftStorage} is a real interface and — since the storage contract suite — both
- * implementations demonstrably satisfy the same invariants. Copying between them is just reading
- * one and writing the other. That is the contract suite paying for itself.
+ * <p>{@link #reconcile} therefore does not care which direction it is going. It compares what is
+ * actually on disk, using Raft's own "more up to date" test (§5.4.1: a higher last term wins; on
+ * equal terms, the longer log), and copies the winner into the backend about to be opened. The
+ * loser's files are <b>moved aside, never deleted</b> — into {@code superseded-<type>-<timestamp>/},
+ * where a human can still find them.
  *
- * <h2>In place, and reversible</h2>
- * Berkeley DB writes {@code NNNNNNNN.jdb}; the WAL writes {@code wal-NNNNNN.log}. They do not
- * collide, so the migration runs inside the existing data directory and <b>leaves the Berkeley DB
- * files where they are</b>. Flip {@code storage.type} back and the old log is still there.
- *
- * <p>The escape hatch has a shelf life: once the node has been running on the WAL, the Berkeley DB
- * files are frozen at the moment of migration, and reverting loses everything written since. It is
- * a safety net for "this went wrong immediately", not a general undo.
+ * <p>Idempotent, so it runs on every startup. A migration that must be remembered separately for
+ * each of five nodes is a migration that will be forgotten for one of them.
  */
 public final class StorageMigration {
 
     private static final Logger log = LoggerFactory.getLogger(StorageMigration.class);
 
-    /** Entries copied per append — one fsync per batch rather than per entry. */
+    /** Entries copied per append — one fsync per batch rather than one per entry. */
     private static final int BATCH = 500;
 
     private StorageMigration() { }
 
     /**
-     * Copies a Berkeley DB log in {@code dataDir} into a WAL in the same directory, if — and only
-     * if — there is a Berkeley DB log there and no WAL yet.
-     *
-     * <p>Idempotent by construction: once the WAL exists, this does nothing. So it is safe to call
-     * on every startup, which is the point — a migration that has to be remembered for each of five
-     * nodes is a migration that will be forgotten for one of them.
+     * Makes {@code target} in {@code dataDir} hold the most recent log available there, migrating
+     * from the other backend if that one is further ahead.
      *
      * @return {@code true} if a migration actually ran
      */
-    public static boolean migrateBerkeleyDbToWalIfNeeded(Path dataDir) {
-        if (!hasBerkeleyDbFiles(dataDir)) {
-            return false;   // nothing to migrate from — a fresh node, or already WAL-native
-        }
-        if (hasWalFiles(dataDir)) {
-            return false;   // already migrated; the .jdb files are the fallback copy
+    public static boolean reconcile(StorageType target, Path dataDir) {
+        if (target == StorageType.MEMORY) return false;
+
+        StorageType other = target == StorageType.WAL ? StorageType.BDB : StorageType.WAL;
+        if (!hasFilesFor(other, dataDir)) {
+            return false;   // nothing to migrate from
         }
 
-        log.info("Berkeley-DB-Log gefunden, aber kein WAL — migriere {} nach WalStorage", dataDir);
-        long entries;
-        try (RaftStorage source = new BerkeleyDbStorage(dataDir.toFile());
-             RaftStorage target = new WalStorage(dataDir.toFile())) {
-            entries = copy(source, target);
+        LogPosition targetPos = positionOf(target, dataDir);
+        LogPosition otherPos = positionOf(other, dataDir);
+
+        if (!otherPos.isMoreUpToDateThan(targetPos)) {
+            // The backend we are opening already holds the current log. This is also what makes a
+            // second boot a no-op instead of copying back and forth for ever.
+            return false;
         }
-        log.info("Migration abgeschlossen: {} Einträge übernommen, lastLogIndex={}. "
-                + "Die Berkeley-DB-Dateien bleiben als Rückfallebene liegen.", entries, entries);
+
+        log.warn("{}-Log ist weiter als {} ({} vs {}) — migriere {} -> {}",
+                other, target, otherPos, targetPos, other, target);
+
+        if (hasFilesFor(target, dataDir)) {
+            // The target's files are STALE. Using them would silently roll this node back; deleting
+            // them would destroy the only other copy if this migration is itself a mistake. Move.
+            Path archive = archiveFilesFor(target, dataDir);
+            log.warn("Veralteter {}-Log beiseitegeschoben nach {}", target, archive);
+        }
+
+        long copied;
+        try (RaftStorage source = openRaw(other, dataDir);
+             RaftStorage destination = openRaw(target, dataDir)) {
+            copied = copy(source, destination);
+        }
+        log.info("Migration abgeschlossen: {} Einträge {} -> {}. Der {}-Log bleibt als "
+                + "Rückfallebene liegen.", copied, other, target, other);
         return true;
     }
 
@@ -84,8 +105,9 @@ public final class StorageMigration {
      * {@code votedFor} and the snapshot — from {@code source} into {@code target}.
      *
      * @return the number of log entries copied
-     * @throws IllegalStateException if {@code target} is not empty (this is a migration, not a
-     *         merge: writing one log on top of another would produce a log that never existed)
+     * @throws IllegalStateException if {@code target} is not empty. This is a migration, not a
+     *         merge: writing one log on top of another would produce a log that existed on no
+     *         server, which is the one thing a replicated log may never be.
      */
     public static long copy(RaftStorage source, RaftStorage target) {
         if (target.getLastLogIndex() != 0 || target.getSnapshotIndex() != 0) {
@@ -94,10 +116,9 @@ public final class StorageMigration {
                             + ", snapshotIndex=" + target.getSnapshotIndex() + ")");
         }
 
-        // The snapshot first: it sets the boundary the remaining entries sit above.
         RaftStorage.Snapshot snapshot = source.getSnapshot();
         if (snapshot != null) {
-            target.saveSnapshotAndCompact(snapshot);
+            target.saveSnapshotAndCompact(snapshot);   // sets the boundary the entries sit above
         }
 
         long from = source.getSnapshotIndex() + 1;
@@ -108,8 +129,8 @@ public final class StorageMigration {
         for (long i = from; i <= to; i++) {
             LogEntry entry = source.getLogEntry(i);
             if (entry == null) {
-                // A hole in the source log means the source is already broken. Better to stop
-                // loudly here than to write a shorter log and let a node come up "fine".
+                // A hole in the source means the source is already broken. Stop loudly rather than
+                // write a shorter log and let the node come up looking fine.
                 throw new IllegalStateException("gap in the source log at index " + i
                         + " (snapshotIndex=" + source.getSnapshotIndex()
                         + ", lastLogIndex=" + to + ")");
@@ -126,29 +147,91 @@ public final class StorageMigration {
             copied += batch.size();
         }
 
-        // §5.2: forgetting the vote lets a server vote twice in the same term. It is one line, and
-        // it is the line a hand-rolled migration forgets.
+        // §5.2: a server that forgets its vote can vote twice in the same term. One line — and
+        // exactly the line a hand-rolled migration leaves out.
         target.setTermAndVote(source.getCurrentTerm(), source.getVotedFor());
 
         return copied;
     }
 
-    private static boolean hasBerkeleyDbFiles(Path dataDir) {
-        return listMatching(dataDir, name -> name.endsWith(".jdb"));
-    }
+    // ── which log is further ahead? ──────────────────────────────────────────
 
-    private static boolean hasWalFiles(Path dataDir) {
-        return listMatching(dataDir, name -> name.startsWith("wal-") && name.endsWith(".log"));
-    }
+    /** Raft's own comparison (§5.4.1): a higher last term wins; on equal terms, the longer log. */
+    record LogPosition(long lastTerm, long lastIndex) {
 
-    private static boolean listMatching(Path dataDir, java.util.function.Predicate<String> match) {
-        File dir = dataDir.toFile();
-        if (!dir.isDirectory()) return false;
-        String[] names = dir.list();
-        if (names == null) return false;
-        for (String name : names) {
-            if (match.test(name)) return true;
+        static final LogPosition EMPTY = new LogPosition(0, 0);
+
+        boolean isMoreUpToDateThan(LogPosition other) {
+            if (lastIndex == 0) return false;   // an empty log is never ahead of anything
+            if (lastTerm != other.lastTerm) return lastTerm > other.lastTerm;
+            return lastIndex > other.lastIndex;
         }
-        return false;
+
+        @Override
+        public String toString() {
+            return "term=" + lastTerm + ",index=" + lastIndex;
+        }
+    }
+
+    static LogPosition positionOf(StorageType type, Path dataDir) {
+        if (!hasFilesFor(type, dataDir)) return LogPosition.EMPTY;
+        try (RaftStorage store = openRaw(type, dataDir)) {
+            return new LogPosition(store.getLastLogTerm(), store.getLastLogIndex());
+        }
+    }
+
+    /** Opens a backend WITHOUT reconciling — otherwise this would recurse. */
+    private static RaftStorage openRaw(StorageType type, Path dataDir) {
+        File dir = dataDir.toFile();
+        return switch (type) {
+            case WAL -> new WalStorage(dir);
+            case BDB -> new BerkeleyDbStorage(dir);
+            case MEMORY -> new InMemoryStorage();
+        };
+    }
+
+    // ── files ────────────────────────────────────────────────────────────────
+
+    private static Predicate<String> filePatternFor(StorageType type) {
+        return switch (type) {
+            case WAL -> name -> name.startsWith("wal-") && name.endsWith(".log");
+            case BDB -> name -> name.endsWith(".jdb");
+            case MEMORY -> name -> false;
+        };
+    }
+
+    static boolean hasFilesFor(StorageType type, Path dataDir) {
+        return !listFilesFor(type, dataDir).isEmpty();
+    }
+
+    private static List<Path> listFilesFor(StorageType type, Path dataDir) {
+        File dir = dataDir.toFile();
+        List<Path> found = new ArrayList<>();
+        if (!dir.isDirectory()) return found;
+        String[] names = dir.list();
+        if (names == null) return found;
+        Predicate<String> matches = filePatternFor(type);
+        for (String name : names) {
+            if (matches.test(name)) found.add(dataDir.resolve(name));
+        }
+        return found;
+    }
+
+    /** Moves a stale backend's files into {@code superseded-<type>-<timestamp>/}. Never deletes. */
+    private static Path archiveFilesFor(StorageType type, Path dataDir) {
+        String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        Path archive = dataDir.resolve(
+                "superseded-" + type.name().toLowerCase(Locale.ROOT) + "-" + stamp);
+        try {
+            Files.createDirectories(archive);
+            for (Path file : listFilesFor(type, dataDir)) {
+                Files.move(file, archive.resolve(file.getFileName()),
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                    "could not move the stale " + type + " log aside; refusing to continue", e);
+        }
+        return archive;
     }
 }

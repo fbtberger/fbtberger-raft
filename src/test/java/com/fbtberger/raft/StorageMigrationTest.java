@@ -4,6 +4,7 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.RaftStorageFactory.StorageType;
 import com.fbtberger.raft.proto.LogEntry;
 import com.google.protobuf.ByteString;
 import org.junit.jupiter.api.Test;
@@ -23,12 +24,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Moving the log from Berkeley DB to the WAL.
+ * Moving the log between storage backends.
  *
- * <p>This is the test that decides whether changing the default backend is a config change or a
- * data-loss incident. With snapshots off — how kwatro runs — <b>the log IS the persistence</b>. A
- * node restarted onto an empty WAL comes up with an empty state machine and reports {@code UP},
- * because the surviving voters still form a majority. That is July, self-inflicted.
+ * <p>This decides whether changing the backend is a config change or a data-loss incident. With
+ * snapshots off — how kwatro runs — <b>the log IS the persistence</b>. A node that starts on an
+ * empty or stale log comes up with the wrong state machine and reports {@code UP}, because the
+ * surviving voters still form a majority. That is July, self-inflicted.
  */
 class StorageMigrationTest {
 
@@ -50,9 +51,8 @@ class StorageMigrationTest {
             assertEquals(3, StorageMigration.copy(source, target));
 
             assertEquals(3, target.getLastLogIndex());
-            assertEquals(1, target.getLastLogTerm());
             assertEquals("cmd-2", target.getLogEntry(2).getCommand().toStringUtf8());
-            // §5.2: a server that forgets its vote can vote twice in the same term. One line, and
+            // §5.2: a server that forgets its vote can vote twice in the same term. One line — and
             // exactly the line a hand-rolled migration leaves out.
             assertEquals(7, target.getCurrentTerm());
             assertEquals("kwatro2", target.getVotedFor());
@@ -73,68 +73,110 @@ class StorageMigrationTest {
             StorageMigration.copy(source, target);
 
             assertEquals(3, target.getSnapshotIndex());
-            assertEquals(2, target.getSnapshotTerm());
             assertArrayEquals("state".getBytes(), target.getSnapshot().stateMachineData);
-            assertArrayEquals("cfg".getBytes(), target.getSnapshot().configurationData);
-
-            assertNull(target.getLogEntry(3), "compacted away in the source, and not resurrected here");
+            assertNull(target.getLogEntry(3), "compacted in the source, not resurrected here");
             assertNotNull(target.getLogEntry(4), "the entries above the boundary must come across");
             assertEquals(5, target.getLastLogIndex());
         }
     }
 
-    /**
-     * A migration is not a merge. Writing one log on top of another would produce a log that never
-     * existed on any server — the one thing a replicated log may never be.
-     */
+    /** A migration is not a merge: one log written over another existed on no server. */
     @Test
     void aTargetThatAlreadyHasALogIsRefused() {
         try (RaftStorage source = new BerkeleyDbStorage(new File(dataDir.toFile(), "src"));
              RaftStorage target = new WalStorage(new File(dataDir.toFile(), "dst"))) {
 
             source.appendEntries(entries(1, 2, 1));
-            target.appendEntries(entries(1, 1, 9));   // not empty
+            target.appendEntries(entries(1, 1, 9));
 
             assertThrows(IllegalStateException.class, () -> StorageMigration.copy(source, target));
         }
     }
 
-    // ── the automatic, in-place migration ────────────────────────────────────
+    // ── reconcile: whichever log is further ahead wins ───────────────────────
 
     @Test
-    void anExistingBerkeleyDbLogIsMigratedInPlace_andTheDbFilesAreLeftAsAFallback() {
+    void openingTheWalWhenOnlyABerkeleyDbLogExistsMigratesIt() {
         try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
             bdb.appendEntries(entries(1, 4, 3));
             bdb.setTermAndVote(5, "kwatro1");
         }
 
-        assertTrue(StorageMigration.migrateBerkeleyDbToWalIfNeeded(dataDir));
+        assertTrue(StorageMigration.reconcile(StorageType.WAL, dataDir));
 
         try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
             assertEquals(4, wal.getLastLogIndex());
-            assertEquals(3, wal.getLastLogTerm());
             assertEquals(5, wal.getCurrentTerm());
             assertEquals("kwatro1", wal.getVotedFor());
         }
-
-        // The .jdb files are still there: flip storage.type back and the old log is intact.
-        assertTrue(hasFile(name -> name.endsWith(".jdb")),
-                "the Berkeley DB files must survive as the escape hatch");
+        assertTrue(hasFile(n -> n.endsWith(".jdb")), "the source log stays as the fallback");
     }
 
     /**
-     * Idempotent, because it runs on every startup. A migration that has to be remembered for each
-     * of five nodes is a migration that will be forgotten for one of them.
+     * THE TRAP v113 SET, and the reason for v115.
+     *
+     * <p>Once a node has run on the WAL, the {@code .jdb} files are frozen at the moment of the
+     * first migration. A naive "switch back to bdb" would load that stale log — <b>on all five
+     * nodes at once</b>. No majority would hold the current state, so Raft would have nothing to
+     * heal from, and everything written since would be gone. The cluster would look perfectly
+     * healthy throughout.
      */
     @Test
-    void migratingTwiceDoesNothingTheSecondTime() {
+    void switchingBackDoesNotResurrectTheStaleLog() {
+        // A node that migrated to the WAL long ago...
+        try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
+            bdb.appendEntries(entries(1, 4, 1));            // the frozen .jdb log
+        }
+        StorageMigration.reconcile(StorageType.WAL, dataDir);
+
+        // ...and has been running on it since.
+        try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
+            wal.appendEntries(entries(5, 20, 2));           // everything since the migration
+            wal.setTermAndVote(9, "kwatro3");
+        }
+
+        assertTrue(StorageMigration.reconcile(StorageType.BDB, dataDir),
+                "the WAL is ahead — Berkeley DB must be rebuilt from it, not loaded as it stands");
+
+        try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
+            assertEquals(20, bdb.getLastLogIndex(), "the 16 entries written on the WAL must survive");
+            assertEquals(2, bdb.getLastLogTerm());
+            assertEquals(9, bdb.getCurrentTerm());
+            assertEquals("kwatro3", bdb.getVotedFor());
+        }
+    }
+
+    @Test
+    void theSupersededLogIsMovedAsideAndNotDeleted() {
+        try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
+            bdb.appendEntries(entries(1, 4, 1));
+        }
+        StorageMigration.reconcile(StorageType.WAL, dataDir);
+        try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
+            wal.appendEntries(entries(5, 10, 2));
+        }
+
+        StorageMigration.reconcile(StorageType.BDB, dataDir);
+
+        // Deleting the stale log would destroy the only other copy if this migration is itself the
+        // mistake. It gets moved, not removed.
+        File[] archives = dataDir.toFile().listFiles(
+                (dir, name) -> name.startsWith("superseded-bdb-"));
+        assertNotNull(archives);
+        assertEquals(1, archives.length, "the stale Berkeley DB files must be archived");
+        assertTrue(archives[0].isDirectory());
+    }
+
+    /** Idempotent, because it runs on every boot. It must not copy back and forth for ever. */
+    @Test
+    void reconcilingTwiceDoesNothingTheSecondTime() {
         try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
             bdb.appendEntries(entries(1, 2, 1));
         }
 
-        assertTrue(StorageMigration.migrateBerkeleyDbToWalIfNeeded(dataDir));
-        assertFalse(StorageMigration.migrateBerkeleyDbToWalIfNeeded(dataDir),
-                "the WAL already exists — a second run must not touch it");
+        assertTrue(StorageMigration.reconcile(StorageType.WAL, dataDir));
+        assertFalse(StorageMigration.reconcile(StorageType.WAL, dataDir),
+                "the WAL now holds the same log — a second run must not touch it");
 
         try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
             assertEquals(2, wal.getLastLogIndex(), "and certainly must not duplicate the log");
@@ -142,39 +184,58 @@ class StorageMigrationTest {
     }
 
     @Test
-    void aFreshNodeHasNothingToMigrate() {
-        assertFalse(StorageMigration.migrateBerkeleyDbToWalIfNeeded(dataDir));
+    void aHigherTermWinsEvenWithAShorterLog() {
+        // §5.4.1: up-to-dateness is (lastTerm, lastIndex), not length. A short log from a later
+        // term beats a long one from an earlier term.
+        try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
+            wal.appendEntries(entries(1, 10, 1));          // long, old
+        }
+        try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
+            bdb.appendEntries(entries(1, 3, 5));           // short, new
+        }
+
+        assertTrue(StorageMigration.reconcile(StorageType.WAL, dataDir));
+
+        try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
+            assertEquals(3, wal.getLastLogIndex());
+            assertEquals(5, wal.getLastLogTerm());
+        }
+    }
+
+    @Test
+    void aFreshNodeHasNothingToReconcile() {
+        assertFalse(StorageMigration.reconcile(StorageType.BDB, dataDir));
+        assertFalse(StorageMigration.reconcile(StorageType.WAL, dataDir));
     }
 
     // ── the factory ──────────────────────────────────────────────────────────
 
     @Test
-    void theDefaultIsTheWal() {
-        assertEquals(RaftStorageFactory.StorageType.WAL, RaftStorageFactory.StorageType.parse(null));
-        assertEquals(RaftStorageFactory.StorageType.WAL, RaftStorageFactory.StorageType.parse(""));
-        assertEquals(RaftStorageFactory.StorageType.WAL, RaftStorageFactory.StorageType.parse("wal"));
-        assertEquals(RaftStorageFactory.StorageType.BDB, RaftStorageFactory.StorageType.parse("BDB"));
-        assertEquals(RaftStorageFactory.StorageType.MEMORY, RaftStorageFactory.StorageType.parse(" memory "));
+    void theDefaultIsBerkeleyDb() {
+        // v113 defaulted to WAL on intuition; the benchmarks put it back. BDB recovers 7.8x faster
+        // at 50k entries and writes 2.2x faster.
+        assertEquals(StorageType.BDB, StorageType.parse(null));
+        assertEquals(StorageType.BDB, StorageType.parse(""));
+        assertEquals(StorageType.WAL, StorageType.parse("wal"));
+        assertEquals(StorageType.BDB, StorageType.parse("BDB"));
+        assertEquals(StorageType.MEMORY, StorageType.parse(" memory "));
     }
 
     @Test
     void anUnknownStorageTypeIsRejectedLoudly() {
-        // Silently falling back to a default here would be the worst possible behaviour: a typo in
-        // one node's config would put it on a different backend than its peers, and nothing would
-        // say so.
-        assertThrows(IllegalArgumentException.class,
-                () -> RaftStorageFactory.StorageType.parse("berkleydb"));
+        // Falling back to a default silently would be the worst behaviour available: a typo in one
+        // node's config would put it on a different backend from its peers, and nothing would say so.
+        assertThrows(IllegalArgumentException.class, () -> StorageType.parse("berkleydb"));
     }
 
     @Test
-    void openingTheWalOnADirectoryWithABerkeleyDbLogMigratesIt() {
-        try (RaftStorage bdb = new BerkeleyDbStorage(dataDir.toFile())) {
-            bdb.appendEntries(entries(1, 3, 1));
+    void theFactoryNeverHandsBackAnEmptyLogNextToAFullOne() {
+        try (RaftStorage wal = new WalStorage(dataDir.toFile())) {
+            wal.appendEntries(entries(1, 3, 1));
         }
 
-        try (RaftStorage opened = RaftStorageFactory.open("wal", dataDir)) {
-            assertEquals(3, opened.getLastLogIndex(),
-                    "the factory must not hand back an empty log next to a full Berkeley DB one");
+        try (RaftStorage opened = RaftStorageFactory.open("bdb", dataDir)) {
+            assertEquals(3, opened.getLastLogIndex());
         }
     }
 

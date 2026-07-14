@@ -245,8 +245,12 @@ public class StorageBenchmark {
             for (int written = 0; written < logSize; written += 500) {
                 chunk.clear();
                 for (int i = 0; i < Math.min(500, logSize - written); i++) {
+                    // A real command, so replaying it does real work: "SET k<n> <padding>".
+                    long n = index;
                     chunk.add(LogEntry.newBuilder()
-                            .setIndex(index++).setTerm(1).setCommand(PAYLOAD).build());
+                            .setIndex(index++).setTerm(1)
+                            .setCommand(ByteString.copyFromUtf8("SET k" + n + " " + "x".repeat(100)))
+                            .build());
                 }
                 writer.appendEntries(chunk);
             }
@@ -273,6 +277,37 @@ public class StorageBenchmark {
     public long recoverFromAnExistingLog(RecoveryState state) {
         state.store = open(state.impl, state.dir);
         return state.store.getLastLogIndex();
+    }
+
+    /**
+     * What a node restart <b>actually</b> costs (v115).
+     *
+     * <p>{@link #recoverFromAnExistingLog} only opens the storage — and that measurement said
+     * something flattering about Berkeley DB: 49 ms at 50 000 entries against the WAL's 378 ms,
+     * because opening a B-tree is not the same as scanning a file. It was then used, by me, to
+     * argue that the two backends differ only by a constant. That argument was not supported by the
+     * number it leaned on.
+     *
+     * <p>A starting node does not merely open the log. It reads <b>every entry</b> back and applies
+     * it to the state machine, because with snapshots off the log IS the state. That is O(n) on
+     * <em>both</em> backends, and this benchmark is the one that says so — or does not.
+     *
+     * <p>It is the number the snapshot question actually turns on, and it should have existed
+     * before the claim did.
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    @OutputTimeUnit(TimeUnit.MILLISECONDS)
+    public long replayTheWholeLogIntoAStateMachine(RecoveryState state) {
+        state.store = open(state.impl, state.dir);
+
+        KeyValueStateMachine stateMachine = new KeyValueStateMachine();
+        long last = state.store.getLastLogIndex();
+        for (long i = state.store.getSnapshotIndex() + 1; i <= last; i++) {
+            LogEntry entry = state.store.getLogEntry(i);
+            stateMachine.apply(entry.getCommand().toByteArray());
+        }
+        return last;
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
