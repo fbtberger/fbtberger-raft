@@ -116,3 +116,29 @@ tasks.jar {
         attributes["Main-Class"] = "com.fbtberger.raft.RaftServer"
     }
 }
+
+// ---------------------------------------------------------------------------
+// JMH benchmarks (StorageBenchmark)
+//
+// Deliberately NOT wired into `build`. They take minutes and hammer the disk, and a benchmark
+// that fails the build for being 8% slower on a loaded laptop just teaches people to ignore the
+// build. They are a measuring instrument, not a gate.
+//
+// jmh-core and its annotation processor are already on the test classpath, so the benchmarks live
+// in src/test/java and need no separate source set:
+//
+//   ./gradlew jmh
+//   ./gradlew jmh -Pjmh.args="recoverFromAnExistingLog"
+//   ./gradlew jmh -Pjmh.args="-p impl=wal -p batchSize=10"
+// ---------------------------------------------------------------------------
+tasks.register<JavaExec>("jmh") {
+    group = "verification"
+    description = "Runs the JMH storage benchmarks (minutes, not seconds — see StorageBenchmark)."
+    dependsOn(tasks.testClasses)
+    mainClass.set("org.openjdk.jmh.Main")
+    classpath = sourceSets["test"].runtimeClasspath
+
+    // Default to the storage benchmarks; -Pjmh.args overrides entirely.
+    val extra = (project.findProperty("jmh.args") as String?) ?: "StorageBenchmark"
+    args = extra.split(" ").filter { it.isNotBlank() }
+}
