@@ -1308,7 +1308,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         ? CompletableFuture.completedFuture(ri)
                         : awaitApplied(ri).thenApply(v -> ri);
             }
-            ReadBarrier barrier = new ReadBarrier(ri, majority());
+            ReadBarrier barrier = new ReadBarrier(ri);
             pendingReadBarriers.add(barrier);
             for (String peerId : peerTransports.keySet()) {
                 replicateTo(peerId);
@@ -1354,18 +1354,38 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * Lease validity: true if a majority of the current configuration
      * (counting self) has acknowledged within the election timeout window.
      */
+    /**
+     * Do we still hold a lease — i.e. has a quorum acknowledged us within the election-timeout
+     * window?
+     *
+     * <p>This used to count acknowledgements only within {@code currentConfiguration} and compare
+     * them against a single {@code majority()}. During a configuration change that ignores
+     * C_old entirely: a leader that had lost contact with a majority of the servers it is being
+     * replaced by (or replacing) still reported a healthy lease — and therefore
+     * {@code isReadyToServe()}, a {@code leaseRead()}, and an UP health check.
+     */
     private boolean hasValidLease() {
         long now = System.currentTimeMillis();
         long window = ELECTION_TIMEOUT_MIN_MS;
-        int acked = 1; // count self
-        for (String peerId : currentConfiguration.keySet()) {
+
+        java.util.Set<String> fresh = new java.util.HashSet<>();
+        fresh.add(config.selfId());
+        for (String peerId : votingMembers()) {
             if (peerId.equals(config.selfId())) continue;
             Long lastAck = peerLastAckMs.get(peerId);
             if (lastAck != null && now - lastAck < window) {
-                acked++;
+                fresh.add(peerId);
             }
         }
-        return acked >= majority();
+        return Quorum.reached(fresh, currentConfiguration, oldConfiguration);
+    }
+
+    /** Every voting member, across both configurations while a change is in flight. */
+    private java.util.Set<String> votingMembers() {
+        java.util.Set<String> ids = new java.util.HashSet<>(currentConfiguration.keySet());
+        Map<String, String> old = oldConfiguration;
+        if (old != null) ids.addAll(old.keySet());
+        return ids;
     }
 
     private CompletableFuture<Void> awaitApplied(long targetIndex) {
@@ -1384,7 +1404,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     private void checkReadBarriers() {
         pendingReadBarriers.removeIf(barrier -> {
-            if (barrier.isConfirmed() && lastApplied.get() >= barrier.readIndex) {
+            if (confirmsLeadership(barrier) && lastApplied.get() >= barrier.readIndex) {
                 barrier.future.complete(barrier.readIndex);
                 return true;
             }
@@ -1392,19 +1412,36 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         });
     }
 
+    /**
+     * Has a quorum confirmed that we are still the leader (§6.4)? Correct across a configuration
+     * change: a majority of C_old AND of C_new, not a count over the union — see {@link Quorum}.
+     */
+    private boolean confirmsLeadership(ReadBarrier barrier) {
+        java.util.Set<String> acks = new java.util.HashSet<>(barrier.confirmed);
+        acks.add(config.selfId());   // the leader's own confirmation
+        return Quorum.reached(acks, currentConfiguration, oldConfiguration);
+    }
+
+    /**
+     * A pending ReadIndex (§6.4): the index a read must see, and who has confirmed our leadership
+     * so far.
+     *
+     * <p>It used to carry a single {@code needed} count and answer {@code confirmed.size() + 1 >=
+     * needed}. That is wrong during a configuration change: joint consensus requires a majority in
+     * C<sub>old</sub> AND in C<sub>new</sub>, which no count over the union can express (see
+     * {@link Quorum}). The barrier now just records WHO confirmed, and the node decides whether
+     * that is a quorum — using the same predicate as every other quorum decision.
+     */
     private static final class ReadBarrier {
         final long readIndex;
-        final int needed;
         final CompletableFuture<Long> future = new CompletableFuture<>();
         final java.util.Set<String> confirmed = ConcurrentHashMap.newKeySet();
 
-        ReadBarrier(long readIndex, int needed) {
+        ReadBarrier(long readIndex) {
             this.readIndex = readIndex;
-            this.needed = needed;
         }
 
         void confirm(String peerId) { confirmed.add(peerId); }
-        boolean isConfirmed() { return confirmed.size() + 1 >= needed; }
     }
 
     // ------------------------------------------------------------------
