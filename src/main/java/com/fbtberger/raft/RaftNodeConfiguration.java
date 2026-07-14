@@ -71,9 +71,19 @@ public class RaftNodeConfiguration {
         return RaftConfig.load(Path.of(configPath));
     }
 
+    /**
+     * The storage backend. {@code raft.storage.type} = {@code wal} (default) | {@code bdb} |
+     * {@code memory}.
+     *
+     * <p>Was a hard-coded {@code new BerkeleyDbStorage(...)}. The default is now the WAL — and
+     * selecting it migrates an existing Berkeley DB log in place first (see
+     * {@link RaftStorageFactory}). With snapshots off the log IS the persistence, so a backend swap
+     * without a migration is data loss dressed up as a config change.
+     */
     @Bean(destroyMethod = "close")
-    public RaftStorage raftStorage(RaftConfig config) {
-        return new BerkeleyDbStorage(config.dataDir().toFile());
+    public RaftStorage raftStorage(RaftConfig config,
+                                   @Value("${raft.storage.type:wal}") String storageType) {
+        return RaftStorageFactory.open(storageType, config.dataDir());
     }
 
     @Bean
