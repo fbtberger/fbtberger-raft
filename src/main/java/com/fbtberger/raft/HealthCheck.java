@@ -30,6 +30,27 @@ public final class HealthCheck {
     }
 
     /**
+     * Stricter than {@link #readiness()}: may this node <b>serve reads</b>? (v105)
+     *
+     * <p>Readiness alone is not enough, as an outage on the dev cluster showed: three nodes had an
+     * empty state machine — they applied nothing for hours — while still reporting UP, because
+     * "leader contact" only meant that bytes had arrived. This variant additionally requires that
+     * everything the leader has declared committed has actually been APPLIED here
+     * ({@link RaftNode#isCaughtUp()}). A node that is behind must say so, so that traffic goes
+     * elsewhere rather than being told the data does not exist.
+     */
+    public Status serving() {
+        if (!node.isReadyToServe()) {
+            return readinessStatus(node.role(), false, node.currentLeaderId());
+        }
+        if (!node.isCaughtUp()) {
+            return new Status(false, "behind: applied=" + node.appliedIndex()
+                    + " leaderCommit=" + node.leaderCommitSeen());
+        }
+        return readinessStatus(node.role(), true, node.currentLeaderId());
+    }
+
+    /**
      * Pure readiness-to-{@link Status} mapping. {@code readyToServe} decides UP/DOWN; role and
      * leader id only shape the human-readable message.
      */

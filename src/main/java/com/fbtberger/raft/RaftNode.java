@@ -94,6 +94,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final Map<String, Long> peerLastFailureLogMs = new ConcurrentHashMap<>();
     private final Map<String, String> peerLastFailure = new ConcurrentHashMap<>();
     private volatile long lastReplicationStatusLogMs = 0;
+    /** Highest commitIndex the leader has told us about — lets a follower know it is behind (v105). */
+    private volatile long leaderCommitSeen = 0;
     private static final long FAILURE_LOG_THROTTLE_MS = 5_000;
     private static final long REPLICATION_STATUS_INTERVAL_MS = 10_000;
 
@@ -639,8 +641,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             currentTerm = store.getCurrentTerm();
             currentLeaderId = request.getLeaderId();
-            lastLeaderContactMs = System.currentTimeMillis();
             resetElectionTimer();
+            // NOTE (v105): lastLeaderContactMs is deliberately NOT set here. It used to be — and
+            // that made "leader contact" mean "bytes arrived", not "AppendEntries was actually
+            // processed". A node that threw an exception on every AppendEntries (the truncateFrom
+            // bug, v104) therefore reported healthy readiness while replicating nothing at all,
+            // for hours. Contact is now recorded only on the paths that produce a response — the
+            // consistency-check rejection below, and the successful append at the end.
 
             // Rule 2: our log must actually have an entry at prevLogIndex
             // whose term matches, or we can't safely accept what follows it.
@@ -650,6 +657,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (request.getPrevLogIndex() > 0) {
                 long prevTerm = store.getTermAt(request.getPrevLogIndex());
                 if (prevTerm < 0 || prevTerm != request.getPrevLogTerm()) {
+                    // A rejection IS healthy contact: we answered, and the leader will back off
+                    // and retry from further back (§5.3).
+                    lastLeaderContactMs = System.currentTimeMillis();
                     return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(false).build();
                 }
             }
@@ -706,6 +716,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 applyCommittedEntries();
             }
 
+            lastLeaderContactMs = System.currentTimeMillis();
+            leaderCommitSeen = Math.max(leaderCommitSeen, request.getLeaderCommit());
             return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(true).build();
         } finally {
             lock.unlock();
@@ -990,6 +1002,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             if (response.getSuccess()) {
                 metrics.replicationSuccess();
+                // v105: the last error must not outlive the failure. It was still being printed
+                // in the replication status line for a peer that had long since recovered
+                // (match=348 lastAck=49ms lastError=UNAVAILABLE) — a diagnostic that lies is
+                // worse than none.
+                peerLastFailure.remove(peerId);
                 // §10.2.2: don't regress matchIndex if an older pipelined
                 // response arrives after a newer one already succeeded.
                 long currentMatch = matchIndex.getOrDefault(peerId, 0L);
@@ -1208,6 +1225,25 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * The current commit index — the highest log index known to be committed on this node.
      * A direct read; for a linearizable, leader-confirmed value use {@link #readIndex()}.
      */
+    /**
+     * The highest commit index the LEADER has reported to this node (v105). A follower compares it
+     * with its own {@link #appliedIndex()} to answer "am I actually up to date?" — the question
+     * nobody could answer during the outage, when three nodes had an empty state machine and
+     * nonetheless reported healthy.
+     */
+    public long leaderCommitSeen() {
+        return Math.max(leaderCommitSeen, commitIndex.get());
+    }
+
+    /**
+     * Is this node caught up enough to serve reads? A leader always is. A follower must have heard
+     * from the leader recently AND have applied everything the leader said was committed.
+     */
+    public boolean isCaughtUp() {
+        if (role == ServerRole.LEADER) return isReadyToServe();
+        return isReadyToServe() && appliedIndex() >= leaderCommitSeen();
+    }
+
     public long commitIndex() {
         return commitIndex.get();
     }
