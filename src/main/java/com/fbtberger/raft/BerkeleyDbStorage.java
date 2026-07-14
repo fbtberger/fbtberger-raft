@@ -228,18 +228,35 @@ public final class BerkeleyDbStorage implements RaftStorage {
     @Override
     public synchronized void truncateFrom(long fromIndexInclusive) {
         Transaction txn = env.beginTransaction(null, null);
-        try (Cursor cursor = logDb.openCursor(txn, null)) {
-            DatabaseEntry key = new DatabaseEntry(longToBytes(fromIndexInclusive));
-            DatabaseEntry value = new DatabaseEntry();
-            OperationStatus status = cursor.getSearchKeyRange(key, value, LockMode.DEFAULT);
-            while (status == OperationStatus.SUCCESS) {
-                cursor.delete();
-                status = cursor.getNext(key, value, LockMode.DEFAULT);
-            }
+        boolean committed = false;
+        try {
+            // The cursor MUST be closed before the transaction is committed. Committing while a
+            // cursor is still open makes Berkeley DB throw
+            // "Transaction N commit failed because there were open cursors" — which is exactly
+            // what happened here: the commit sat INSIDE the try-with-resources, so the cursor was
+            // still open. Every truncate therefore failed, forever.
+            //
+            // The blast radius was far worse than the typo suggests. truncateFrom() is only
+            // reached by a follower that has to catch up (AppendEntries rule 3), so a node that
+            // never fell behind never touched it — while a node that DID fall behind rejected the
+            // leader's log with an unhandled exception, the leader reset nextIndex to 1, resent
+            // the entire log, and the receiver threw again: an endless loop. Three of five nodes
+            // sat with an empty state machine for hours; the cluster looked healthy because the
+            // remaining two still formed a majority, and clients reading from the empty nodes were
+            // told their games did not exist.
+            try (Cursor cursor = logDb.openCursor(txn, null)) {
+                DatabaseEntry key = new DatabaseEntry(longToBytes(fromIndexInclusive));
+                DatabaseEntry value = new DatabaseEntry();
+                OperationStatus status = cursor.getSearchKeyRange(key, value, LockMode.DEFAULT);
+                while (status == OperationStatus.SUCCESS) {
+                    cursor.delete();
+                    status = cursor.getNext(key, value, LockMode.DEFAULT);
+                }
+            }   // ← cursor closed here, before the commit
             txn.commit();
-        } catch (RuntimeException e) {
-            txn.abort();
-            throw e;
+            committed = true;
+        } finally {
+            if (!committed) txn.abort();
         }
         if (fromIndexInclusive <= lastLogIndex) {
             long newLastIndex = fromIndexInclusive - 1;
