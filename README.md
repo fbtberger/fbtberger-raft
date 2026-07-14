@@ -139,8 +139,11 @@ fbtberger-raft/
         ├── HealthCheckTest.java                # liveness + readiness tests
         ├── RaftClientGrpcServiceTest.java      # client RPC tests
         ├── RaftNodeConfigurationTest.java      # Spring wiring tests
-        ├── InMemoryStorageTest.java            # storage contract tests
-        ├── WalStorageTest.java                 # WAL storage, segmentation + recovery
+        ├── RaftStorageContract.java            # ONE invariant set for every RaftStorage impl
+        ├── InMemoryStorageContractTest.java    #   -> in-memory (durability tests skipped)
+        ├── BerkeleyDbStorageContractTest.java  #   -> Berkeley DB, real environment on disk
+        ├── WalStorageContractTest.java         #   -> segmented write-ahead log
+        ├── WalStorageSegmentTest.java          # WAL-only: rollover, truncate across segments
         ├── KeyValueStateMachineTest.java       # state machine tests
         ├── RaftBenchmark.java                  # JMH performance benchmarks
         └── transport/

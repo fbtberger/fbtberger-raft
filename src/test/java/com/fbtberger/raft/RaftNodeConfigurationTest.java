@@ -22,8 +22,8 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>These tests exercise the Spring wiring layer specifically. The behaviour
  * of the individual beans is covered by the unit tests in
- * {@link RaftNodeTest}, {@link InMemoryStorageTest}, and
- * {@link KeyValueStateMachineTest}.
+ * {@link RaftNodeTest}, {@link RaftStorageContract} (run against every
+ * {@link RaftStorage} implementation), and {@link KeyValueStateMachineTest}.
  */
 @SpringJUnitConfig(RaftNodeTestConfiguration.class)
 class RaftNodeConfigurationTest {
