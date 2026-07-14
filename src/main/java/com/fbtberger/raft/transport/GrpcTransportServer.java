@@ -21,6 +21,8 @@ import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.netty.shaded.io.netty.handler.ssl.ClientAuth;
 import io.grpc.stub.StreamObserver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import javax.net.ssl.SSLException;
@@ -70,16 +72,34 @@ public final class GrpcTransportServer implements RaftTransportServer {
     public Server grpcServer() { return server; }
 
     public static final class RaftServiceAdapter extends RaftServiceGrpc.RaftServiceImplBase {
+
+        private static final Logger LOG = LoggerFactory.getLogger(GrpcTransportServer.class);
+
         private final RaftRpcHandler handler;
 
         public RaftServiceAdapter(RaftRpcHandler handler) { this.handler = handler; }
+
+        /**
+         * v102 — an exception in an RPC handler used to be answered with {@code observer.onError(e)}
+         * and logged NOWHERE. gRPC turns it into a bare {@code UNKNOWN} on the caller's side, so the
+         * leader reported "AppendEntries fehlgeschlagen: UNKNOWN" while the node that actually threw
+         * said nothing at all. A follower can reject the entire log forever that way — the leader
+         * resets nextIndex to 1, resends everything, the receiver throws again — with no way to find
+         * out why. The receiving side is the only one that knows; it has to say so.
+         */
+        private static <T> void fail(String rpc, RuntimeException e,
+                                     StreamObserver<T> observer, String context) {
+            LOG.error("Raft-RPC {} fehlgeschlagen{}", rpc,
+                    context.isEmpty() ? "" : " (" + context + ")", e);
+            observer.onError(e);
+        }
 
         @Override
         public void requestVote(RequestVoteRequest request, StreamObserver<RequestVoteResponse> observer) {
             try {
                 observer.onNext(handler.handleRequestVote(request));
                 observer.onCompleted();
-            } catch (RuntimeException e) { observer.onError(e); }
+            } catch (RuntimeException e) { fail("RequestVote", e, observer, ""); }
         }
 
         @Override
@@ -87,7 +107,13 @@ public final class GrpcTransportServer implements RaftTransportServer {
             try {
                 observer.onNext(handler.handleAppendEntries(request));
                 observer.onCompleted();
-            } catch (RuntimeException e) { observer.onError(e); }
+            } catch (RuntimeException e) {
+                fail("AppendEntries", e, observer,
+                        "prevLogIndex=" + request.getPrevLogIndex()
+                                + " entries=" + request.getEntriesCount()
+                                + " leaderCommit=" + request.getLeaderCommit()
+                                + " term=" + request.getTerm());
+            }
         }
 
         @Override
@@ -95,7 +121,7 @@ public final class GrpcTransportServer implements RaftTransportServer {
             try {
                 observer.onNext(handler.handleInstallSnapshot(request));
                 observer.onCompleted();
-            } catch (RuntimeException e) { observer.onError(e); }
+            } catch (RuntimeException e) { fail("InstallSnapshot", e, observer, ""); }
         }
 
         @Override
@@ -103,7 +129,7 @@ public final class GrpcTransportServer implements RaftTransportServer {
             try {
                 observer.onNext(handler.handlePreVote(request));
                 observer.onCompleted();
-            } catch (RuntimeException e) { observer.onError(e); }
+            } catch (RuntimeException e) { fail("PreVote", e, observer, ""); }
         }
 
         @Override
@@ -111,7 +137,7 @@ public final class GrpcTransportServer implements RaftTransportServer {
             try {
                 observer.onNext(handler.handleTimeoutNow(request));
                 observer.onCompleted();
-            } catch (RuntimeException e) { observer.onError(e); }
+            } catch (RuntimeException e) { fail("TimeoutNow", e, observer, ""); }
         }
     }
 }
