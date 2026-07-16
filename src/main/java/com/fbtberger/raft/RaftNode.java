@@ -711,13 +711,23 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
             // Rule 5: pull commitIndex forward to whatever the leader says
             // is safe, capped at the last entry we actually just stored.
+            //
+            // v116: record what the leader says is committed BEFORE applying. During a chunked
+            // catch-up this batch may carry only part of what the leader has committed, so
+            // commitIndex below is capped at lastNewIndex while leaderCommit runs ahead.
+            // maybeTakeSnapshotLocked() (reached from applyCommittedEntries) gates on
+            // appliedIndex() >= leaderCommitSeen() to refuse compaction mid-catch-up -- but only
+            // if leaderCommitSeen already reflects the leader's true commit. Left below the apply
+            // call, leaderCommitSeen() would still read the capped commitIndex during a partial
+            // batch and the gate would be blind. This assignment is monotonic (max), so recording
+            // it a few statements earlier changes nothing an outside observer can see.
+            leaderCommitSeen = Math.max(leaderCommitSeen, request.getLeaderCommit());
             if (request.getLeaderCommit() > commitIndex.get()) {
                 commitIndex.set(Math.min(request.getLeaderCommit(), lastNewIndex));
                 applyCommittedEntries();
             }
 
             lastLeaderContactMs = System.currentTimeMillis();
-            leaderCommitSeen = Math.max(leaderCommitSeen, request.getLeaderCommit());
             return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(true).build();
         } finally {
             lock.unlock();
@@ -1134,6 +1144,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private void maybeTakeSnapshotLocked() {
         if (snapshotInProgress) return;
         if (lastApplied.get() - store.getSnapshotIndex() < config.snapshotThreshold()) {
+            return;
+        }
+        // v116: never compact while still catching up. applyCommittedEntries() runs after every
+        // batch, including the partial batches a lagging follower/learner receives during catch-up
+        // (commitIndex is capped at the last entry actually stored). The threshold can therefore be
+        // crossed at an intermediate index while the leader has committed far beyond it -- and
+        // snapshotting there would fold a mid-catch-up state and discard the log up to it before
+        // the remaining entries are even applied. Only snapshot once level with what the leader
+        // says is committed: the caught-up predicate from isCaughtUp() (v105) minus the lease
+        // clause. A lagging lease must not stop a learner from compacting; a lagging apply must.
+        // On the leader leaderCommitSeen() collapses to commitIndex, which lastApplied has just
+        // been driven up to, so this is transparent there.
+        if (appliedIndex() < leaderCommitSeen()) {
             return;
         }
         takeSnapshotAsync();
