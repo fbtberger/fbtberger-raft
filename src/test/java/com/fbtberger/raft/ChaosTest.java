@@ -40,8 +40,16 @@ class ChaosTest {
     private final Map<String, RaftNode> nodes = new HashMap<>();
     private final Map<String, KeyValueStateMachine> machines = new HashMap<>();
     private final Map<String, Map<String, PartitionableTransport>> peerTransports = new HashMap<>();
+    // v117: partition / loss state lives per DIRECTED EDGE (fromNode -> toNode), independently of
+    // the transport instance. The leader may now rebuild a peer's transport on persistent failure
+    // (RaftNode v117); a partition must survive that — a fresh channel over a partitioned link is
+    // still partitioned. Storing the state on the disposable transport made a rebuild silently heal
+    // the partition. Keyed [fromNode][toNode], created once, reused by every rebuilt transport.
+    private final Map<String, Map<String, LinkState>> linkStates = new java.util.concurrent.ConcurrentHashMap<>();
     private final List<Server> servers = new ArrayList<>();
-    private final List<ManagedChannel> channels = new ArrayList<>();
+    // v117: rebuilds create channels at runtime from multiple node threads, so this must be
+    // thread-safe (was a plain ArrayList, only written single-threaded at startup before).
+    private final List<ManagedChannel> channels = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     @AfterEach
     void tearDown() {
@@ -156,10 +164,15 @@ class ChaosTest {
                         .directExecutor().build();
                 channels.add(ch);
                 GrpcTransport base = new GrpcTransport(ch);
-                PartitionableTransport pt = new PartitionableTransport(base);
                 String peerId = ids.stream()
                         .filter(pid -> ("chaos-" + pid).equals(peerAddress))
                         .findFirst().orElseThrow();
+                // Reuse the persistent per-edge state so a rebuilt transport inherits any partition
+                // / loss already in effect (v117).
+                LinkState link = linkStates
+                        .computeIfAbsent(nodeId, k -> new java.util.concurrent.ConcurrentHashMap<>())
+                        .computeIfAbsent(peerId, k -> new LinkState());
+                PartitionableTransport pt = new PartitionableTransport(base, link);
                 peerTransports.get(nodeId).put(peerId, pt);
                 return pt;
             }, RaftMetrics.noop());
@@ -175,23 +188,21 @@ class ChaosTest {
     }
 
     private void partition(String nodeId) {
-        for (var entry : peerTransports.entrySet()) {
-            if (entry.getKey().equals(nodeId)) {
-                entry.getValue().values().forEach(PartitionableTransport::partition);
-            } else {
-                PartitionableTransport pt = entry.getValue().get(nodeId);
-                if (pt != null) pt.partition();
-            }
-        }
+        forEachLinkTouching(nodeId, ls -> ls.partitioned.set(true));
     }
 
     private void heal(String nodeId) {
-        for (var entry : peerTransports.entrySet()) {
-            if (entry.getKey().equals(nodeId)) {
-                entry.getValue().values().forEach(PartitionableTransport::heal);
+        forEachLinkTouching(nodeId, ls -> { ls.partitioned.set(false); ls.lossRate = 0.0; });
+    }
+
+    /** Applies {@code op} to every directed edge into or out of {@code nodeId} (both directions). */
+    private void forEachLinkTouching(String nodeId, java.util.function.Consumer<LinkState> op) {
+        for (var from : linkStates.entrySet()) {
+            if (from.getKey().equals(nodeId)) {
+                from.getValue().values().forEach(op);            // outgoing from nodeId
             } else {
-                PartitionableTransport pt = entry.getValue().get(nodeId);
-                if (pt != null) pt.heal();
+                LinkState ls = from.getValue().get(nodeId);      // incoming to nodeId
+                if (ls != null) op.accept(ls);
             }
         }
     }
@@ -203,14 +214,7 @@ class ChaosTest {
     }
 
     private void setPacketLoss(String nodeId, double rate) {
-        for (var entry : peerTransports.entrySet()) {
-            if (entry.getKey().equals(nodeId)) {
-                entry.getValue().values().forEach(pt -> pt.setLossRate(rate));
-            } else {
-                PartitionableTransport pt = entry.getValue().get(nodeId);
-                if (pt != null) pt.setLossRate(rate);
-            }
-        }
+        forEachLinkTouching(nodeId, ls -> ls.lossRate = rate);
     }
 
     private String otherNode(String excludeId) {
@@ -239,19 +243,24 @@ class ChaosTest {
         return RaftConfig.load(tmp);
     }
 
+    /** Per directed edge (fromNode -> toNode); shared across every transport rebuilt for that edge. */
+    static final class LinkState {
+        final AtomicBoolean partitioned = new AtomicBoolean(false);
+        volatile double lossRate = 0.0;
+    }
+
     static final class PartitionableTransport implements RaftTransport {
         private final RaftTransport delegate;
-        private final AtomicBoolean partitioned = new AtomicBoolean(false);
-        private volatile double lossRate = 0.0;
+        private final LinkState link;
         private final java.util.Random rng = new java.util.Random();
 
-        PartitionableTransport(RaftTransport delegate) { this.delegate = delegate; }
-        void partition() { partitioned.set(true); }
-        void heal() { partitioned.set(false); lossRate = 0.0; }
-        void setLossRate(double rate) { this.lossRate = rate; }
+        PartitionableTransport(RaftTransport delegate, LinkState link) {
+            this.delegate = delegate;
+            this.link = link;
+        }
 
         private boolean shouldDrop() {
-            return partitioned.get() || (lossRate > 0 && rng.nextDouble() < lossRate);
+            return link.partitioned.get() || (link.lossRate > 0 && rng.nextDouble() < link.lossRate);
         }
 
         @Override public CompletableFuture<RequestVoteResponse> requestVote(RequestVoteRequest r) {

@@ -93,6 +93,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // it (seen on kwatro-1: log stuck at 336, state machine empty, leader silent).
     private final Map<String, Long> peerLastFailureLogMs = new ConcurrentHashMap<>();
     private final Map<String, String> peerLastFailure = new ConcurrentHashMap<>();
+    // v117 — consecutive replication transport failures per peer. A plain gRPC channel that has
+    // gone into a persistent io-failure against a peer which was recreated (new container / new
+    // IP) does not reliably re-resolve and reconnect on its own — it can hammer the dead
+    // connection indefinitely while the peer sits at a stale index (the "learner stuck at 0,
+    // leader silent" signature). After MAX_CONSECUTIVE_FAILURES_BEFORE_REBUILD in a row we discard
+    // the cached transport and build a fresh one; reset to 0 on any success or after a rebuild.
+    private final Map<String, Integer> peerConsecutiveFailures = new ConcurrentHashMap<>();
+    private static final int MAX_CONSECUTIVE_FAILURES_BEFORE_REBUILD = 3;
+    // Bound the churn: the common case is ONE dead peer under a healthy leader, which would
+    // otherwise rebuild every few heartbeats until the peer returns. Rebuild at most this often
+    // per peer; the first rebuild after an outage still fires immediately (lastRebuild defaults 0).
+    private final Map<String, Long> peerLastRebuildMs = new ConcurrentHashMap<>();
+    private static final long REBUILD_COOLDOWN_MS = 2_000;
     private volatile long lastReplicationStatusLogMs = 0;
     /** Highest commitIndex the leader has told us about — lets a follower know it is behind (v105). */
     private volatile long leaderCommitSeen = 0;
@@ -893,6 +906,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     peerInflight.merge(peerId, -1, Integer::sum);
                     long confirmed = matchIndex.getOrDefault(peerId, 0L);
                     nextIndex.put(peerId, Math.max(1, confirmed + 1));
+                    // v117: after enough consecutive transport failures, the cached channel is
+                    // presumed stuck (peer recreated, connection dead but not self-healing).
+                    // Discard it and build a fresh one — a new channel re-resolves DNS and
+                    // reconnects, which is what actually un-sticks a peer left at a stale index.
+                    int fails = peerConsecutiveFailures.merge(peerId, 1, Integer::sum);
+                    if (fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REBUILD
+                            && System.currentTimeMillis()
+                                - peerLastRebuildMs.getOrDefault(peerId, 0L) >= REBUILD_COOLDOWN_MS) {
+                        peerLastRebuildMs.put(peerId, System.currentTimeMillis());
+                        rebuildTransportLocked(peerId);
+                    }
                 } finally {
                     lock.unlock();
                 }
@@ -902,9 +926,39 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 logThrottled(peerId, "AppendEntries fehlgeschlagen (prevLogIndex=" + prevLogIndex
                         + ", entries=" + entries.size() + "): " + t);
             } else {
+                peerConsecutiveFailures.put(peerId, 0);   // the transport is healthy again
+                peerLastRebuildMs.remove(peerId);
                 handleAppendEntriesResponse(peerId, currentTerm, lastSentIndex, response);
             }
         });
+    }
+
+    /**
+     * Discards a peer's cached transport and builds a fresh one (§v117). A new channel performs a
+     * fresh DNS resolution and a fresh connection, healing a channel stuck against a peer that has
+     * been recreated. Caller must hold {@code lock}. No-op if the peer is no longer a replication
+     * target (its address is gone from every configuration map).
+     */
+    private void rebuildTransportLocked(String peerId) {
+        String address = addressOf(peerId);
+        if (address == null) return;
+        RaftTransport old = peerTransports.remove(peerId);
+        if (old != null) {
+            try { old.close(); } catch (RuntimeException ignored) { /* best effort */ }
+        }
+        peerTransports.put(peerId, transportFactory.connect(address));
+        peerConsecutiveFailures.put(peerId, 0);
+        log("Peer-Transport zu " + peerId + " (" + address + ") nach "
+                + MAX_CONSECUTIVE_FAILURES_BEFORE_REBUILD + " Fehlern in Folge neu aufgebaut");
+    }
+
+    /** The current "host:port" for a peer, looked up across every configuration map. */
+    private String addressOf(String peerId) {
+        String a = currentConfiguration.get(peerId);
+        if (a == null) a = currentLearners.get(peerId);
+        if (a == null && oldConfiguration != null) a = oldConfiguration.get(peerId);
+        if (a == null) a = config.peerAddresses().get(peerId);
+        return a;
     }
 
     /**
