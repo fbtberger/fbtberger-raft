@@ -643,7 +643,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
             // Rule 1: a leader from an earlier term is stale; reject it.
             if (request.getTerm() < currentTerm) {
-                return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(false).build();
+                return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(false)
+                        .setConflictLastLogIndex(store.getLastLogIndex()).build();
             }
 
             // A request with term >= currentTerm proves a legitimate leader
@@ -673,7 +674,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     // A rejection IS healthy contact: we answered, and the leader will back off
                     // and retry from further back (§5.3).
                     lastLeaderContactMs = System.currentTimeMillis();
-                    return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(false).build();
+                    // v118: tell the leader how far our log actually reaches. A wiped peer reports 0,
+                    // so the leader can drop nextIndex to 1 (<= snapshotIndex) and switch to
+                    // InstallSnapshot in a single round instead of pinning at a stale matchIndex.
+                    return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(false)
+                            .setConflictLastLogIndex(store.getLastLogIndex()).build();
                 }
             }
 
@@ -1091,10 +1096,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 }
             } else {
                 metrics.replicationFailure();
-                // §10.2.2: revert optimistic nextIndex to last confirmed
-                // position. The next heartbeat tick will retry from there.
-                long confirmed = matchIndex.getOrDefault(peerId, 0L);
-                nextIndex.put(peerId, Math.max(1, confirmed + 1));
+                // §10.2.2 + v118: a rejection proves the follower does NOT hold the entry at the
+                // prevLogIndex we sent, so any matchIndex we recorded at/above it is a lie. Normally
+                // impossible — but a wiped/rebuilt peer truncates its log back to 0 while the leader
+                // still holds its pre-wipe (high) matchIndex. Clamping nextIndex to matchIndex+1 then
+                // pins it above snapshotIndex forever and replicateTo never switches to InstallSnapshot
+                // (the "learner stuck at 0, leader silent" tail that outlives the v117 transport fix).
+                // Use the follower's reported last index to pull BOTH pointers down — monotonically,
+                // since a rejection can only ever reveal the follower has less than we assumed. Capped
+                // at lastSentIndex so nextIndex always drops strictly below the index that just failed.
+                long hint = response.getConflictLastLogIndex();
+                matchIndex.merge(peerId, hint, (cur, h) -> Math.min(cur, h));
+                nextIndex.put(peerId, Math.max(1, Math.min(hint + 1, lastSentIndex)));
             }
         } finally {
             lock.unlock();

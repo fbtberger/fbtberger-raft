@@ -78,6 +78,12 @@ message AppendEntriesRequest {
 message AppendEntriesResponse {
   int64 term = 1;
   bool success = 2;
+  // v118: on a rejection, the follower's own last log index. The leader uses it to back
+  // nextIndex/matchIndex down past a stale-high matchIndex — the case where a peer was wiped
+  // (log truncated back) while the leader still held its pre-wipe match, which otherwise pins
+  // nextIndex above snapshotIndex forever and the InstallSnapshot switch never fires. Unset (0)
+  // on success. Also correct for a normal shorter follower; only advisory, never trusted upward.
+  int64 conflictLastLogIndex = 3;
 }
 
 // InstallSnapshot RPC (§7, Figure 13), used by a leader instead of
