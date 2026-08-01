@@ -78,8 +78,8 @@ public class RaftNodeConfiguration {
      * <p>Was a hard-coded {@code new BerkeleyDbStorage(...)}; v113 made it a property and briefly
      * defaulted to the WAL, until the benchmarks said otherwise (see {@link RaftStorageFactory}).
      * Selecting a backend migrates from the other one first if that one's log is further ahead —
-     * with snapshots off the log IS the persistence, so a backend swap without a migration is data
-     * loss dressed up as a config change.
+     * the on-disk log plus the latest snapshot ARE the persistence, so a backend swap without a
+     * migration is data loss dressed up as a config change.
      */
     @Bean(destroyMethod = "close")
     public RaftStorage raftStorage(RaftConfig config,

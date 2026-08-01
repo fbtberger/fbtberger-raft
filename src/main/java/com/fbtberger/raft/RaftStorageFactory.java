@@ -34,8 +34,9 @@ import java.util.Locale;
  * cost. It simply does less for Berkeley DB, which already groups its writes.)
  *
  * <h2>Changing the backend is a data migration</h2>
- * Selecting a backend runs {@link StorageMigration#reconcile} first, in EITHER direction. With
- * snapshots off the log IS the persistence, so a node that starts on a stale or empty log comes up
+ * Selecting a backend runs {@link StorageMigration#reconcile} first, in EITHER direction. The
+ * on-disk log plus the latest snapshot ARE the persistence (the migration carries the snapshot
+ * over too), so a node that starts on a stale or empty log comes up
  * with the wrong state machine and reports itself healthy. Whichever log on disk is further ahead
  * wins; the other is moved aside, never deleted.
  */

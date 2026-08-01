@@ -26,8 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Moving the log between storage backends.
  *
- * <p>This decides whether changing the backend is a config change or a data-loss incident. With
- * snapshots off — how kwatro runs — <b>the log IS the persistence</b>. A node that starts on an
+ * <p>This decides whether changing the backend is a config change or a data-loss incident. The
+ * on-disk log plus the latest snapshot ARE the persistence. A node that starts on an
  * empty or stale log comes up with the wrong state machine and reports {@code UP}, because the
  * surviving voters still form a majority. That is July, self-inflicted.
  */

@@ -216,7 +216,7 @@ public class StorageBenchmark {
     // ── 3. the cost of every deploy, forever ─────────────────────────────────
 
     /**
-     * Startup with snapshots off, which is how kwatro runs: the entire log is replayed. This is not
+     * Startup from an empty snapshot boundary (worst case): the entire log is replayed. This is not
      * a micro-benchmark — it is the deploy.
      *
      * <p>Its own {@code @State}, because the log has to be built once and then re-opened over and
@@ -289,7 +289,7 @@ public class StorageBenchmark {
      * number it leaned on.
      *
      * <p>A starting node does not merely open the log. It reads <b>every entry</b> back and applies
-     * it to the state machine, because with snapshots off the log IS the state. That is O(n) on
+     * it to the state machine, because everything past the snapshot boundary lives only in the log. That is O(n) on
      * <em>both</em> backends, and this benchmark is the one that says so — or does not.
      *
      * <p>It is the number the snapshot question actually turns on, and it should have existed

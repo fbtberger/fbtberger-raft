@@ -26,7 +26,8 @@ import java.util.function.Predicate;
  * Keeps the on-disk log correct when the storage backend changes.
  *
  * <h2>Why this is not just "copy A to B"</h2>
- * With snapshots disabled — how kwatro runs — <b>the log IS the persistence</b>. Switching backends
+ * <b>The on-disk log plus the latest snapshot ARE the persistence</b> (snapshots are enabled;
+ * kwatro runs with a threshold of 1000 on dev / 300 in prod). Switching backends
  * is a data migration, and a node that starts on an empty or stale log comes up with a wrong state
  * machine while the cluster reports {@code UP}, because the remaining voters still form a majority.
  * That is the July picture, self-inflicted.
