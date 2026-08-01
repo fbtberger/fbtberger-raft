@@ -179,6 +179,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final Random random = new Random();
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTask;
+
+    // v119 -- staleness guard for the election timer.
+    //
+    // ScheduledFuture.cancel(false) does NOT stop a task that has already begun
+    // running, and a scheduled startElection() that is blocked on lock.lock() has
+    // already begun. Every cancel() below is therefore best-effort only: the task
+    // it "cancelled" may still be sitting on the lock, and will proceed the moment
+    // whoever holds the lock lets go -- by which point the node may have already
+    // become CANDIDATE, LEADER, or heard from a live leader.
+    //
+    // The epoch closes that window. resetElectionTimer() bumps it and hands the new
+    // value to the task it schedules; a task whose captured epoch no longer matches
+    // is by definition stale and aborts. Anything that legitimately invalidates a
+    // pending election -- a timer reset, a step-down, winning an election -- moves
+    // the epoch, so no separate bookkeeping is needed at each site.
+    private final AtomicLong electionEpoch = new AtomicLong();
     // Guards resetElectionTimer: a node that has not been formally started
     // (i.e. start() has not been called) must not schedule election timers,
     // because it may be receiving RPCs from a leader before being officially
@@ -268,9 +284,31 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
         if (electionTimer != null) electionTimer.cancel(false);
+        // Invalidate any previously scheduled task, including one that cancel(false)
+        // could not stop because it was already running (blocked on `lock`).
+        long epoch = electionEpoch.incrementAndGet();
         int timeoutMs = ELECTION_TIMEOUT_MIN_MS
                 + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS + 1);
-        electionTimer = scheduler.schedule(this::startElection, timeoutMs, TimeUnit.MILLISECONDS);
+        electionTimer = scheduler.schedule(() -> startElectionIfCurrent(epoch), timeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Entry point for a <em>scheduled</em> election attempt. Re-validates, after
+     * acquiring the lock, that the timer that scheduled this task is still the
+     * current one -- see {@link #electionEpoch}. A stale task returns silently:
+     * it must not reset the timer either, because a live one already exists.
+     */
+    // Package-private (not private) so the election tests can drive this seam directly:
+    // the scheduler is node-internal, so a stale timer task cannot otherwise be reproduced
+    // without a probabilistic race.
+    void startElectionIfCurrent(long scheduledEpoch) {
+        lock.lock();
+        try {
+            if (scheduledEpoch != electionEpoch.get()) return;
+            startElection();
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -279,9 +317,14 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * recently. Only if the PreVote succeeds does the real election start.
      * Single-node clusters skip PreVote and elect immediately.
      */
-    private void startElection() {
+    // Package-private for the election tests -- see startElectionIfCurrent.
+    void startElection() {
         lock.lock();
         try {
+            // v119: a leader has nothing to elect. The epoch guard above already
+            // drops a stale timer task, but this states the invariant directly and
+            // covers any future caller that does not come through the timer.
+            if (role == ServerRole.LEADER) return;
             if (!currentConfiguration.containsKey(config.selfId())) {
                 resetElectionTimer();
                 return;
@@ -353,6 +396,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     private void startRealElection(long newTerm) {
+        // v119: two independent ways in, both of which can arrive late.
+        //
+        //  * role == LEADER -- we already won a term; bumping it now would discard
+        //    our own no-op and every client entry accepted since, all uncommitted,
+        //    for nothing.
+        //  * newTerm <= currentTerm -- a grant from a PreVote round that has already
+        //    been decided (or superseded). Since proposedTerm is always
+        //    currentTerm + 1 at the time the round starts, this single comparison
+        //    marks the round consumed: the first grant to cross the threshold moves
+        //    currentTerm to newTerm, and every later grant of that round fails here.
+        //    No separate round-ID bookkeeping is needed.
+        if (role == ServerRole.LEADER || newTerm <= store.getCurrentTerm()) return;
         role = ServerRole.CANDIDATE;
         currentLeaderId = null;
         store.setTermAndVote(newTerm, config.selfId());
@@ -409,6 +464,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         currentLeaderId = config.selfId();
         metrics.electionWon();
         log("elected LEADER for term " + store.getCurrentTerm());
+        // v119: cancel(false) cannot stop an election task that is already running
+        // and merely waiting for this lock. Moving the epoch makes such a task abort
+        // when it finally gets in. Without this, a task scheduled a moment before we
+        // won would proceed to run a full PreVote round for term+1 and unseat us.
+        electionEpoch.incrementAndGet();
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTask != null) heartbeatTask.cancel(false);
 
@@ -521,6 +581,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * configuration that removed us from the cluster (§6).
      */
     private void becomeFollowerLocked(long newTerm) {
+        ServerRole previousRole = role;
+        long previousTerm = store.getCurrentTerm();
         if (newTerm > store.getCurrentTerm()) {
             store.setTermAndVote(newTerm, null);
         }
@@ -539,6 +601,14 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         pendingReadBarriers.clear();
         oldConfiguration = null;
         metrics.stepDown();
+        // v119: this used to be entirely silent -- only metrics.stepDown() recorded it.
+        // A step-down is the single most load-bearing event when reading an election
+        // trace, and its absence from the log was read (in issue B) as proof that no
+        // step-down had happened. Absence of a log line was never evidence of absence.
+        if (previousRole != ServerRole.FOLLOWER || newTerm > previousTerm) {
+            log("stepping down: " + previousRole + " term " + previousTerm
+                    + " -> FOLLOWER term " + store.getCurrentTerm());
+        }
         role = ServerRole.FOLLOWER;
         resetElectionTimer();
     }
@@ -1115,16 +1185,6 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
-     * Looks for the highest index that is both replicated on a majority of
-     * the *current* configuration's servers and was created in our own
-     * current term, and moves commitIndex up to it. Entries from earlier
-     * terms only become committed indirectly, once a later entry that
-     * covers them commits -- never by counting their own replica count
-     * directly (§5.4.2). The majority required is recomputed from
-     * {@link #currentConfiguration} every time, since a reconfiguration can
-     * change it while entries are still being committed (§6).
-     */
-    /**
      * §10.2.1: called (possibly from the storage sync thread) when the
      * leader's own disk write has been durably fsynced. Advances the
      * leader's match index and tries to commit.
@@ -1142,6 +1202,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
+    /**
+     * Looks for the highest index that is both replicated on a majority of
+     * the *current* configuration's servers and was created in our own
+     * current term, and moves commitIndex up to it. Entries from earlier
+     * terms only become committed indirectly, once a later entry that
+     * covers them commits -- never by counting their own replica count
+     * directly (§5.4.2). The majority required is recomputed from
+     * {@link #currentConfiguration} every time, since a reconfiguration can
+     * change it while entries are still being committed (§6).
+     */
     private void advanceCommitIndex() {
         long currentTerm = store.getCurrentTerm();
         long lastLogIndex = store.getLastLogIndex();
@@ -1312,10 +1382,6 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
-     * The current commit index — the highest log index known to be committed on this node.
-     * A direct read; for a linearizable, leader-confirmed value use {@link #readIndex()}.
-     */
-    /**
      * The highest commit index the LEADER has reported to this node (v105). A follower compares it
      * with its own {@link #appliedIndex()} to answer "am I actually up to date?" — the question
      * nobody could answer during the outage, when three nodes had an empty state machine and
@@ -1334,6 +1400,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         return isReadyToServe() && appliedIndex() >= leaderCommitSeen();
     }
 
+    /**
+     * The current commit index — the highest log index known to be committed on this node.
+     * A direct read; for a linearizable, leader-confirmed value use {@link #readIndex()}.
+     */
     public long commitIndex() {
         return commitIndex.get();
     }
@@ -1440,10 +1510,6 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
-    /**
-     * Lease validity: true if a majority of the current configuration
-     * (counting self) has acknowledged within the election timeout window.
-     */
     /**
      * Do we still hold a lease — i.e. has a quorum acknowledged us within the election-timeout
      * window?
@@ -1637,17 +1703,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     // ------------------------------------------------------------------
-    // Cluster reconfiguration (§6): membership changes one server at a
-    // time. Changing only a single member per step guarantees the old and
-    // new configurations' majorities always share at least one server, so
-    // -- unlike an arbitrary multi-server change -- this can never produce
-    // two disjoint majorities that elect two different leaders for the
-    // same term. That's what lets this skip the general-case joint
-    // consensus (C_old,new) machinery the paper introduces: a configuration
-    // change here is just one more log entry, replicated and committed
-    // exactly like a normal command. A second change has to wait for the
-    // first to commit (enforced below) -- this simplification depends on
-    // never having two membership changes in flight at once.
+    // Cluster reconfiguration (§6). Two mechanisms coexist here:
+    //
+    //  * Single-server changes (addServer / removeServer / addLearner /
+    //    promoteLearner / removeLearner): changing only one member per step
+    //    guarantees the old and new configurations' majorities always share
+    //    at least one server, so such a change is just one more log entry,
+    //    replicated and committed like a normal command — no joint phase
+    //    needed. A second change has to wait for the first to commit
+    //    (enforced in rejectIfConfigurationChangePending).
+    //
+    //  * Arbitrary changes (setConfiguration): full joint consensus
+    //    C_old,new. While the joint entry is in effect, every majority
+    //    decision (votes, commits, ReadIndex, lease — see Quorum) requires
+    //    separate majorities in BOTH configurations; once C_old,new commits,
+    //    the leader automatically proposes the final C_new (see
+    //    applyCommittedEntries).
     // ------------------------------------------------------------------
 
     /** Adds a new voting member. Only the leader can do this (§6). */
@@ -1910,6 +1981,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     public ServerRole role() { return role; }
 
+    /** Current election epoch -- see {@link #electionEpoch}. Package-private, for tests. */
+    long electionEpoch() { return electionEpoch.get(); }
+
     public String currentLeaderId() { return currentLeaderId; }
 
     public boolean isTransferInProgress() { return leaderTransferTarget != null; }
@@ -1964,7 +2038,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
-    /** Thrown by {@link #addServer} / {@link #removeServer} for requests that are invalid regardless of who the leader is. */
+    /**
+     * Thrown by the configuration-change entry points ({@link #addServer}, {@link #removeServer},
+     * {@link #addLearner}, {@link #removeLearner}, {@link #promoteLearner},
+     * {@link #setConfiguration}) for requests that are invalid regardless of who the leader is.
+     */
     public static final class ConfigurationChangeException extends RuntimeException {
         public ConfigurationChangeException(String message) {
             super(message);

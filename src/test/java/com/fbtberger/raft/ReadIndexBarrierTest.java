@@ -281,11 +281,25 @@ class ReadIndexBarrierTest {
         /** Let this peer answer — including the requests it is currently sitting on. */
         void acknowledge() {
             acking.set(true);
+            // Take the batch and clear it under the lock, then complete OUTSIDE both the lock and
+            // the iteration.
+            //
+            // complete() is not a passive hand-off: it runs the node's continuations inline, on
+            // this very thread, and those continuations call straight back into this peer
+            // (replicateTo -> appendEntries -> withheld.add). synchronized is reentrant, so the
+            // mutex does not stop that re-entry — it lets it through, and the list mutates under
+            // a live iterator. Hence the ConcurrentModificationException.
+            //
+            // Snapshotting first makes the batch immutable for the duration of the completions,
+            // and re-entrant adds simply land in the (now empty) list for a later acknowledge().
+            java.util.List<CompletableFuture<AppendEntriesResponse>> batch;
             synchronized (withheld) {
-                for (CompletableFuture<AppendEntriesResponse> f : withheld) {
-                    f.complete(ok(lastTermSeen));
-                }
+                batch = new java.util.ArrayList<>(withheld);
                 withheld.clear();
+            }
+            long term = lastTermSeen;
+            for (CompletableFuture<AppendEntriesResponse> f : batch) {
+                f.complete(ok(term));
             }
         }
 

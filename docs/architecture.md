@@ -85,6 +85,18 @@ The election process has two phases:
 
 Single-node clusters skip PreVote and elect immediately.
 
+**Election epoch (v119).** The election timer is cancelled from several places
+(a reset on leader contact, a step-down, winning an election), but
+`ScheduledFuture.cancel(false)` cannot stop a task that has already begun --
+and a scheduled election task blocked on the node lock has begun. Every such
+cancel is therefore best-effort. `RaftNode` carries an `electionEpoch` that is
+incremented whenever a pending election becomes invalid; each scheduled task
+captures the epoch it was scheduled under and aborts if it no longer matches.
+`startElection` additionally refuses to run at all while the node is leader,
+and `startRealElection` refuses any term not strictly greater than the current
+one -- which is also what makes a decided PreVote round idempotent against a
+late second grant.
+
 # 5. Leadership Transfer (§3.10)
 
 A leader can gracefully hand off to a specific target server:
