@@ -23,21 +23,5 @@ public interface RaftTransport extends AutoCloseable {
     CompletableFuture<InstallSnapshotResponse> installSnapshot(InstallSnapshotRequest request);
     CompletableFuture<PreVoteResponse> preVote(PreVoteRequest request);
     CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request);
-
-    /**
-     * Hint that the peer behind this transport may have returned, so any reconnect backoff should
-     * be abandoned and the next attempt made immediately. Cheap, idempotent, and safe to call on
-     * every failure -- unlike closing and rebuilding the transport, which is the only other lever
-     * a caller has and is expensive enough to need throttling.
-     *
-     * <p>Default is a no-op: a transport with no connection state (in-process, test doubles) has
-     * nothing to reset, and implementations should only override this if backing off is something
-     * they actually do.
-     *
-     * <p>Best-effort by contract. It asks for an earlier attempt; it does not promise the attempt
-     * succeeds, nor that any name resolution behind it is refreshed.
-     */
-    default void resetBackoff() { }
-
     @Override void close();
 }

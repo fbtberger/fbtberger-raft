@@ -939,11 +939,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * catches up: it starts with an empty log, so the very first
      * AppendEntries it receives offers it the entire log from index 1.
      */
-    // Package-private (not private) so the transport tests can drive exactly one replication
-    // round: replication is otherwise only reachable through the heartbeat scheduler, and a test
-    // that has to race a 50 ms timer to count anything is flaky by construction. No role guard
-    // here by design -- callers decide when to replicate.
-    void replicateTo(String peerId) {
+    private void replicateTo(String peerId) {
         RaftTransport transport = peerTransports.get(peerId);
         if (transport == null) {
             // A configured member with no transport is replicated to by NOBODY — it will
@@ -1025,26 +1021,6 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     }
                 } finally {
                     lock.unlock();
-                }
-                // v123: the cheap lever, on EVERY failure and with no cooldown. gRPC backs off
-                // between reconnect attempts (growing into seconds after even a short outage), so
-                // a peer that has just come back is not retried for as long as that backoff lasts
-                // -- which is why a restarting node reliably hit its 150-300 ms election timeout
-                // before the leader hit it (the requester side of issue #2). Resetting is cheap
-                // and idempotent, so it needs no throttling. The rebuild above is unchanged: it
-                // is the expensive lever, it is what heals a peer that returned on a DIFFERENT
-                // address, and it keeps its cooldown because rebuilding every few heartbeats is
-                // real churn.
-                //
-                // Deliberately outside the lock: resetBackoff() asks the channel to start
-                // connecting, and calling into foreign code while holding the node lock is how
-                // the surprises in this codebase have historically happened. Nothing here needs
-                // the lock -- the transport reference is already resolved.
-                try {
-                    transport.resetBackoff();
-                } catch (RuntimeException ignored) {
-                    // Best-effort by contract; a transport that cannot be nudged is not a failure
-                    // worth propagating into the replication path.
                 }
                 metrics.replicationFailure();
                 // v101: a replication failure used to vanish here without a trace.
