@@ -58,6 +58,25 @@ public final class GrpcTransport implements RaftTransport {
         return toCompletable(stub.timeoutNow(request));
     }
 
+    /**
+     * Abandons the channel's reconnect backoff so the next RPC attempts to connect right away
+     * instead of waiting the backoff out (gRPC's default grows to seconds after a short outage).
+     *
+     * <p>{@code getState(true)} additionally asks an IDLE channel to start connecting, which
+     * {@code resetConnectBackoff()} alone does not do.
+     *
+     * <p>Whether the underlying name resolution is refreshed too is deliberately NOT claimed here:
+     * grpc-java refreshes it when the load balancer reports TRANSIENT_FAILURE, but that is an
+     * implementation detail rather than an API guarantee. A peer that comes back on a NEW address
+     * may therefore still need the caller's transport rebuild -- this method is the cheap first
+     * attempt, not a replacement for it.
+     */
+    @Override
+    public void resetBackoff() {
+        channel.resetConnectBackoff();
+        channel.getState(true);
+    }
+
     @Override
     public void close() {
         channel.shutdownNow();
