@@ -57,6 +57,14 @@ message RequestVoteRequest {
   string candidateId = 2;
   int64 lastLogIndex = 3;
   int64 lastLogTerm = 4;
+  // v125: set only when the candidate was told to campaign by the incumbent
+  // leader via TimeoutNow (§3.10). Leader stickiness (§4.2.3) makes every
+  // healthy follower refuse a vote while it still hears from a leader -- which
+  // is exactly what a leadership transfer needs them NOT to do, since the
+  // leader is alive by construction. Voters skip the stickiness check when this
+  // is set. Defaults to false, so an old peer that never sets it simply gets
+  // the strict behaviour.
+  bool leadershipTransfer = 5;
 }
 
 message RequestVoteResponse {

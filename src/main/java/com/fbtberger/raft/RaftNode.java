@@ -403,6 +403,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     private void startRealElection(long newTerm) {
+        startRealElection(newTerm, false);
+    }
+
+    /**
+     * @param leadershipTransfer true only when the incumbent leader told us to campaign via
+     *        TimeoutNow (§3.10). Marks the outgoing RequestVote RPCs so voters skip their
+     *        stickiness check -- see {@link #handleRequestVote}.
+     */
+    private void startRealElection(long newTerm, boolean leadershipTransfer) {
         // v119: two independent ways in, both of which can arrive late.
         //
         //  * role == LEADER -- we already won a term; bumping it now would discard
@@ -428,6 +437,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 .setCandidateId(config.selfId())
                 .setLastLogIndex(store.getLastLogIndex())
                 .setLastLogTerm(store.getLastLogTerm())
+                .setLeadershipTransfer(leadershipTransfer)
                 .build();
 
         AtomicLong votesGranted = new AtomicLong(1);
@@ -633,6 +643,26 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         lock.lock();
         try {
             long currentTerm = store.getCurrentTerm();
+
+            // v125 (§4.2.3): while we still hear from a leader, ignore the request outright --
+            // BEFORE adopting its term. Denying the vote but adopting the term would be no
+            // protection at all: the term bump alone deposes our leader and forces a fresh
+            // election, which is the disruption stickiness exists to prevent. The PreVote handler
+            // has had this guard since the beginning; RequestVote never did, so a candidate that
+            // skips PreVote (or an old/hostile peer) could still unseat a healthy leader.
+            //
+            // The exception is a leadership transfer: there the incumbent itself asked the
+            // candidate to campaign, so every voter's "I still hear a leader" is true and
+            // irrelevant. Without this carve-out, adding the guard would break transferLeadership.
+            if (!request.getLeadershipTransfer() && hasLeaderStickiness()) {
+                log("denied vote to " + request.getCandidateId() + " for term " + request.getTerm()
+                        + " (stickiness: leader " + currentLeaderId + " still active"
+                        + ", sinceLeaderContact=" + (role == ServerRole.LEADER
+                                ? "self" : (System.currentTimeMillis() - lastLeaderContactMs) + "ms")
+                        + "), term not adopted");
+                return RequestVoteResponse.newBuilder()
+                        .setTerm(currentTerm).setVoteGranted(false).build();
+            }
 
             if (request.getTerm() > currentTerm) {
                 becomeFollowerLocked(request.getTerm());
@@ -1722,7 +1752,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         lock.lock();
         try {
             log("received TimeoutNow, starting immediate election");
-            startRealElection(store.getCurrentTerm() + 1);
+            // The incumbent asked us to take over, so our RequestVotes must carry the transfer
+            // flag -- every other voter still hears from that (very much alive) leader and would
+            // otherwise refuse us on stickiness grounds.
+            startRealElection(store.getCurrentTerm() + 1, true);
             return TimeoutNowResponse.getDefaultInstance();
         } finally {
             lock.unlock();

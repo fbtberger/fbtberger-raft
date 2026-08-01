@@ -85,6 +85,15 @@ The election process has two phases:
 
 Single-node clusters skip PreVote and elect immediately.
 
+**Leader stickiness on both vote RPCs (v122/v125).** A server refuses to grant a (Pre)Vote while
+it has heard from a leader within the minimum election timeout. A leader counts as having heard
+from a leader -- itself; without that, the one node whose refusal matters most was the only one
+always granting (v122). For `RequestVote` the refusal must come *before* the term is adopted
+(§4.2.3): denying the vote but taking the higher term still deposes the incumbent, which is the
+disruption the rule exists to prevent. Leadership transfer is the deliberate exception -- a
+`TimeoutNow` target marks its `RequestVote`s with `leadershipTransfer`, and voters skip the check
+for those, since there the incumbent itself asked for the handover.
+
 **Election epoch (v119).** The election timer is cancelled from several places
 (a reset on leader contact, a step-down, winning an election), but
 `ScheduledFuture.cancel(false)` cannot stop a task that has already begun --
