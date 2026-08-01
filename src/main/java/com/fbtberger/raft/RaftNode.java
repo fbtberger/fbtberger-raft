@@ -251,6 +251,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 + ", lastLogIndex=" + store.getLastLogIndex()
                 + ", snapshotIndex=" + store.getSnapshotIndex()
                 + ", configuration=" + currentConfiguration.keySet());
+        // v122: treat startup as leader contact for stickiness purposes. The field initialises to
+        // 0, i.e. "last heard from a leader in 1970", so a node that had only just come up granted
+        // (pre-)votes to anyone before it had any chance to hear from the incumbent. During a
+        // rolling restart that is the second grant. This does NOT delay our own campaign -- the
+        // election timer is driven by resetElectionTimer() below, not by this field -- it only
+        // stops us from unseating a leader we have not even listened for yet.
+        lastLeaderContactMs = System.currentTimeMillis();
         resetElectionTimer();
     }
 
@@ -673,8 +680,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * leader recently enough that it should refuse to grant (Pre)Votes.
      * This prevents a candidate from disrupting a functioning cluster --
      * especially a partitioned node whose term inflated while isolated.
+     *
+     * <p>v122: a LEADER counts as having contact -- with itself. {@code lastLeaderContactMs} is
+     * only ever written by {@link #handleAppendEntries}, which a leader never receives, so its
+     * value is frozen at whatever it was before this node won its term: seconds, or days, old.
+     * Stickiness was therefore permanently false on exactly the one node whose refusal matters
+     * most. With three voters, quorum is two and the candidate counts itself, so the leader's
+     * grant alone was enough to unseat it -- which is why every restart of any voter took the
+     * leadership (issue #2), deterministically rather than by chance.
      */
     private boolean hasLeaderStickiness() {
+        if (role == ServerRole.LEADER) return true;
         return System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
     }
 
@@ -689,7 +705,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
 
             boolean logOk = isLogAtLeastAsUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
-            boolean grant = logOk && !hasLeaderStickiness();
+            boolean sticky = hasLeaderStickiness();
+            boolean grant = logOk && !sticky;
+            // v122: say who asked, what we answered, and why. Issue #2 could name the granting
+            // peer only by elimination, because the responder logged nothing at all -- the one
+            // side that knows the reason was the silent one.
+            log((grant ? "granted" : "denied") + " pre-vote to " + request.getCandidateId()
+                    + " for term " + request.getTerm()
+                    + " (logOk=" + logOk + ", stickiness=" + sticky
+                    + ", role=" + role
+                    + ", sinceLeaderContact=" + (role == ServerRole.LEADER
+                            ? "self" : (System.currentTimeMillis() - lastLeaderContactMs) + "ms")
+                    + ")");
             return PreVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(grant).build();
         } finally {
             lock.unlock();
