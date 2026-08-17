@@ -5,11 +5,10 @@
     }
   ],
   "settings": {
-    // Java / Maven
+    // Java / Gradle
     "java.configuration.updateBuildConfiguration": "automatic",
     "java.compile.nullAnalysis.mode": "automatic",
     "java.test.defaultConfig": "junit5",
-    "maven.executable.preferMavenWrapper": false,
     // Editor
     "editor.tabSize": 4,
     "editor.insertSpaces": true,
@@ -21,7 +20,7 @@
     "files.insertFinalNewline": true,
     // Exclude build output from the file explorer
     "files.exclude": {
-      "**/target": true,
+      "**/build": true,
       "**/.classpath": true,
       "**/.project": true,
       "**/.settings": true,
@@ -29,18 +28,18 @@
     },
     // Protobuf: treat generated sources as read-only
     "files.readonlyInclude": {
-      "**/target/generated-sources/**": true
+      "**/build/generated/**": true
     },
     "java.debug.settings.onBuildFailureProceed": true
   },
   "extensions": {
     "recommendations": [
-      // Java language support + debugger + Maven + test runner
+      // Java language support + debugger + Gradle + test runner
       "vscjava.vscode-java-pack",
       // Individual components (already bundled in vscode-java-pack, listed
       // explicitly so they are installed even when the pack is not)
       "redhat.java",
-      "vscjava.vscode-maven",
+      "vscjava.vscode-gradle",
       "vscjava.vscode-java-test",
       "vscjava.vscode-java-debug",
       // Protobuf syntax highlighting
