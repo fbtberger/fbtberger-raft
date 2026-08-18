@@ -1537,6 +1537,24 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
+     * Serves a linearizable read (§6.4): confirms leadership with a ReadIndex
+     * barrier, waits until the state machine has caught up to the index that
+     * barrier captured, and only then reads.
+     *
+     * <p>The read itself never enters the log. What makes it linearizable is the
+     * barrier: when the returned future runs, this server has proof from a
+     * majority that it was still the leader when the query arrived, and every
+     * command committed before then has been applied.
+     *
+     * <p>Fails with {@link NotLeaderException} on a follower, carrying the leader
+     * hint, exactly as {@link #submitCommand} does -- a client that can find the
+     * leader for writes needs no second mechanism for reads.
+     */
+    public CompletableFuture<byte[]> query(byte[] query) {
+        return readIndex().thenApply(readIndex -> stateMachine.read(query));
+    }
+
+    /**
      * Lease-based linearizable read: serves the read immediately (no
      * heartbeat round-trip) if a majority of peers have acknowledged
      * a heartbeat within the election timeout window, proving no other

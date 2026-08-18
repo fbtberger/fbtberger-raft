@@ -35,9 +35,21 @@ public final class KeyValueClient {
         return new String(result, StandardCharsets.UTF_8);
     }
 
-    // Note: there is deliberately no get() here. Reads in this demo are served
-    // locally by whichever node you happen to ask (see RaftServer's CLI), which is
-    // not linearizable -- a client could read stale data from a partitioned-away
-    // follower. Routing reads safely through Raft (e.g. the paper's read-index
-    // approach, §8) is out of scope for this implementation; see the README.
+    /**
+     * Reads {@code key} linearizably: the answer reflects every SET that had
+     * committed when the call was made.
+     *
+     * <p>This replaces the note that used to stand here saying reads were out of
+     * scope. They no longer are: {@code RaftClientService.Query} routes the read
+     * through the leader's ReadIndex barrier (§6.4) instead of asking whichever
+     * node happens to answer, which is what {@code RaftServer}'s local CLI GET
+     * still does -- that one can serve stale data from a partitioned-away
+     * follower, and is fine only because it is a debugging aid.
+     *
+     * @return the stored value, or {@code "ERR no such key"}
+     */
+    public String get(String key) throws RaftClientException {
+        byte[] result = raftClient.query(("GET " + key).getBytes(StandardCharsets.UTF_8));
+        return new String(result, StandardCharsets.UTF_8);
+    }
 }

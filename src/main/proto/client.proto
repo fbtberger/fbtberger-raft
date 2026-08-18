@@ -23,6 +23,16 @@ option java_multiple_files = true;
 service RaftClientService {
   rpc Submit(SubmitRequest) returns (SubmitResponse);
 
+  // A linearizable read (§6.4). Like Submit it is leader-only, and for the same
+  // reason: a follower can be arbitrarily far behind, and a partitioned-away one
+  // may not even know it has been deposed. The leader confirms its leadership
+  // with a ReadIndex barrier before the state machine is touched, so a Query
+  // observes every command that committed before it was issued.
+  //
+  // The query bytes are opaque here exactly as command bytes are in Submit: what
+  // they mean is the deployment's state machine's business.
+  rpc Query(QueryRequest) returns (QueryResponse);
+
   // Cluster reconfiguration (§6): adds or removes one voting member at a
   // time. Like Submit, these only succeed against the leader; a non-leader
   // rejects the request and reports a leader_hint if it has one.
@@ -54,6 +64,24 @@ message SubmitResponse {
   string leader_hint = 3;
 
   // Set iff success is false, for diagnostics / display to a human.
+  string error = 4;
+}
+
+message QueryRequest {
+  bytes query = 1;
+}
+
+message QueryResponse {
+  bool success = 1;
+
+  // Set iff success is true: the state machine's answer to this query.
+  bytes result = 2;
+
+  // Set iff success is false and this server knows who the current leader is.
+  string leader_hint = 3;
+
+  // Set iff success is false, for diagnostics / display to a human. A state
+  // machine that serves no reads at all answers here rather than pretending.
   string error = 4;
 }
 

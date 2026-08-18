@@ -43,6 +43,25 @@ public final class KeyValueStateMachine implements StateMachine {
     }
 
     /**
+     * {@code GET key} against the current map. Answers {@code ERR no such key}
+     * rather than an empty value, so a client can tell "not there" from "there and
+     * empty" -- the distinction a read test needs in order to mean anything.
+     *
+     * <p>Safe against a concurrent {@link #apply}: the backing map is a
+     * ConcurrentHashMap and this only reads from it.
+     */
+    @Override
+    public byte[] read(byte[] query) {
+        String[] parts = new String(query, StandardCharsets.UTF_8).split(" ", 2);
+        if (parts.length != 2 || !parts[0].equals("GET")) {
+            return ("ERR unknown query: " + new String(query, StandardCharsets.UTF_8))
+                    .getBytes(StandardCharsets.UTF_8);
+        }
+        String value = data.get(parts[1]);
+        return (value == null ? "ERR no such key" : value).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
      * Encodes the entire map as a count followed by UTF-8 key/value pairs
      * (§7). Simple rather than compact -- fine for this demo store, where a
      * snapshot only ever needs to round-trip through {@link #restoreSnapshot}

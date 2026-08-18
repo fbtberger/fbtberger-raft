@@ -18,6 +18,35 @@ public interface StateMachine {
     byte[] apply(byte[] command);
 
     /**
+     * Answers a read-only query against the current state, without going through
+     * the log.
+     *
+     * <p>Reads are deliberately not commands: replicating a query would put an
+     * entry in every server's log and cost a round of consensus to learn something
+     * nobody changed. Linearizability comes from the caller instead --
+     * {@link RaftNode#query} confirms leadership with a ReadIndex barrier (§6.4)
+     * and waits until everything committed before the query has been applied,
+     * <em>then</em> calls this method.
+     *
+     * <p>Two obligations on implementations:
+     * <ol>
+     *   <li><b>Do not mutate.</b> This runs outside the log, so anything changed
+     *       here exists on one server only -- divergence that no snapshot or
+     *       replay can repair.</li>
+     *   <li><b>Be safe against a concurrent {@link #apply}.</b> Unlike apply,
+     *       which Raft calls single-threaded, this can run on a client thread
+     *       while the applier thread is working.</li>
+     * </ol>
+     *
+     * <p>The default refuses: a state machine that has no read side should say so
+     * rather than silently answer something empty.
+     */
+    default byte[] read(byte[] query) {
+        throw new UnsupportedOperationException(
+                getClass().getSimpleName() + " serves no reads");
+    }
+
+    /**
      * Produces a complete, self-contained snapshot of this state machine's
      * current state (§7), to be persisted by {@link RaftNode} alongside the
      * Raft-level snapshot metadata (lastIncludedIndex/Term) and handed back

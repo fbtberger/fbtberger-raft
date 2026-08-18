@@ -7,6 +7,8 @@ package com.fbtberger.raft;
 import com.fbtberger.raft.client.proto.AddLearnerRequest;
 import com.fbtberger.raft.client.proto.AddServerRequest;
 import com.fbtberger.raft.client.proto.PromoteLearnerRequest;
+import com.fbtberger.raft.client.proto.QueryRequest;
+import com.fbtberger.raft.client.proto.QueryResponse;
 import com.fbtberger.raft.client.proto.RaftClientServiceGrpc;
 import com.fbtberger.raft.client.proto.ReconfigurationResponse;
 import com.fbtberger.raft.client.proto.RemoveLearnerRequest;
@@ -43,6 +45,14 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         raftNode.submitCommand(request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
             sample.stop(metrics.clientSubmitTimer());
             responseObserver.onNext(throwable == null ? success(result) : failure(unwrap(throwable)));
+            responseObserver.onCompleted();
+        });
+    }
+
+    @Override
+    public void query(QueryRequest request, StreamObserver<QueryResponse> responseObserver) {
+        raftNode.query(request.getQuery().toByteArray()).whenComplete((result, throwable) -> {
+            responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
             responseObserver.onCompleted();
         });
     }
@@ -102,6 +112,29 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
             }
             builder.setError("not leader");
         } else {
+            builder.setError(cause.getMessage() != null ? cause.getMessage() : cause.toString());
+        }
+        return builder.build();
+    }
+
+    private static QueryResponse querySuccess(byte[] result) {
+        return QueryResponse.newBuilder()
+                .setSuccess(true)
+                .setResult(ByteString.copyFrom(result))
+                .build();
+    }
+
+    private static QueryResponse queryFailure(Throwable cause) {
+        QueryResponse.Builder builder = QueryResponse.newBuilder().setSuccess(false);
+        if (cause instanceof RaftNode.NotLeaderException nle) {
+            if (nle.leaderHint != null) {
+                builder.setLeaderHint(nle.leaderHint);
+            }
+            builder.setError("not leader");
+        } else {
+            // Also the path for a state machine with no read side
+            // (UnsupportedOperationException from StateMachine#read), which is a
+            // configuration mistake and must not read as a cluster problem.
             builder.setError(cause.getMessage() != null ? cause.getMessage() : cause.toString());
         }
         return builder.build();

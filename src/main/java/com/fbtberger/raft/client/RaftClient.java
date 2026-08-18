@@ -7,6 +7,8 @@ package com.fbtberger.raft.client;
 import com.fbtberger.raft.client.proto.AddLearnerRequest;
 import com.fbtberger.raft.client.proto.AddServerRequest;
 import com.fbtberger.raft.client.proto.PromoteLearnerRequest;
+import com.fbtberger.raft.client.proto.QueryRequest;
+import com.fbtberger.raft.client.proto.QueryResponse;
 import com.fbtberger.raft.client.proto.RaftClientServiceGrpc;
 import com.fbtberger.raft.client.proto.ReconfigurationResponse;
 import com.fbtberger.raft.client.proto.RemoveLearnerRequest;
@@ -112,6 +114,44 @@ public final class RaftClient implements AutoCloseable {
                         nodeId + " rejected the command (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
                 knownLeaderId = null; // an unreachable node is not a useful guess anymore
+                lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
+            }
+        }
+        throw lastError != null ? lastError : new RaftClientException("no nodes configured");
+    }
+
+    /** Runs a linearizable read with the default timeout per attempted node. */
+    public byte[] query(byte[] query) throws RaftClientException {
+        return query(query, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * Runs a linearizable read (§6.4), following the same leader-hint walk as
+     * {@link #submit}: reads are leader-only here, because a follower can be
+     * arbitrarily far behind and a partitioned one need not know it was deposed.
+     *
+     * @return the state machine's answer
+     * @throws RaftClientException if no node in the cluster answered the query
+     */
+    public byte[] query(byte[] query, Duration perAttemptTimeout) throws RaftClientException {
+        QueryRequest request = QueryRequest.newBuilder().setQuery(ByteString.copyFrom(query)).build();
+        RaftClientException lastError = null;
+
+        for (String nodeId : candidateOrder()) {
+            try {
+                QueryResponse response = stubFor(nodeId)
+                        .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                        .query(request);
+
+                if (response.getSuccess()) {
+                    knownLeaderId = nodeId;
+                    return response.getResult().toByteArray();
+                }
+                knownLeaderId = response.getLeaderHint().isEmpty() ? null : response.getLeaderHint();
+                lastError = new RaftClientException(
+                        nodeId + " rejected the query (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
+            } catch (StatusRuntimeException e) {
+                knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
         }

@@ -9,6 +9,8 @@ import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.fbtberger.raft.client.proto.AddServerRequest;
 import com.fbtberger.raft.client.proto.RemoveServerRequest;
+import com.fbtberger.raft.client.proto.QueryRequest;
+import com.fbtberger.raft.client.proto.QueryResponse;
 import com.fbtberger.raft.client.proto.ReconfigurationResponse;
 import com.fbtberger.raft.transport.GrpcTransport;
 import com.fbtberger.raft.transport.GrpcTransportServer;
@@ -84,6 +86,58 @@ class RaftClientGrpcServiceTest {
                 .build());
         assertTrue(resp.getSuccess());
         assertEquals("OK", resp.getResult().toStringUtf8());
+    }
+
+    @Test
+    void queryReadsBackWhatWasJustCommitted() {
+        clientStub.submit(SubmitRequest.newBuilder()
+                .setCommand(ByteString.copyFromUtf8("SET x 42")).build());
+
+        QueryResponse resp = clientStub.query(QueryRequest.newBuilder()
+                .setQuery(ByteString.copyFromUtf8("GET x")).build());
+
+        // The ReadIndex barrier is what makes this an assertion rather than a race:
+        // the query cannot be answered before everything committed ahead of it has
+        // been applied.
+        assertTrue(resp.getSuccess());
+        assertEquals("42", resp.getResult().toStringUtf8());
+    }
+
+    @Test
+    void queryForAMissingKeyIsAnAnswerNotAFailure() {
+        QueryResponse resp = clientStub.query(QueryRequest.newBuilder()
+                .setQuery(ByteString.copyFromUtf8("GET nothing-here")).build());
+
+        // success=false is reserved for "this node could not answer" -- a key that
+        // is not in the store is a perfectly good answer from the state machine.
+        assertTrue(resp.getSuccess());
+        assertEquals("ERR no such key", resp.getResult().toStringUtf8());
+    }
+
+    @Test
+    void queryOnAFollowerReturnsNotLeader() throws Exception {
+        RaftConfig followerConfig = loadConfig("qfollower", "19996",
+                java.util.Map.of("qfollower", "localhost:19996", "other1", "localhost:19995", "other2", "localhost:19994"));
+        RaftNode follower = new RaftNode(followerConfig, new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
+
+        String followerServer = "query-follower-test-server";
+        Server srv = InProcessServerBuilder.forName(followerServer)
+                .directExecutor().addService(new RaftClientGrpcService(follower)).build().start();
+        ManagedChannel ch = InProcessChannelBuilder.forName(followerServer).directExecutor().build();
+        try {
+            QueryResponse resp = RaftClientServiceGrpc.newBlockingStub(ch)
+                    .query(QueryRequest.newBuilder().setQuery(ByteString.copyFromUtf8("GET x")).build());
+
+            // Reads are leader-only for the same reason writes are: a follower can be
+            // arbitrarily behind, and a partitioned one need not know it was deposed.
+            assertFalse(resp.getSuccess());
+            assertEquals("not leader", resp.getError());
+        } finally {
+            follower.shutdown();
+            ch.shutdownNow();
+            srv.shutdown();
+        }
     }
 
     @Test

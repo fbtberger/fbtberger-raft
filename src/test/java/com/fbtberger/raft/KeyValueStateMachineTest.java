@@ -105,6 +105,69 @@ class KeyValueStateMachineTest {
     }
 
     @Test
+    void readsBackWhatWasApplied() {
+        sm.apply("SET greeting hello".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("hello", read("GET greeting"));
+    }
+
+    /**
+     * "Not there" must be distinguishable from "there and empty", otherwise a read
+     * test can pass against a state machine that lost the write.
+     */
+    @Test
+    void readOfAMissingKeyIsNotAnEmptyValue() {
+        sm.apply("SET present ".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("", read("GET present"));
+        assertEquals("ERR no such key", read("GET absent"));
+    }
+
+    @Test
+    void refusesAQueryItDoesNotUnderstand() {
+        assertEquals("ERR unknown query: DROP TABLE", read("DROP TABLE"));
+    }
+
+    /** A read must never change the state: it runs outside the log, so a change here exists on one server only. */
+    @Test
+    void readDoesNotMutate() {
+        sm.apply("SET k v".getBytes(StandardCharsets.UTF_8));
+        byte[] before = sm.takeSnapshot();
+
+        read("GET k");
+        read("GET missing");
+
+        assertArrayEquals(before, sm.takeSnapshot());
+    }
+
+    /** A state machine with no read side must say so rather than answer something empty. */
+    @Test
+    void theDefaultStateMachineRefusesReads() {
+        StateMachine noReads = new StateMachine() {
+            @Override
+            public byte[] apply(byte[] command) {
+                return new byte[0];
+            }
+
+            @Override
+            public byte[] takeSnapshot() {
+                return new byte[0];
+            }
+
+            @Override
+            public void restoreSnapshot(byte[] snapshot) {
+                // nothing to restore
+            }
+        };
+
+        assertThrows(UnsupportedOperationException.class, () -> noReads.read("GET x".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private String read(String query) {
+        return new String(sm.read(query.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8);
+    }
+
+    @Test
     void restoreWithCorruptDataThrows() {
         assertThrows(IllegalArgumentException.class,
                 () -> sm.restoreSnapshot(new byte[]{0, 0, 0, 10, 'x'})); // count=10 but no data
