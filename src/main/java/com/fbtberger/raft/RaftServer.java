@@ -17,6 +17,17 @@ import java.util.concurrent.TimeoutException;
 
 public final class RaftServer {
 
+    // Before the first Logger exists, and that ordering is the whole point: the
+    // configuration file is no longer called logback.xml, because a library must
+    // not decide how the applications embedding it log (see that file's header).
+    // A static initializer declared ahead of LOG runs before it, and logback
+    // configures itself on the first LoggerFactory call.
+    static {
+        if (System.getProperty("logback.configurationFile") == null) {
+            System.setProperty("logback.configurationFile", "logback-raftserver.xml");
+        }
+    }
+
     private static final Logger LOG = LoggerFactory.getLogger(RaftServer.class);
 
     public static void main(String[] args) throws Exception {

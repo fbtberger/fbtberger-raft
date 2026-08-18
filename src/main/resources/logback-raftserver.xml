@@ -1,0 +1,31 @@
+<!--
+    Logging for the standalone RaftServer process only.
+
+    Deliberately NOT named logback.xml. This artefact is a library: kwatro, the
+    load client and anything else embedding RaftNode put it on their classpath,
+    and logback's own lookup finds a root logback.xml before Spring Boot ever
+    offers the application's logback-spring.xml. Measured on the running kwatro
+    deployment: every service was logging through this file's pattern, and
+    kwatro's JSON file appender for the prod/node* profiles (rotation, 500 MB
+    cap and all) never activated, because its configuration was never read.
+
+    RaftServer names this file explicitly (see its static initializer), so the
+    standalone server keeps the logging it always had. Override with
+    -Dlogback.configurationFile=<path> for a deployment that wants its own.
+-->
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.fbtberger.raft" level="INFO"/>
+    <logger name="io.grpc" level="WARN"/>
+    <logger name="io.netty" level="WARN"/>
+    <logger name="com.sleepycat" level="WARN"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

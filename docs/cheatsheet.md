@@ -268,7 +268,9 @@ RaftTransport t = new GrpcTransport(
 
 ## Logging
 
-SLF4J + Logback. Config: `src/main/resources/logback.xml`
+SLF4J + Logback. Config: `src/main/resources/logback-raftserver.xml`, named by
+`RaftServer` itself. Not `logback.xml`: a library that ships one at the classpath
+root silently overrides the logging configuration of every application embedding it
 
 | Logger | Default level |
 |--------|---------------|

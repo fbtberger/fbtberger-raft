@@ -88,7 +88,7 @@ fbtberger-raft/
     │   │   │                           # PreVote, TimeoutNow
     │   │   └── client.proto            # Submit, AddServer, RemoveServer
     │   ├── resources/
-    │   │   └── logback.xml             # logging configuration
+    │   │   └── logback-raftserver.xml  # logging for the standalone server only
     │   └── java/com/fbtberger/raft/
     │       ├── RaftNode.java               # core algorithm
     │       ├── RaftConfig.java             # node configuration from .properties
