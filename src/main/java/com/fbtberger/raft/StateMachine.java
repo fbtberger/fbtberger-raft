@@ -18,6 +18,33 @@ public interface StateMachine {
     byte[] apply(byte[] command);
 
     /**
+     * Applies one committed command, told which log index it is.
+     *
+     * <p>Only a state machine whose state <em>outlives the process</em> needs this.
+     * An in-memory one starts empty on every restart, so replaying the log from the
+     * beginning reconstructs exactly the right state and the index is redundant. A
+     * state machine backed by a database does not start empty: on restart its data
+     * already reflects everything it applied before, and Raft -- which has no
+     * snapshot yet, or one older than that data -- replays those same entries
+     * again.
+     *
+     * <p>Measured, because this is not theoretical. A three-node cluster with a
+     * SQL-backed state machine, one node killed mid-load and restarted: it caught
+     * up to the same row count as its peers and held different data. Row versions
+     * had been incremented a second time and at least one value ended up different,
+     * because every command between its last commit and the kill was applied twice.
+     * Same key count, different content, no error anywhere.
+     *
+     * <p>An implementation with durable storage must therefore record the index it
+     * has applied <b>in the same transaction as the data</b>, and ignore any index
+     * it has already seen. The default here simply delegates, which is correct for
+     * every in-memory implementation and keeps this an additive change.
+     */
+    default byte[] apply(long index, byte[] command) {
+        return apply(command);
+    }
+
+    /**
      * Answers a read-only query against the current state, without going through
      * the log.
      *

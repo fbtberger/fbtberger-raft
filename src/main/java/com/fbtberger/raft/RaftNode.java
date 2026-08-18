@@ -1319,7 +1319,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     becomeFollowerLocked(store.getCurrentTerm());
                 }
             } else {
-                result = stateMachine.apply(entry.getCommand().toByteArray());
+                // With the index: a state machine with durable storage cannot tell a
+                // first application from a replay without it (see StateMachine#apply).
+                result = stateMachine.apply(index, entry.getCommand().toByteArray());
             }
             metrics.entryApplied();
             CompletableFuture<byte[]> pending = pendingClientRequests.remove(index);

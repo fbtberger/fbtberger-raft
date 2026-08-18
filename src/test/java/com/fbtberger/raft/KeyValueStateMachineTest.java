@@ -163,6 +163,64 @@ class KeyValueStateMachineTest {
         assertThrows(UnsupportedOperationException.class, () -> noReads.read("GET x".getBytes(StandardCharsets.UTF_8)));
     }
 
+    /**
+     * The indexed overload must reach the same state machine. In-memory
+     * implementations ignore the index by design -- they start empty, so a replay
+     * rebuilds exactly the right state -- but the call has to arrive.
+     */
+    @Test
+    void theIndexedApplyDelegatesToTheCommandApply() {
+        sm.apply(7L, "SET k v".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("v", sm.get("k"));
+    }
+
+    /**
+     * The distinction the index exists for: a durable state machine sees the same
+     * index twice after a restart and must not act on it twice.
+     */
+    @Test
+    void aDurableStateMachineCanSkipAnIndexItHasAlreadyApplied() {
+        class DurableCounter implements StateMachine {
+            private long appliedIndex;
+            private int applications;
+
+            @Override
+            public byte[] apply(long index, byte[] command) {
+                if (index <= appliedIndex) {
+                    return "SKIPPED".getBytes(StandardCharsets.UTF_8);
+                }
+                appliedIndex = index;
+                applications++;
+                return apply(command);
+            }
+
+            @Override
+            public byte[] apply(byte[] command) {
+                return "OK".getBytes(StandardCharsets.UTF_8);
+            }
+
+            @Override
+            public byte[] takeSnapshot() {
+                return new byte[0];
+            }
+
+            @Override
+            public void restoreSnapshot(byte[] snapshot) {
+                // nothing to restore
+            }
+        }
+
+        DurableCounter durable = new DurableCounter();
+        byte[] command = "SET k v".getBytes(StandardCharsets.UTF_8);
+        durable.apply(1L, command);
+        durable.apply(2L, command);
+        durable.apply(1L, command);   // the replay after a restart
+        durable.apply(2L, command);
+
+        assertEquals(2, durable.applications);
+    }
+
     private String read(String query) {
         return new String(sm.read(query.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8);
     }
