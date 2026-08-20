@@ -37,3 +37,6 @@ docs/raft_comparison_v5.pdf
 docs/atomix_comparison.pdf
 docs/microraft_comparison.pdf
 docs/raft_comparison_v4.pdf
+
+# Local demo cluster run state (pids, FIFOs, logs, node data) -- see scripts/demo-cluster.sh
+.demo-cluster/

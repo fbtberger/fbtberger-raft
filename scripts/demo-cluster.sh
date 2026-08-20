@@ -22,7 +22,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_DIR="$REPO_ROOT/build/demo-cluster"
+# NOT under build/: `./gradlew clean` deletes that tree, and it takes the pid files
+# with it. The running JVMs survive, `stop` can no longer find them, and the next
+# `start` dies on "Address already in use" -- with the orphans still holding the
+# ports and still writing into logs nobody is reading. Cost one confused debugging
+# round on the first day this script existed.
+RUN_DIR="$REPO_ROOT/.demo-cluster"
 LOG_DIR="$RUN_DIR/logs"
 JAR="$REPO_ROOT/build/libs/fbtberger-raft-1.0.0-all.jar"
 NODES=(1 2 3)
@@ -73,7 +78,17 @@ start_node() {
 stop_node() {
     local n="$1" pid
     if ! pid="$(pid_of "$n")"; then
-        echo "node$n not running"
+        # No pid file, but the node may still be up -- someone deleted the run
+        # directory, or the shell that started it is gone. Match on the config path,
+        # which is unique per node and cannot hit anything else on this machine.
+        local orphan
+        orphan="$(pgrep -f "[-]jar .*config/local/node$n\.properties" || true)"
+        if [[ -n "$orphan" ]]; then
+            echo "node$n running without a pid file (pid $orphan), killing it"
+            kill $orphan 2>/dev/null || true
+        else
+            echo "node$n not running"
+        fi
         rm -f "$RUN_DIR/node$n.pid"
         return 0
     fi
