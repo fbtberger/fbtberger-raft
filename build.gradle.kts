@@ -122,6 +122,20 @@ tasks.jar {
     }
 }
 
+// gRPC finds its transports, resolvers and load balancers through the ServiceLoader, and every
+// grpc artifact ships its own META-INF/services/io.grpc.NameResolverProvider. Without an explicit
+// merge, shadow keeps whichever copy it unpacked last: the fat jar ended up declaring only
+// UdsNameResolverProvider, so every node built from it died at startup with
+//
+//   Address types of NameResolver 'unix' for 'localhost:9093' not supported by transport
+//
+// -- i.e. the `java -jar ...-all.jar` path in the README could not have worked. The plain jar and
+// the tests are unaffected, which is why this survived: nothing that runs in CI goes through the
+// shaded artifact.
+tasks.shadowJar {
+    mergeServiceFiles()
+}
+
 // ---------------------------------------------------------------------------
 // JMH benchmarks (StorageBenchmark)
 //
