@@ -36,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -203,6 +204,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // timer in that state would cause spurious term inflation that disrupts
     // the ongoing cluster.
     private volatile boolean started = false;
+    // Set by start(), consumed by the single resetElectionTimer() call that follows it: the very
+    // first election timer of a node's life is scaled by the boot delay factor, every later one
+    // is an ordinary timeout. See ElectionSwitches#electionBootDelayFactor for why the first one
+    // is special -- a restarting node has to outwait the leader's transport reconnecting to it,
+    // not just the leader's heartbeat interval.
+    private volatile boolean bootGracePending = false;
 
     public RaftNode(RaftConfig config,
                      RaftStorage store,
@@ -247,10 +254,20 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     /** Every server starts out as a follower (§5.1). */
     public void start() {
         started = true;
+        bootGracePending = true;
         log("starting as FOLLOWER, currentTerm=" + store.getCurrentTerm()
                 + ", lastLogIndex=" + store.getLastLogIndex()
                 + ", snapshotIndex=" + store.getSnapshotIndex()
                 + ", configuration=" + currentConfiguration.keySet());
+        // A node whose election path is not in its fixed state says so, once, in its own trace.
+        // Reading a demo run's log a week later must not require remembering which flags the
+        // process was started with.
+        ElectionSwitches switches = config.electionSwitches();
+        if (switches.allFixed()) {
+            log("election switches: all default (" + switches + ")");
+        } else {
+            logWarn("election switches: NOT default -- a known defect is armed (" + switches + ")");
+        }
         // v122: treat startup as leader contact for stickiness purposes. The field initialises to
         // 0, i.e. "last heard from a leader in 1970", so a node that had only just come up granted
         // (pre-)votes to anyone before it had any chance to hear from the incumbent. During a
@@ -296,6 +313,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         long epoch = electionEpoch.incrementAndGet();
         int timeoutMs = ELECTION_TIMEOUT_MIN_MS
                 + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS + 1);
+        // Issue #2, requester side: the first timer after start() is the one that decides whether
+        // a restarting node campaigns before the incumbent's transport has reconnected to it. The
+        // measured gap between "starting as FOLLOWER" and the first PreVote was 498-802 ms, i.e.
+        // an ordinary timeout expired long before the first heartbeat arrived. Scaling only this
+        // one timer buys that window back without slowing down a real failover: from the first
+        // reset onwards -- which any heartbeat performs -- the node is on the normal schedule.
+        if (bootGracePending) {
+            bootGracePending = false;
+            int factor = config.electionSwitches().electionBootDelayFactor();
+            if (factor > 1) {
+                timeoutMs *= factor;
+                log("boot grace: first election timer extended to " + timeoutMs + " ms (factor "
+                        + factor + ")");
+            }
+        }
+        lastArmedElectionTimeoutMs = timeoutMs;
         electionTimer = scheduler.schedule(() -> startElectionIfCurrent(epoch), timeoutMs, TimeUnit.MILLISECONDS);
     }
 
@@ -355,6 +388,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     .build();
 
             AtomicLong preVotesGranted = new AtomicLong(1); // count self
+            // Issue #3: one latch per round, so the quorum threshold converts into an election
+            // exactly once no matter how many grants cross it. Scoped to the round rather than
+            // to the node -- a later round must be free to decide again.
+            AtomicBoolean roundDecided = new AtomicBoolean(false);
             try {
                 // §4.2.1: solicit (Pre)Votes only from voting members -- never
                 // from learners, which do not participate in elections.
@@ -363,7 +400,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     if (peer == null) continue;
                     peer.preVote(preVoteRequest).whenComplete((response, t) -> {
                         if (t == null) {
-                            handlePreVoteResponse(proposedTerm, response, preVotesGranted);
+                            handlePreVoteResponse(proposedTerm, response, preVotesGranted, roundDecided);
                         } else {
                             log("PreVote RPC failed", t);
                         }
@@ -388,30 +425,65 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
-    private void handlePreVoteResponse(long proposedTerm, PreVoteResponse response, AtomicLong preVotesGranted) {
+    /**
+     * Counts one PreVote reply and, when the round reaches quorum, converts it into a real
+     * election -- exactly once per round (issue #3).
+     *
+     * <p>The latch is what makes "exactly once" true by construction rather than by consequence.
+     * The two term comparisons here and in {@link #startRealElection} also happen to swallow a
+     * late second grant, but only because the first one moved {@code currentTerm}: that is a
+     * side effect of another guard, not a statement of this rule, and it stops holding the
+     * moment a caller reaches quorum without bumping the term. With
+     * {@link ElectionSwitches#preVoteQuorumLatch()} off, every guard that hides the defect is
+     * bypassed on this path, and the node reproduces the two-elections-in-52-ms shape from the
+     * issue deterministically instead of once in three restarts.
+     */
+    private void handlePreVoteResponse(long proposedTerm, PreVoteResponse response,
+                                       AtomicLong preVotesGranted, AtomicBoolean roundDecided) {
         lock.lock();
         try {
-            if (store.getCurrentTerm() + 1 != proposedTerm) {
+            boolean latched = config.electionSwitches().preVoteQuorumLatch();
+            if (latched && store.getCurrentTerm() + 1 != proposedTerm) {
                 return;
             }
-            if (response.getVoteGranted() && preVotesGranted.incrementAndGet() >= majority()) {
-                startRealElection(proposedTerm);
+            if (!response.getVoteGranted() || preVotesGranted.incrementAndGet() < majority()) {
+                return;
             }
+            if (latched) {
+                // The round is consumed here, not by whatever startRealElection does with it.
+                if (!roundDecided.compareAndSet(false, true)) return;
+                startRealElection(proposedTerm);
+                return;
+            }
+            // Defect armed: check-then-act with no atomic transition. Every grant that crosses
+            // the threshold campaigns for whatever term is next when it happens to arrive, so
+            // two peers granting the same round elect the node twice -- 145, then 146, with no
+            // step-down in between.
+            startRealElection(store.getCurrentTerm() + 1, false, true);
         } finally {
             lock.unlock();
         }
     }
 
     private void startRealElection(long newTerm) {
-        startRealElection(newTerm, false);
+        startRealElection(newTerm, false, false);
+    }
+
+    private void startRealElection(long newTerm, boolean leadershipTransfer) {
+        startRealElection(newTerm, leadershipTransfer, false);
     }
 
     /**
      * @param leadershipTransfer true only when the incumbent leader told us to campaign via
      *        TimeoutNow (§3.10). Marks the outgoing RequestVote RPCs so voters skip their
      *        stickiness check -- see {@link #handleRequestVote}.
+     * @param ignoreLateGrantGuards true only from the un-latched PreVote path, i.e. when
+     *        {@link ElectionSwitches#preVoteQuorumLatch()} is off and issue #3 is deliberately
+     *        armed. Production never passes true: the guards below are the reason a decided
+     *        round cannot elect twice, so bypassing them is the defect.
      */
-    private void startRealElection(long newTerm, boolean leadershipTransfer) {
+    private void startRealElection(long newTerm, boolean leadershipTransfer,
+                                   boolean ignoreLateGrantGuards) {
         // v119: two independent ways in, both of which can arrive late.
         //
         //  * role == LEADER -- we already won a term; bumping it now would discard
@@ -423,7 +495,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         //    marks the round consumed: the first grant to cross the threshold moves
         //    currentTerm to newTerm, and every later grant of that round fails here.
         //    No separate round-ID bookkeeping is needed.
-        if (role == ServerRole.LEADER || newTerm <= store.getCurrentTerm()) return;
+        if (!ignoreLateGrantGuards && (role == ServerRole.LEADER || newTerm <= store.getCurrentTerm())) return;
         role = ServerRole.CANDIDATE;
         currentLeaderId = null;
         store.setTermAndVote(newTerm, config.selfId());
@@ -720,7 +792,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * leadership (issue #2), deterministically rather than by chance.
      */
     private boolean hasLeaderStickiness() {
-        if (role == ServerRole.LEADER) return true;
+        // With ElectionSwitches#leaderStickiness off, a LEADER falls through to the timestamp
+        // below -- which handleAppendEntries never writes on a leader, so it reads as "no leader
+        // contact since 1970" and the incumbent grants the vote that unseats it. That is issue #2
+        // exactly, and it is the half of the defect that decides whether the restarting node wins.
+        if (role == ServerRole.LEADER && config.electionSwitches().leaderStickiness()) return true;
         return System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
     }
 
@@ -2063,6 +2139,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     /** Current election epoch -- see {@link #electionEpoch}. Package-private, for tests. */
     long electionEpoch() { return electionEpoch.get(); }
+
+    /**
+     * The timeout, in milliseconds, that the currently armed election timer was scheduled with;
+     * 0 before the first one is armed. Package-private, for tests: the boot delay
+     * ({@link ElectionSwitches#electionBootDelayFactor()}) is otherwise only observable by
+     * waiting out a real timer, and a test that sleeps for a second to assert a delay is a test
+     * that will one day fail on a loaded build machine for reasons unrelated to the delay.
+     */
+    volatile int lastArmedElectionTimeoutMs = 0;
 
     public String currentLeaderId() { return currentLeaderId; }
 

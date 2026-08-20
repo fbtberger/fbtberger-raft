@@ -106,6 +106,24 @@ and `startRealElection` refuses any term not strictly greater than the current
 one -- which is also what makes a decided PreVote round idempotent against a
 late second grant.
 
+**Quorum latch (issue #3).** Idempotence-by-consequence is not the rule the code means, so the
+PreVote round now also carries its own latch: the first grant to cross the quorum threshold
+`compareAndSet`s the round to decided, and every later grant of that round returns. The term
+comparisons above still hold; the latch is what states the rule, and it keeps holding if a
+future caller ever reaches quorum without moving the term.
+
+**Boot grace (issue #2, requester side).** The first election timer after `start()` is scaled by
+`raft.election.boot-delay-factor` (default 6), because a restarting node has to outwait the
+incumbent's transport reconnecting to it -- measured at 498-802 ms, against an ordinary timeout
+of 150-300 ms -- not merely the heartbeat interval. Only that first timer is scaled: anything
+that resets the timer, which any heartbeat does, puts the node back on the ordinary schedule, so
+a real failover is not slowed down.
+
+**Switching the defects back on.** All three of the above are runtime switches
+(`ElectionSwitches`), defaulting to the fixed behaviour, so the talks can demonstrate the
+failures rather than assert them. See the README's "Election switches"; `ElectionDefectSwitchTest`
+pins both directions of each.
+
 # 5. Leadership Transfer (§3.10)
 
 A leader can gracefully hand off to a specific target server:

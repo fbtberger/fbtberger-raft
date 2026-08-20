@@ -181,7 +181,33 @@ tls.cert.path=/path/to/cert.pem
 tls.key.path=/path/to/key.pem
 tls.ca.path=/path/to/ca.pem
 tls.mtls.enabled=false
+
+# Election switches -- defaults shown. See "Election switches" below before
+# changing any of these: the non-default value of each one is a known defect.
+raft.prevote.quorum-latch=true
+raft.election.boot-delay-factor=6
+raft.prevote.leader-stickiness=true
 ```
+
+### Election switches
+
+Three keys can put a fixed election defect back into a running node, so a talk can show the
+failure instead of describing it. Each defaults to the fixed behaviour, and a `-D` system
+property of the same name overrides the file — one artifact and one properties file can
+therefore serve a run with the defect and a run without it.
+
+| Key | Default | The non-default value restores |
+|---|---|---|
+| `raft.prevote.quorum-latch` | `true` | **Issue #3.** The PreVote quorum handler fires once per grant instead of once per round: two peers granting the same round run two full elections, no step-down in between. |
+| `raft.election.boot-delay-factor` | `6` | **Issue #2, requester side.** `1` puts a freshly started node on the ordinary 150–300 ms timeout, so it campaigns before a live leader's transport has reconnected to it (the measured gap was 498–802 ms). |
+| `raft.prevote.leader-stickiness` | `true` | **Issue #2, responder side.** A LEADER stops counting as having leader contact and grants the (pre-)vote that unseats it. With three voters this grant *is* the challenger's quorum. |
+
+Issue #2 needs both of its switches to reproduce: the boot delay decides whether the restarting
+node campaigns, stickiness decides whether it wins. Lower the boot delay alone and the node
+campaigns and is refused by everyone — visible in the log, no leader change.
+
+A node whose switches are not all default logs that at WARN on startup, so a demo trace can
+still be read months later.
 
 ## Building
 
