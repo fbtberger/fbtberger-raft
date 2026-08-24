@@ -623,15 +623,45 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         StringBuilder sb = new StringBuilder("replication: lastLogIndex=").append(lastLogIndex)
                 .append(" commitIndex=").append(commitIndex.get());
 
+        java.util.Set<String> published = new java.util.LinkedHashSet<>();
         for (Map.Entry<String, String> member : currentConfiguration.entrySet()) {
             String id = member.getKey();
             if (id.equals(config.selfId())) continue;
             appendPeerStatus(sb, id, lastLogIndex, "voter");
+            publishPeerMetrics(id, "voter");
+            published.add(id);
         }
         for (Map.Entry<String, String> learner : currentLearners.entrySet()) {
             appendPeerStatus(sb, learner.getKey(), lastLogIndex, "learner");
+            publishPeerMetrics(learner.getKey(), "learner");
+            published.add(learner.getKey());
         }
+        // Everything not just published has left the configuration. Done here rather than
+        // where nodes are removed, so no removal path can forget it and leave a series
+        // claiming the leader still replicates to a node it does not.
+        metrics.forgetPeersExcept(published);
         log(sb.toString());
+    }
+
+    /**
+     * The same per-peer facts the line above prints, as metrics.
+     *
+     * <p>The log line has been the only way to see the live configuration from outside,
+     * and a log line is not an interface -- reading it means an SSH session and a parser
+     * coupled to a format nobody declared stable. The series carry the peer id and its
+     * role, so on a leader the set of series is the configuration itself.
+     */
+    private void publishPeerMetrics(String peerId, String role) {
+        if (!peerTransports.containsKey(peerId)) {
+            // No transport means this node has never been replicated to -- a defect the
+            // line above calls out. Publishing a match index for it would dress that up
+            // as mere lag.
+            return;
+        }
+        Long lastAck = peerLastAckMs.get(peerId);
+        metrics.peerReplication(peerId, role,
+                matchIndex.getOrDefault(peerId, 0L),
+                lastAck == null ? -1L : System.currentTimeMillis() - lastAck);
     }
 
     private void appendPeerStatus(StringBuilder sb, String id, long lastLogIndex, String role) {

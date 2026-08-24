@@ -11,6 +11,10 @@ import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
+import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 public final class RaftMetrics {
@@ -19,6 +23,9 @@ public final class RaftMetrics {
 
         private final MeterRegistry registry;
         private final Tags tags;
+
+        /** One entry per peer the leader is replicating to. Empty on a follower. */
+        private final Map<String, PeerMeters> peerMeters = new ConcurrentHashMap<>();
 
         private final Counter electionsStarted;
         private final Counter electionsWon;
@@ -105,6 +112,86 @@ public final class RaftMetrics {
                                 .description("Index of the last log entry").register(registry);
                 Gauge.builder("raft.node.snapshot.index", snapshotIndex).tags(tags)
                                 .description("Snapshot boundary (last compacted index)").register(registry);
+        }
+
+        /**
+         * How far each peer has got, as the leader sees it.
+         *
+         * <p>The leader already knows this -- it logs a line per peer every ten seconds --
+         * and until now that was the only way out. A log line is not an interface: reading
+         * it means an SSH session and a parser coupled to a format nobody declared stable.
+         *
+         * <p>The series carry a {@code peer} and a {@code peer_role} tag, so the set of
+         * series on the leader <em>is</em> the live configuration, roles included. That is
+         * something no other metric says: {@code raft.cluster.size} gives a count, and a
+         * node removed from the configuration keeps reporting the last count it knew.
+         *
+         * <p>Only a leader has any of this. A follower publishes nothing here, and a leader
+         * that steps down drops what it published -- see {@link #forgetPeersExcept}. A
+         * stale series claiming a node is still being replicated to would be worse than no
+         * series at all.
+         */
+        public void peerReplication(String peerId, String peerRole, long matchIndex, long lastAckAgeMillis) {
+                PeerMeters existing = peerMeters.get(peerId);
+                if (existing != null && !existing.role.equals(peerRole)) {
+                        // A learner that has been promoted is the same peer with a different
+                        // tag, and Micrometer keys a meter by name plus tags. Leaving the old
+                        // one would publish the node twice, once under each role.
+                        removePeerMeters(peerId, existing.role);
+                        existing = null;
+                }
+                if (existing == null) {
+                        existing = new PeerMeters(peerRole);
+                        Tags peerTags = tags.and("peer", peerId).and("peer_role", peerRole);
+                        Gauge.builder("raft.replication.match.index", existing.matchIndex, AtomicLong::doubleValue)
+                                        .tags(peerTags)
+                                        .description("Highest log index this peer has acknowledged, per the leader")
+                                        .register(registry);
+                        Gauge.builder("raft.replication.last.ack.seconds", existing.lastAckAgeMillis,
+                                        a -> a.get() < 0 ? Double.NaN : a.get() / 1000.0)
+                                        .tags(peerTags)
+                                        .description("Seconds since this peer last acknowledged anything")
+                                        .register(registry);
+                        peerMeters.put(peerId, existing);
+                }
+                existing.matchIndex.set(matchIndex);
+                existing.lastAckAgeMillis.set(lastAckAgeMillis);
+        }
+
+        /**
+         * Drops the peers that are no longer in the configuration.
+         *
+         * <p>Called with the whole membership every time it is published, so removal needs
+         * no separate notification and cannot be forgotten on a path that removes a node.
+         * Passing an empty collection clears everything, which is what a node that has just
+         * stepped down should do.
+         */
+        public void forgetPeersExcept(Collection<String> stillMembers) {
+                peerMeters.keySet().removeIf(peerId -> {
+                        if (stillMembers.contains(peerId)) {
+                                return false;
+                        }
+                        removePeerMeters(peerId, peerMeters.get(peerId).role);
+                        return true;
+                });
+        }
+
+        private void removePeerMeters(String peerId, String peerRole) {
+                Tags peerTags = tags.and("peer", peerId).and("peer_role", peerRole);
+                registry.find("raft.replication.match.index").tags(peerTags).gauges()
+                                .forEach(registry::remove);
+                registry.find("raft.replication.last.ack.seconds").tags(peerTags).gauges()
+                                .forEach(registry::remove);
+        }
+
+        private static final class PeerMeters {
+                private final String role;
+                private final AtomicLong matchIndex = new AtomicLong();
+                private final AtomicLong lastAckAgeMillis = new AtomicLong(-1);
+
+                private PeerMeters(String role) {
+                        this.role = role;
+                }
         }
 
         public void electionStarted() {
