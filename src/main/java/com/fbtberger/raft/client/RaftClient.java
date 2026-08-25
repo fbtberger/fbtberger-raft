@@ -63,6 +63,13 @@ public final class RaftClient implements AutoCloseable {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(2);
 
+    /**
+     * What a node that is not the leader answers -- set verbatim by
+     * {@code RaftClientGrpcService}, and the one rejection that carries no information
+     * about the request itself.
+     */
+    private static final String NOT_LEADER = "not leader";
+
     private final Map<String, String> clusterAddresses; // nodeId -> host:port
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile String knownLeaderId; // best guess; null means "unknown, try everyone"
@@ -231,6 +238,7 @@ public final class RaftClient implements AutoCloseable {
      */
     private void reconfigure(Function<String, ReconfigurationResponse> call) throws RaftClientException {
         RaftClientException lastError = null;
+        RaftClientException reasoned = null;
 
         for (String nodeId : candidateOrder()) {
             try {
@@ -240,12 +248,28 @@ public final class RaftClient implements AutoCloseable {
                     return;
                 }
                 knownLeaderId = response.getLeaderHint().isEmpty() ? null : response.getLeaderHint();
-                lastError = new RaftClientException(
+                RaftClientException rejection = new RaftClientException(
                         nodeId + " rejected the request (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
+                // Keep the first answer that says something beyond "not leader". The walk
+                // asks the leader first and every follower afterwards, so overwriting on
+                // each rejection means the caller is shown the last follower's "not
+                // leader" -- structurally the least informative answer available, and the
+                // one that hides the leader's actual objection. Measured twice against a
+                // live cluster: a promotion refused with "a previous configuration change
+                // has not committed yet; retry once it has" surfaced as "node1 rejected
+                // the request (not leader)", which sent two separate investigations after
+                // an election that had never happened. The term had not even changed.
+                if (reasoned == null && !NOT_LEADER.equals(response.getError())) {
+                    reasoned = rejection;
+                }
+                lastError = rejection;
             } catch (StatusRuntimeException e) {
                 knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
+        }
+        if (reasoned != null) {
+            throw reasoned;
         }
         throw lastError != null ? lastError : new RaftClientException("no nodes configured");
     }
