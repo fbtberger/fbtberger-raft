@@ -16,7 +16,6 @@ import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
-import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -58,18 +57,24 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 class GrpcMtlsRejectionTest {
 
-    private SelfSignedCertificate clusterCa;
-    private SelfSignedCertificate foreignCa;
+    private TestPki clusterPki;
+    private TestPki foreignPki;
+    private TestPki.Node legitimate;
+    private TestPki.Node rogue;
     private CountingHandler handler;
     private GrpcTransportServer server;
     private int port;
 
     @BeforeEach
     void setUp() throws Exception {
-        // Same CN on both, different issuer: the point of the test is that the NAME is worthless
-        // and only the signing authority counts.
-        clusterCa = new SelfSignedCertificate("localhost");
-        foreignCa = new SelfSignedCertificate("localhost");
+        // Same subject on both, different issuer. Since the sender-id binding landed, the name is
+        // no longer worthless -- it is what a peer is held to -- so both certificates carry the
+        // SAME node id, and the only thing separating them is the signing authority. That keeps
+        // this test about trust and lets the binding test be about identity.
+        clusterPki = TestPki.create("kwatro-cluster-ca");
+        foreignPki = TestPki.create("some-other-ca");
+        legitimate = clusterPki.issue(LEADER_ID);
+        rogue = foreignPki.issue(LEADER_ID);
         handler = new CountingHandler();
         try (ServerSocket ss = new ServerSocket(0)) {
             port = ss.getLocalPort();
@@ -83,17 +88,16 @@ class GrpcMtlsRejectionTest {
         if (server != null) {
             server.close();
         }
-        if (clusterCa != null) {
-            clusterCa.delete();
-        }
-        if (foreignCa != null) {
-            foreignCa.delete();
+        try {
+            if (clusterPki != null) clusterPki.close();
+            if (foreignPki != null) foreignPki.close();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
     private TlsConfig clusterTls() {
-        return new TlsConfig(true, clusterCa.certificate(), clusterCa.privateKey(),
-                clusterCa.certificate(), true);
+        return legitimate.tls(clusterPki);
     }
 
     /**
@@ -118,8 +122,8 @@ class GrpcMtlsRejectionTest {
     @DisplayName("a peer holding a certificate from a foreign CA never reaches the Raft handler")
     void rejectsPeerSignedByForeignCa() throws Exception {
         assertRejected(GrpcSslContexts.forClient()
-                .keyManager(foreignCa.certificate(), foreignCa.privateKey())
-                .trustManager(clusterCa.certificate())
+                .keyManager(rogue.certFile(), rogue.keyFile())
+                .trustManager(clusterPki.caFile())
                 .build());
     }
 
@@ -127,7 +131,7 @@ class GrpcMtlsRejectionTest {
     @DisplayName("a peer presenting no client certificate at all never reaches the Raft handler")
     void rejectsPeerWithoutClientCertificate() throws Exception {
         assertRejected(GrpcSslContexts.forClient()
-                .trustManager(clusterCa.certificate())
+                .trustManager(clusterPki.caFile())
                 .build());
     }
 
@@ -154,11 +158,14 @@ class GrpcMtlsRejectionTest {
                 "an untrusted peer reached the Raft handler — mTLS did not reject it");
     }
 
+    /** The node id both certificates carry, and the one every request below declares. */
+    private static final String LEADER_ID = "kwatro-1";
+
     /** A leaderId a rogue peer would plausibly claim, to keep the scenario concrete. */
     private static AppendEntriesRequest appendEntries() {
         return AppendEntriesRequest.newBuilder()
                 .setTerm(7)
-                .setLeaderId("kwatro-1")
+                .setLeaderId(LEADER_ID)
                 .setPrevLogIndex(0)
                 .setPrevLogTerm(0)
                 .build();

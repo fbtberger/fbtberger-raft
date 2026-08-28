@@ -157,9 +157,14 @@ class TlsAndTimeoutsTest {
 
     @Test
     void grpcMtlsRoundTrip() throws Exception {
-        SelfSignedCertificate ssc = new SelfSignedCertificate();
-        TlsConfig tlsConfig = new TlsConfig(true,
-                ssc.certificate(), ssc.privateKey(), ssc.certificate(), true);
+        // v162 -- a node certificate now has to carry the node id in its CN, because the server
+        // binds the sender id in the message to it. A bare SelfSignedCertificate cannot express
+        // that shape (CN is the hostname and there are no SANs), so the round trip is driven from
+        // the same throwaway PKI the transport tests use.
+        try (com.fbtberger.raft.transport.TestPki pki =
+                     com.fbtberger.raft.transport.TestPki.create("roundtrip-ca")) {
+        com.fbtberger.raft.transport.TestPki.Node node = pki.issue("leader");
+        TlsConfig tlsConfig = node.tls(pki);
 
         int port;
         try (ServerSocket ss = new ServerSocket(0)) { port = ss.getLocalPort(); }
@@ -183,6 +188,7 @@ class TlsAndTimeoutsTest {
             }
         } finally {
             server.close();
+        }
         }
     }
 
