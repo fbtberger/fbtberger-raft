@@ -8,6 +8,48 @@ plugins {
     jacoco
     id("com.google.protobuf") version "0.9.4"
     id("com.github.johnrengelman.shadow") version "8.1.1"
+    // Mutation testing. jacoco above says a line ran; this says whether a test would have
+    // noticed had the line been wrong.
+    id("info.solidsoft.pitest") version "1.15.0"
+}
+
+// ── Mutation testing ──────────────────────────────────────────────────────────
+//
+//   ./gradlew pitest
+//
+// Pointed at the classes that DECIDE and nothing else. RaftNode is 2530 lines of threads,
+// timers and sockets: one mutant there means booting a cluster, and the timing-dependent
+// suites (ChaosTest, the three-node ones) would report survivors that are really timeouts.
+// What is left is the arithmetic the whole protocol rests on — who is a majority, what a
+// configuration parses to, what the log does when it is truncated.
+pitest {
+    junit5PluginVersion.set("1.2.0")
+    targetClasses.set(listOf(
+        "com.fbtberger.raft.Quorum*",
+        "com.fbtberger.raft.ElectionSwitches*",
+        "com.fbtberger.raft.RaftConfig*",
+        "com.fbtberger.raft.HealthCheck*",
+        "com.fbtberger.raft.KeyValueStateMachine*",
+        "com.fbtberger.raft.InMemoryStorage*",
+        "com.fbtberger.raft.StorageMigration*"
+    ))
+    targetTests.set(listOf(
+        "com.fbtberger.raft.QuorumTest",
+        "com.fbtberger.raft.ElectionSwitchesTest",
+        // ElectionDefectSwitchTest is what actually pins both directions of the switches
+        // (CLAUDE.md: the defect must really appear in front of an audience). Leaving it out
+        // made ElectionSwitches look worse than it is.
+        "com.fbtberger.raft.ElectionDefectSwitchTest",
+        "com.fbtberger.raft.RaftConfigOfTest",
+        "com.fbtberger.raft.HealthCheckTest",
+        "com.fbtberger.raft.KeyValueStateMachineTest",
+        "com.fbtberger.raft.KeyValueStateMachineCowTest",
+        "com.fbtberger.raft.InMemoryStorageContractTest",
+        "com.fbtberger.raft.StorageMigrationTest"
+    ))
+    outputFormats.set(listOf("XML", "HTML"))
+    timestampedReports.set(false)
+    threads.set(2)
 }
 
 group = "com.fbtberger"

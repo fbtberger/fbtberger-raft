@@ -250,6 +250,42 @@ class StorageMigrationTest {
         return false;
     }
 
+    // ── which log is further ahead ───────────────────────────────────────────
+    //
+    // Raft's own comparison (§5.4.1), applied here to STORAGE rather than to votes: when both
+    // a WAL and a BerkeleyDB directory hold entries, this decides which one the node keeps.
+    // Getting it wrong discards committed entries silently.
+    //
+    // Found by mutation testing: the term line could be turned into `>=`, or made to return
+    // true outright, and nothing went red. Only the index comparison was pinned.
+
+    @Test
+    void aHigherTermWins_evenAgainstALongerLog() {
+        var shortButNewer = new StorageMigration.LogPosition(3, 1);
+        var longButOlder  = new StorageMigration.LogPosition(2, 50);
+
+        assertTrue(shortButNewer.isMoreUpToDateThan(longButOlder));
+        assertFalse(longButOlder.isMoreUpToDateThan(shortButNewer));
+    }
+
+    /** Equal terms are NOT ahead of each other — the boundary `>` rather than `>=`. */
+    @Test
+    void anEqualTermFallsThroughToTheIndex() {
+        var a = new StorageMigration.LogPosition(4, 10);
+        var b = new StorageMigration.LogPosition(4, 10);
+
+        assertFalse(a.isMoreUpToDateThan(b));
+        assertTrue(new StorageMigration.LogPosition(4, 11).isMoreUpToDateThan(b));
+    }
+
+    /** An empty log is never ahead of anything, whatever term it claims. */
+    @Test
+    void anEmptyLogIsNeverAhead() {
+        var empty = new StorageMigration.LogPosition(99, 0);
+
+        assertFalse(empty.isMoreUpToDateThan(new StorageMigration.LogPosition(1, 1)));
+    }
+
     private static List<LogEntry> entries(int fromInclusive, int toInclusive, long term) {
         List<LogEntry> list = new ArrayList<>();
         for (int i = fromInclusive; i <= toInclusive; i++) {
