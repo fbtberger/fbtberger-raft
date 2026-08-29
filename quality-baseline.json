@@ -1,0 +1,9 @@
+{
+  "_comment": "Quality floors for fbtberger-raft. Both numbers may only go UP -- see the kwatro repository's QUALITY.md. Pitest is pointed at the arithmetic the protocol rests on (Quorum, RaftConfig, storage), not at RaftNode: one mutant there means booting a cluster.",
+  "coverage": {
+    "line": 0.463519313304721
+  },
+  "mutation": {
+    "score": 0.8888888888888888
+  }
+}

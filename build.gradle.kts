@@ -22,6 +22,16 @@ plugins {
 // suites (ChaosTest, the three-node ones) would report survivors that are really timeouts.
 // What is left is the arithmetic the whole protocol rests on — who is a majority, what a
 // configuration parses to, what the log does when it is truncated.
+// The two numbers, with a floor under each (quality-baseline.json). See gradle/ratchet.gradle.kts
+// for what a ratchet is and how to raise one. This repository carries its own copy of that
+// script: kwatro's is in a different checkout, and a build must not reach outside its own.
+apply(from = file("gradle/ratchet.gradle.kts"))
+
+// Coverage is cheap once JaCoCo has run, so its floor is part of `check`.
+tasks.named("check") { dependsOn("coverageRatchet") }
+// The mutation floor is not: a run here takes minutes, so it is checked when it is asked for.
+tasks.named("pitest") { finalizedBy("mutationRatchet") }
+
 pitest {
     junit5PluginVersion.set("1.2.0")
     targetClasses.set(listOf(
