@@ -130,7 +130,7 @@ public final class GrpcTransportServer implements RaftTransportServer {
          */
         private static <T> void fail(String rpc, RuntimeException e,
                                      StreamObserver<T> observer, String context) {
-            LOG.error("Raft-RPC {} fehlgeschlagen{}", rpc,
+            LOG.error("Raft RPC {} failed{}", rpc,
                     context.isEmpty() ? "" : " (" + context + ")", e);
             observer.onError(e);
         }

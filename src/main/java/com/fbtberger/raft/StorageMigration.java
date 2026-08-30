@@ -81,7 +81,7 @@ public final class StorageMigration {
             return false;
         }
 
-        log.warn("{}-Log ist weiter als {} ({} vs {}) — migriere {} -> {}",
+        log.warn("The {} log is ahead of {} ({} vs {}) — migrating {} -> {}",
                 other, target, otherPos, targetPos, other, target);
 
         if (hasFilesFor(target, dataDir)) {
