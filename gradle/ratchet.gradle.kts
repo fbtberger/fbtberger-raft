@@ -122,6 +122,23 @@ val coverageRatchet by tasks.registering {
     val relative = (project.extra.properties["ratchetCoverageReport"] as? String)
         ?: "reports/jacoco/test/jacocoTestReport.xml"
     val report = layout.buildDirectory.file(relative)
+
+    // This task READS a report another task writes, and `check` pulls in both without saying
+    // which comes first — so Gradle was free to run the ratchet before the tests, and did.
+    // Measured here on 2026-08-30: `./gradlew clean build` failed with "no JaCoCo report" on a
+    // change that touched nothing but text. The loud failure is the lucky case. The quiet one is
+    // a build directory that still holds an OLDER report: the ratchet then passes, against a
+    // measurement that has nothing to do with this run — a green gate that measured yesterday.
+    //
+    // mustRunAfter rather than dependsOn: `check` already brings the tests along and the report
+    // comes from `test { finalizedBy(jacocoTestReport) }`. Only the order was missing. Two names,
+    // because the producer differs: JaCoCo's own task here, and the Android plugin's
+    // createDebugUnitTestCoverageReport in the kwatro repository, which carries the other copy of
+    // this file. `tasks.matching` is lazy and empty where a name does not exist.
+    mustRunAfter(tasks.matching {
+        it.name == "jacocoTestReport" || it.name == "createDebugUnitTestCoverageReport"
+    })
+
     doLast {
         val measured = jacocoLineRatio(report.get().asFile)
             ?: throw GradleException(
