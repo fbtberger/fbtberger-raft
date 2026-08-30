@@ -373,8 +373,13 @@ class ThreeNodeClusterTest {
     @Test
     void leaseReadCompletesOnMultiNodeCluster() throws Exception {
         leader().submitCommand("SET lk lv".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
-        Thread.sleep(100);
-        leader().leaseRead().get(2, TimeUnit.SECONDS);
+        // A lease read needs a lease, which needs a heartbeat round the leader has had time to
+        // complete. Waiting for the read to succeed says that directly; a hundred milliseconds
+        // only said it on this machine.
+        Await.until("a lease read completes", 5_000, () -> {
+            try { leader().leaseRead().get(2, TimeUnit.SECONDS); return true; }
+            catch (Exception e) { return false; }
+        });
     }
 
     // ------------------------------------------------------------------

@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -34,6 +35,8 @@ class MultiTransportClusterTest {
     }
 
     private final Map<String, RaftNode> nodes = new HashMap<>();
+    /** The wrappers around every node's incoming RPCs, for the latches in [DelegatingHandler]. */
+    private Map<String, DelegatingHandler> handlers = new HashMap<>();
     private final Map<String, KeyValueStateMachine> machines = new HashMap<>();
     private final List<AutoCloseable> closeables = new ArrayList<>();
     private NioEventLoopGroup nettyGroup;
@@ -56,7 +59,7 @@ class MultiTransportClusterTest {
     @EnumSource(Transport.class)
     void threeNodeClusterElectsLeader(Transport transport) throws Exception {
         startCluster(transport, 3);
-        awaitLeader(5_000);
+        awaitReplicatingCluster(5_000);
         long leaders = nodes.values().stream().filter(n -> n.role() == ServerRole.LEADER).count();
         assertEquals(1, leaders, "exactly one leader expected");
     }
@@ -65,7 +68,7 @@ class MultiTransportClusterTest {
     @EnumSource(Transport.class)
     void leaderReplicatesCommand(Transport transport) throws Exception {
         startCluster(transport, 3);
-        awaitLeader(5_000);
+        awaitReplicatingCluster(5_000);
         RaftNode leader = leader();
         assertNotNull(leader);
 
@@ -73,21 +76,26 @@ class MultiTransportClusterTest {
                 .get(5, TimeUnit.SECONDS);
         assertEquals("OK", new String(result, StandardCharsets.UTF_8));
 
-        Thread.sleep(300);
-        for (KeyValueStateMachine sm : machines.values()) {
-            assertEquals("v", sm.get("k"), "all state machines must converge");
-        }
+        // Wait for convergence itself, not for a guess at how long it takes. The sleep that
+        // was here also decided, run by run, whether the follower's AppendEntries handler had
+        // been reached before the test returned — which is how a passing suite still moved its
+        // coverage by ten lines.
+        Await.until("all state machines have converged on k=v", 5_000, () ->
+                machines.values().stream().allMatch(sm -> "v".equals(sm.get("k"))));
     }
 
     @ParameterizedTest
     @EnumSource(Transport.class)
     void followerRejectsCommand(Transport transport) throws Exception {
         startCluster(transport, 3);
-        awaitLeader(5_000);
+        awaitReplicatingCluster(5_000);
         RaftNode follower = nodes.values().stream()
                 .filter(n -> n.role() != ServerRole.LEADER).findFirst().orElseThrow();
         var f = follower.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
-        assertTrue(f.isCompletedExceptionally());
+        // The refusal travels back through the transport, so it is not necessarily there the
+        // instant submitCommand returns. Reading the future immediately made this test pass for
+        // the wrong reason on a fast machine and race on a slow one.
+        Await.until("the follower has refused the command", 5_000, f::isCompletedExceptionally);
     }
 
     // ---- setup helpers --------------------------------------------------
@@ -107,6 +115,7 @@ class MultiTransportClusterTest {
 
         // Phase 1: start servers with delegating handlers
         Map<String, DelegatingHandler> handlers = new HashMap<>();
+        this.handlers = handlers;
         for (var e : ports.entrySet()) {
             DelegatingHandler h = new DelegatingHandler();
             handlers.put(e.getKey(), h);
@@ -162,15 +171,34 @@ class MultiTransportClusterTest {
         };
     }
 
+    /**
+     * The seam every incoming RPC passes through — and therefore the place to be told that one
+     * has arrived, rather than to guess that it has by now.
+     *
+     * <p>The two latches are why they are here. Waiting for a leader is waiting for a proxy: a
+     * role flips as soon as the votes are counted, while the FOLLOWERS' side of the conversation
+     * — the handler that answered the vote, the handler that took the first AppendEntries — may
+     * not have been reached yet when the test returns. Measured on 2026-08-30 over identical
+     * suites (344 tests, no failures, no skips): those ten lines of the gRPC adapter were covered
+     * in some runs and not in others, all-or-nothing, and moved the repository's line coverage by
+     * twelve lines from run to run. A ratchet cannot be set against that.
+     *
+     * <p>A latch and not a poll, because there IS an event to be told about: this class already
+     * wraps the handler. Polling is for conditions that are only readable as state — see
+     * {@link Await}, which the rest of this test uses for exactly those.
+     */
     private static final class DelegatingHandler implements RaftRpcHandler {
         private volatile RaftRpcHandler delegate;
+        final CountDownLatch votesAnswered = new CountDownLatch(1);
+        final CountDownLatch appendsAnswered = new CountDownLatch(1);
+
         void setDelegate(RaftRpcHandler d) { this.delegate = d; }
 
         @Override public RequestVoteResponse handleRequestVote(RequestVoteRequest r) {
-            return delegate.handleRequestVote(r);
+            try { return delegate.handleRequestVote(r); } finally { votesAnswered.countDown(); }
         }
         @Override public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest r) {
-            return delegate.handleAppendEntries(r);
+            try { return delegate.handleAppendEntries(r); } finally { appendsAnswered.countDown(); }
         }
         @Override public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest r) {
             return delegate.handleInstallSnapshot(r);
@@ -186,6 +214,34 @@ class MultiTransportClusterTest {
     private RaftNode leader() {
         return nodes.values().stream()
                 .filter(n -> n.role() == ServerRole.LEADER).findFirst().orElse(null);
+    }
+
+    /**
+     * Wait until the cluster is not merely led but actually TALKING: a leader exists, some node
+     * has answered a vote, and some node has taken an AppendEntries.
+     *
+     * <p>That is a stronger claim than "a leader exists", and it is the one every test here
+     * actually depends on. It is also what makes the run reproducible — see [DelegatingHandler].
+     */
+    private void awaitReplicatingCluster(long timeoutMs) throws InterruptedException {
+        awaitLeader(timeoutMs);
+        assertTrue(anyLatch(timeoutMs, h -> h.votesAnswered),
+                "no node answered a RequestVote within " + timeoutMs + " ms");
+        assertTrue(anyLatch(timeoutMs, h -> h.appendsAnswered),
+                "no node answered an AppendEntries within " + timeoutMs + " ms");
+    }
+
+    /** True as soon as ONE of the nodes' latches has fired; a follower is enough. */
+    private boolean anyLatch(long timeoutMs,
+                             java.util.function.Function<DelegatingHandler, CountDownLatch> pick)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+        while (System.nanoTime() < deadline) {
+            for (DelegatingHandler h : handlers.values()) {
+                if (pick.apply(h).await(20, TimeUnit.MILLISECONDS)) return true;
+            }
+        }
+        return false;
     }
 
     private void awaitLeader(long timeoutMs) throws InterruptedException {

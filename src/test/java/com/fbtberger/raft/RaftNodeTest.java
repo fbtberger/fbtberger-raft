@@ -217,10 +217,9 @@ class RaftNodeTest {
         node.submitCommand("SET p 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
         node.submitCommand("SET q 2".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
 
-        // Allow one more heartbeat cycle for the trigger to fire
-        Thread.sleep(100);
-        assertTrue(node.snapshotIndex() > 0,
-                "automatic snapshot should have fired after threshold was reached");
+        // Wait for the trigger, rather than for one heartbeat cycle's worth of wall clock.
+        Await.until("the automatic snapshot has fired after the threshold was reached",
+                5_000, () -> node.snapshotIndex() > 0);
     }
 
     // ---- InstallSnapshot RPC receiver (§7) ------------------------------
@@ -566,9 +565,11 @@ class RaftNodeTest {
         startPeerNode("n2", "localhost:9092");
         node.addServer("n2", "localhost:9092").get(2, TimeUnit.SECONDS);
         node.transferLeadership("n2");
-        Thread.sleep(20);
-        CompletableFuture<byte[]> cmd = node.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8));
-        assertTrue(cmd.isCompletedExceptionally());
+        // Until the transfer has actually taken effect this node still accepts commands, so
+        // twenty milliseconds was a bet on how quickly it would stop.
+        Await.until("this node has stopped accepting commands after handing leadership over",
+                5_000, () -> node.submitCommand("SET x 1".getBytes(StandardCharsets.UTF_8))
+                        .isCompletedExceptionally());
     }
 
     @Test

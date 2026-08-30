@@ -131,8 +131,8 @@ class HealthCheckTest {
                 new KeyValueStateMachine(), addr -> null, RaftMetrics.noop());
         try {
             node.start();
-            Thread.sleep(200);
-            assertTrue(node.isReadyToServe());
+            Await.until("the single node reports itself ready to serve", 5_000,
+                    node::isReadyToServe);
         } finally { node.shutdown(); }
     }
 
