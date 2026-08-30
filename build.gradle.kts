@@ -166,6 +166,25 @@ tasks.jacocoTestReport {
         csv.required.set(true)
         xml.required.set(true)
     }
+
+    // Measure what someone wrote, not what protoc emitted.
+    //
+    // Two thirds of this repository by line count is generated: 6287 of 9113 lines live in
+    // com.fbtberger.raft.proto and com.fbtberger.raft.client.proto, almost all of it in the
+    // message classes and their $Builder. Measured on 2026-08-30, the generated part sat at
+    // 30.9 % and the hand-written part at 81.3 %, and the two together produced the 46 % that
+    // used to be the headline number. That number moved with the size of the .proto files
+    // rather than with the tests, which is the opposite of what a ratchet is for.
+    //
+    // Raising it would have meant tests for AppendEntriesRequest.newBuilder().setTerm(1) --
+    // which tests protoc. The build already draws exactly this line for the mutation run a few
+    // dozen lines above ("Pointed at the classes that DECIDE and nothing else"); coverage simply
+    // had not been told.
+    classDirectories.setFrom(
+        files(classDirectories.files.map {
+            fileTree(it) { exclude("com/fbtberger/raft/**/proto/**", "com/fbtberger/raft/proto/**") }
+        })
+    )
 }
 
 tasks.jar {
