@@ -56,13 +56,24 @@ public final class RaftServer {
 
         Runtime.getRuntime().addShutdownHook(new Thread(ctx::close));
 
-        runCli(raftNode, stateMachine);
+        runCli(raftNode, stateMachine,
+                new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)));
 
         ctx.close();
     }
 
-    private static void runCli(RaftNode raftNode, KeyValueStateMachine stateMachine) throws Exception {
-        BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+    /**
+     * The command loop, over whatever it is given to read.
+     *
+     * <p>The reader is a parameter and this method is package-private for one reason: it could
+     * not otherwise be tested. It used to build its own reader over {@code System.in}, and a
+     * method that reaches for a global has no seam — which is why the whole of this class sat at
+     * 0 % while carrying every operator-facing command there is. The argument parsing here is
+     * real decision logic: which command was meant, whether it came with the arguments it needs,
+     * and what to print when the cluster refuses. None of that was exercised by anything.
+     */
+    static void runCli(RaftNode raftNode, KeyValueStateMachine stateMachine, BufferedReader in)
+            throws Exception {
         String line;
         while ((line = in.readLine()) != null) {
             line = line.trim();
@@ -78,7 +89,13 @@ public final class RaftServer {
                     String value = stateMachine.get(line.substring(4).trim());
                     System.out.println(value == null ? "(not found)" : value);
                 } else if (line.regionMatches(true, 0, "SET ", 0, 4)) {
-                    byte[] result = raftNode.submitCommand(line.getBytes(StandardCharsets.UTF_8))
+                    // The verb is normalised before it is replicated. Every command here is
+                    // recognised case-insensitively, but SET is the one whose text is forwarded
+                    // VERBATIM to the state machine, which is case-sensitive: "set k v" was
+                    // accepted by this loop and then answered with "ERR unknown command: set k v".
+                    // Only the verb is touched — the key and the value are the operator's.
+                    byte[] result = raftNode
+                            .submitCommand(("SET " + line.substring(4)).getBytes(StandardCharsets.UTF_8))
                             .get(2, TimeUnit.SECONDS);
                     System.out.println(new String(result, StandardCharsets.UTF_8));
                 } else if (line.regionMatches(true, 0, "ADD ", 0, 4)) {
@@ -117,7 +134,8 @@ public final class RaftServer {
         }
     }
 
-    private static String describe(Throwable cause) {
+    /** Package-private for the same reason as {@link #runCli}: so it can be asked. */
+    static String describe(Throwable cause) {
         if (cause instanceof RaftNode.NotLeaderException nle) {
             return "not leader; try " + (nle.leaderHint != null ? nle.leaderHint : "(unknown leader, retry shortly)");
         }
