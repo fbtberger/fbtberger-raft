@@ -112,8 +112,8 @@ public final class GrpcTransportServer implements RaftTransportServer {
             String authenticated = PeerIdentity.AUTHENTICATED_NODE_ID.get();
             if (authenticated != null && authenticated.equals(claimedId)) return true;
 
-            LOG.error("Raft-RPC {} abgewiesen: Absender gibt sich als '{}' aus, "
-                            + "authentisiert ist '{}'", rpc, claimedId, authenticated);
+            LOG.error("Raft RPC {} refused: the sender claims to be '{}', the certificate "
+                            + "authenticates '{}'", rpc, claimedId, authenticated);
             observer.onError(io.grpc.Status.PERMISSION_DENIED
                     .withDescription("sender id does not match the authenticated certificate")
                     .asRuntimeException());

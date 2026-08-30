@@ -1080,7 +1080,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         if (transport == null) {
             // A configured member with no transport is replicated to by NOBODY — it will
             // never receive an entry again. That must not be silent (v101).
-            logThrottled(peerId, "kein Transport vorhanden — dieser Peer wird NICHT repliziert");
+            logThrottled(peerId, "no transport for this peer — it is NOT being replicated to");
             return;
         }
         long peerNextIndex = nextIndex.getOrDefault(peerId, 1L);

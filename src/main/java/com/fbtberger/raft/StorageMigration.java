@@ -88,7 +88,7 @@ public final class StorageMigration {
             // The target's files are STALE. Using them would silently roll this node back; deleting
             // them would destroy the only other copy if this migration is itself a mistake. Move.
             Path archive = archiveFilesFor(target, dataDir);
-            log.warn("Veralteter {}-Log beiseitegeschoben nach {}", target, archive);
+            log.warn("Stale {} log moved aside to {}", target, archive);
         }
 
         long copied;
@@ -96,8 +96,8 @@ public final class StorageMigration {
              RaftStorage destination = openRaw(target, dataDir)) {
             copied = copy(source, destination);
         }
-        log.info("Migration abgeschlossen: {} Einträge {} -> {}. Der {}-Log bleibt als "
-                + "Rückfallebene liegen.", copied, other, target, other);
+        log.info("Migration done: {} entries {} -> {}. The {} log is left in place as a "
+                + "fallback.", copied, other, target, other);
         return true;
     }
 
