@@ -4,137 +4,126 @@
  */
 package com.fbtberger.raft;
 
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.ApplicationContext;
-import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
-
 import com.fbtberger.raft.transport.RaftTransportFactory;
+import com.fbtberger.raft.transport.RaftTransportServer;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
-import static org.junit.jupiter.api.Assertions.*;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Properties;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Spring IoC integration tests. Verifies that {@link RaftNodeTestConfiguration}
- * (which mirrors the structure of the production {@link RaftNodeConfiguration})
- * loads without errors, all expected beans are present and correctly typed,
- * and the injected collaborators are the test doubles rather than real
- * external resources.
+ * The wiring that decides whether a node comes up at all.
  *
- * <p>These tests exercise the Spring wiring layer specifically. The behaviour
- * of the individual beans is covered by the unit tests in
- * {@link RaftNodeTest}, {@link RaftStorageContract} (run against every
- * {@link RaftStorage} implementation), and {@link KeyValueStateMachineTest}.
+ * <p>This class is how {@code RaftServer.main} builds everything: it reads the properties path
+ * out of a system property, loads the config, opens storage, picks a transport, assembles the
+ * metrics and hands all of it to a {@link RaftNode}. It was at 38 % coverage, and the parts that
+ * were dark are the parts a deployment gets wrong — a path that does not exist, a storage type
+ * nobody recognises, a port already taken.
+ *
+ * <p>Tested by booting the context for real rather than by calling the {@code @Bean} methods by
+ * hand. Calling them directly would prove that a method returns what its body says; booting
+ * proves that Spring can satisfy every dependency in it, which is the thing that actually fails.
+ *
+ * <p><b>The node is deliberately not started.</b> That is this configuration's own contract —
+ * see its class comment: {@code RaftNode.start()} belongs to {@code RaftServer}, after the
+ * transport server is confirmed listening. A test that started it would be testing a sequence
+ * this class explicitly does not own.
  */
-@SpringJUnitConfig(RaftNodeTestConfiguration.class)
 class RaftNodeConfigurationTest {
 
-    @Autowired ApplicationContext ctx;
-    @Autowired RaftConfig         config;
-    @Autowired RaftStorage        storage;
-    @Autowired StateMachine       stateMachine;
-    @Autowired RaftNode           raftNode;
-
-    // ---- context loads --------------------------------------------------
-
     @Test
-    void contextLoadsWithoutErrors() {
-        assertNotNull(ctx, "ApplicationContext must not be null");
+    @DisplayName("The context assembles a whole node from a properties file")
+    void bootsAWholeNode() throws Exception {
+        Path cfg = writeConfig("cfg-node", freePort());
+        System.setProperty("raft.config.path", cfg.toString());
+
+        try (var ctx = new AnnotationConfigApplicationContext(RaftNodeConfiguration.class)) {
+            RaftConfig config = ctx.getBean(RaftConfig.class);
+            assertEquals("cfg-node", config.selfId());
+
+            assertNotNull(ctx.getBean(RaftNode.class));
+            assertNotNull(ctx.getBean(KeyValueStateMachine.class));
+            assertNotNull(ctx.getBean(RaftStorage.class));
+            assertNotNull(ctx.getBean(RaftMetrics.class));
+            assertNotNull(ctx.getBean(RaftTransportServer.class));
+
+            // Singletons, not a fresh object per injection point: a second RaftNode would be a
+            // second state machine writing the same log directory.
+            assertSame(ctx.getBean(RaftNode.class), ctx.getBean(RaftNode.class));
+        } finally {
+            System.clearProperty("raft.config.path");
+        }
     }
 
+    /**
+     * The transport every peer call goes through is wrapped in a timeout. Without the wrapper a
+     * peer that accepts a connection and then says nothing blocks a replication thread for good,
+     * which is the failure that does not look like a failure.
+     */
     @Test
-    void allExpectedBeansArePresent() {
-        // Every class that the production configuration wires (minus the
-        // gRPC server, which is omitted from the test config) must be
-        // registered in the context.
-        assertTrue(ctx.containsBean("raftConfig"));
-        assertTrue(ctx.containsBean("raftStorage"));
-        assertTrue(ctx.containsBean("stateMachine"));
-        assertTrue(ctx.containsBean("transportFactory"));
-        assertTrue(ctx.containsBean("raftNode"));
+    @DisplayName("Peer transports are wrapped so a silent peer cannot block for ever")
+    void peerTransportsCarryATimeout() throws Exception {
+        Path cfg = writeConfig("cfg-timeout", freePort());
+        System.setProperty("raft.config.path", cfg.toString());
+
+        try (var ctx = new AnnotationConfigApplicationContext(RaftNodeConfiguration.class)) {
+            RaftTransportFactory factory = ctx.getBean(RaftTransportFactory.class);
+            assertNotNull(factory);
+            var transport = factory.connect("localhost:1");   // never dialled until used
+            assertTrue(transport.getClass().getSimpleName().contains("Timeout"),
+                    "expected a timeout wrapper, got " + transport.getClass().getName());
+        } finally {
+            System.clearProperty("raft.config.path");
+        }
     }
 
-    // ---- correct types / test doubles wired -----------------------------
-
+    /**
+     * A path that is not there must fail while the context is being built, loudly. The
+     * alternative — a node that starts and then cannot say what it is — is what makes a bad
+     * deployment look like a network problem.
+     */
     @Test
-    void storageIsInMemoryNotBerkeleyDb() {
-        // The test configuration replaces BerkeleyDbStorage with InMemoryStorage
-        // so that tests never touch the file system.
-        assertInstanceOf(InMemoryStorage.class, storage,
-                "test config must wire InMemoryStorage, not BerkeleyDbStorage");
+    @DisplayName("A configuration file that does not exist stops the context, not the cluster")
+    void missingConfigFileFailsFast() {
+        System.setProperty("raft.config.path", "/definitely/not/here/node.properties");
+        try {
+            assertThrows(Exception.class,
+                    () -> new AnnotationConfigApplicationContext(RaftNodeConfiguration.class).close());
+        } finally {
+            System.clearProperty("raft.config.path");
+        }
     }
 
-    @Test
-    void stateMachineIsKeyValueStateMachine() {
-        assertInstanceOf(KeyValueStateMachine.class, stateMachine);
+    // ---- helpers ------------------------------------------------------------
+
+    private static Path writeConfig(String id, int port) throws Exception {
+        Properties props = new Properties();
+        props.setProperty("node.id", id);
+        props.setProperty("node.port", String.valueOf(port));
+        props.setProperty("data.dir", Files.createTempDirectory("raft-cfg-").toString());
+        props.setProperty("peer." + id, "localhost:" + port);
+        props.setProperty("snapshot.threshold", "100");
+        Path tmp = Files.createTempFile("raft-cfg-", ".properties");
+        try (OutputStream out = Files.newOutputStream(tmp)) {
+            props.store(out, null);
+        }
+        return tmp;
     }
 
-    @Test
-    void transportFactoryReturnsNullForAnyAddress() {
-        RaftTransportFactory factory = ctx.getBean(RaftTransportFactory.class);
-        assertNull(factory.connect("localhost:9999"),
-                "test transport factory must return null for every address");
-    }
-
-    // ---- RaftConfig values loaded from temp properties file -------------
-
-    @Test
-    void configSelfIdMatchesTestProperties() {
-        assertEquals("test-node", config.selfId());
-    }
-
-    @Test
-    void configPortMatchesTestProperties() {
-        assertEquals(19999, config.selfPort());
-    }
-
-    @Test
-    void configContainsSelfInPeerList() {
-        assertTrue(config.peerAddresses().containsKey("test-node"),
-                "peer list must include the node itself (used to compute cluster size)");
-    }
-
-    @Test
-    void configSnapshotThresholdMatchesTestProperties() {
-        assertEquals(10, config.snapshotThreshold());
-    }
-
-    // ---- RaftNode wired to the right collaborators ----------------------
-
-    @Test
-    void raftNodeUsesInjectedStorage() {
-        // Store a value directly, then verify RaftNode sees the same store.
-        // Before any entries are appended the term must be 0.
-        assertEquals(0, storage.getCurrentTerm(),
-                "freshly injected storage must start at term 0");
-    }
-
-    @Test
-    void raftNodeStartsAsFollowerAndShutDownCleanly() {
-        // Before start() is called, the node must be a FOLLOWER (§5.1).
-        // After start(), a single-node cluster immediately elects itself
-        // leader (majority == 1), so the FOLLOWER assertion must come first.
-        assertEquals(ServerRole.FOLLOWER, raftNode.role(),
-                "every node starts as FOLLOWER per §5.1");
-        raftNode.start();
-        raftNode.shutdown();
-        // A second shutdown must be idempotent (scheduler.shutdownNow()
-        // on an already-terminated executor is a no-op).
-        assertDoesNotThrow(raftNode::shutdown);
-    }
-
-    // ---- dependency injection is constructor-based, not field injection --
-
-    @Test
-    void raftNodeIsASingleton() {
-        // Spring default scope is singleton: both lookups must return
-        // the exact same instance.
-        RaftNode a = ctx.getBean(RaftNode.class);
-        RaftNode b = ctx.getBean(RaftNode.class);
-        assertSame(a, b, "RaftNode must be a Spring singleton");
-    }
-
-    @Test
-    void storageIsASingleton() {
-        assertSame(ctx.getBean(RaftStorage.class), ctx.getBean(RaftStorage.class));
+    private static int freePort() throws Exception {
+        try (ServerSocket s = new ServerSocket(0)) {
+            return s.getLocalPort();
+        }
     }
 }

@@ -133,9 +133,18 @@ public class RaftNodeConfiguration {
     public RaftNodeMXBean raftNodeMBean(RaftNode raftNode, RaftStorage storage) {
         RaftNodeMBean mbean = new RaftNodeMBean(raftNode, storage);
         try {
-            java.lang.management.ManagementFactory.getPlatformMBeanServer()
-                    .registerMBean(mbean,
-                            new javax.management.ObjectName("com.fbtberger.raft:type=RaftNode"));
+            var server = java.lang.management.ManagementFactory.getPlatformMBeanServer();
+            var name = new javax.management.ObjectName("com.fbtberger.raft:type=RaftNode");
+            // Replace, do not fail. The name is a constant and nothing unregisters it when the
+            // context closes, so a SECOND context in the same JVM used to die on
+            // InstanceAlreadyExistsException -- and take the whole node with it, because this
+            // throws. That is a restart in the same process, and it is also why this class could
+            // not be tested at all: the second test to boot a context hit it.
+            //
+            // The name is left as it is on purpose: it is what a JMX console is pointed at, so
+            // adding the node id here would be a change to something outside this repository.
+            if (server.isRegistered(name)) server.unregisterMBean(name);
+            server.registerMBean(mbean, name);
         } catch (Exception e) {
             throw new RuntimeException("failed to register RaftNode MBean", e);
         }
