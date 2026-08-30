@@ -1,9 +1,8 @@
 {
   "_comment": "Quality floors for fbtberger-raft. Both numbers may only go UP -- see the kwatro repository's QUALITY.md. Pitest is pointed at the arithmetic the protocol rests on (Quorum, RaftConfig, storage), not at RaftNode: one mutant there means booting a cluster.",
-  "_coverage_note": "LOWERED from 0.4635193 to 0.46 on 2026-08-30, deliberately, and this is the commit that says why. That number was never reproducible: five measurements in one sitting gave 4211, 4211, 4200, 4200 and 4200 covered lines out of 9087 -- a spread of twelve lines, 46.22 % to 46.34 % -- and the recorded floor of 4212 was the high-water mark of that spread from an earlier session. It only ever passed because coverageRatchet was reading a report from an OLDER run: the task read a file another task writes, and nothing ordered the two. Fixing that ordering (see gradle/ratchet.gradle.kts) is what made the ratchet read this run's measurement and fail. The spread itself is real and is not the ratchet's fault -- this repository's tests drive elections and timeouts, so different runs walk different branches. A floor has to sit under the whole spread or it tears at random, which is a ratchet nobody can commit through. Raise it once the measurement is stable, not before."
-  ,
+  "_coverage_note": "The floor is 0.80 against a measured 80.9 %. Two things changed on 2026-08-30. First, the report no longer counts protoc output: two thirds of this repository by line count is generated (6287 of 9113 lines), it sat at 30.9 %, and together with the hand-written 81.3 % it produced the 46 % that used to be the headline. That number moved with the size of the .proto files rather than with the tests. Second, the tests stopped sleeping: fixed waits were replaced by conditions and, where the code has an event to signal, by latches on the RPC seam. Measured before: 344 tests, no failures, no skips, and line coverage moving between 4199 and 4214 from run to run. Measured after, over four forced re-runs: 2284, 2285, 2284, 2285 -- a spread of one line. The margin to 0.80 is for that one line and no more; raise it when a run is worth pinning.",
   "coverage": {
-    "line": 0.46
+    "line": 0.8
   },
   "mutation": {
     "score": 0.8888888888888888
