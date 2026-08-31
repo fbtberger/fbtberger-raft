@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -73,6 +74,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final RaftMetrics metrics;
     private final Map<String, RaftTransport> peerTransports = new ConcurrentHashMap<>(); // excludes self
     private final ScheduledExecutorService scheduler;
+    /** Snapshot work only; see the constructor for why it is not the scheduler. */
+    private final ExecutorService snapshotExecutor;
 
     private final ReentrantLock lock = new ReentrantLock();
     private volatile ServerRole role = ServerRole.FOLLOWER;
@@ -226,6 +229,28 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             t.setDaemon(true);
             return t;
         });
+        // Snapshots get a thread of their own, and it is not a preference.
+        //
+        // The scheduler above has two threads and four other users: the election timer,
+        // the heartbeat, the read barrier and the leadership-transfer timeout. Every one
+        // of those is short and bounded. Taking a snapshot is the only work in this class
+        // with no bound at all -- it serialises whatever the state machine holds and
+        // writes it to disk -- and it used to run there too.
+        //
+        // The copy-on-write path (see takeSnapshotAsync) already keeps serialisation off
+        // the Raft lock, which makes it easy to believe the cost was contained. It is not
+        // the lock that decides elections; it is the timers, and they were sharing two
+        // threads with the one task that can occupy them indefinitely. On this repo's
+        // demo cluster a snapshot costs 5 ms and nothing is visible -- which is precisely
+        // the shape of a fault that waits for a bigger state machine to appear.
+        //
+        // Single-threaded, not a pool: snapshotInProgress already permits only one at a
+        // time, so a second thread could never have work.
+        this.snapshotExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "raft-snapshot-" + config.selfId());
+            t.setDaemon(true);
+            return t;
+        });
         // Still single-threaded at this point (inside the constructor), so
         // it's safe to seed our view of the cluster without holding `lock`.
         // If a previous run already took (or installed) a snapshot, restore
@@ -280,6 +305,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     public void shutdown() {
         scheduler.shutdownNow();
+        snapshotExecutor.shutdownNow();
         for (RaftTransport transport : peerTransports.values()) {
             transport.close();
         }
@@ -1480,7 +1506,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
 
         snapshotInProgress = true;
-        scheduler.execute(() -> {
+        snapshotExecutor.execute(() -> {
             // Timed, because this body occupies one of the scheduler's two threads, and the
             // other four users of that pool are the heartbeat, the election timer, the read
             // barrier and the transfer timeout. How long a snapshot takes is therefore a
