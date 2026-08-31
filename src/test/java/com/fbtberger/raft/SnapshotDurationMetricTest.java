@@ -70,14 +70,62 @@ class SnapshotDurationMetricTest {
                 "the count and the timer must describe the same events");
     }
 
+    /**
+     * The half that runs under the Raft lock is timed separately, because it is the more
+     * dangerous one.
+     *
+     * <p>{@code StateMachine#prepareCowSnapshot} is called with the lock held. The SPI asks
+     * implementations to be cheap there and permits them not to be:
+     * {@code SqlCrudStateMachine} reads its whole table, deliberately, because deferring a
+     * read of a mutating table is the worse mistake. Whatever it costs, heartbeats and votes
+     * wait for it -- so this is the only part of taking a snapshot that can depose a leader
+     * without touching a disk, and until this timer it was the only part nobody measured.
+     * {@code raft.snapshot.duration} starts after it, inside the executor.
+     */
+    @Test
+    void theLockHeldCaptureIsTimedSeparatelyFromTheWrite() throws Exception {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RaftMetrics metrics = new RaftMetrics(registry, "n1");
+        // Threshold 1, so applying one command triggers the background path -- the only
+        // one that captures under the lock. snapshotNow() takes a different route.
+        node = new RaftNode(config("n1", 1), new InMemoryStorage(),
+                new KeyValueStateMachine(), addr -> null, metrics);
+        node.start();
+
+        long deadline = System.currentTimeMillis() + 2_000;
+        while (node.role() != ServerRole.LEADER && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        node.submitCommand("SET a 1".getBytes(StandardCharsets.UTF_8)).get(2, TimeUnit.SECONDS);
+
+        deadline = System.currentTimeMillis() + 5_000;
+        while (metrics.captureSnapshotTimer().count() == 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        // Not "exactly one": at threshold 1 the leader's own no-op entry is already enough
+        // to trigger one, so how many happen is a matter of timing. What must hold is that
+        // the lock-held phase is measured where it happens, and that it is never measured
+        // fewer times than the write it precedes -- the write can be skipped when a newer
+        // snapshot landed first, the capture cannot.
+        assertTrue(metrics.captureSnapshotTimer().count() >= 1,
+                "the lock-held capture was not timed at all");
+        assertTrue(metrics.captureSnapshotTimer().totalTime(TimeUnit.NANOSECONDS) > 0,
+                "a capture that takes no measurable time was not measured");
+        assertTrue(metrics.captureSnapshotTimer().count() >= metrics.takeSnapshotTimer().count(),
+                "every write was preceded by a capture, so it cannot be counted more often");
+    }
+
     private static RaftConfig singleNodeConfig() throws Exception {
+        return config("n1", 1_000_000);
+    }
+
+    private static RaftConfig config(String id, int snapshotThreshold) throws Exception {
         Properties props = new Properties();
-        props.setProperty("node.id", "n1");
+        props.setProperty("node.id", id);
         props.setProperty("node.port", "9091");
         props.setProperty("data.dir", "/tmp/raft-snapshot-metric-unused");
-        props.setProperty("peer.n1", "localhost:9091");
-        // High, so the only snapshot in this test is the one it asks for.
-        props.setProperty("snapshot.threshold", "1000000");
+        props.setProperty("peer." + id, "localhost:9091");
+        props.setProperty("snapshot.threshold", String.valueOf(snapshotThreshold));
         Path tmp = Files.createTempFile("raft-snapshot-metric-", ".properties");
         try (OutputStream out = Files.newOutputStream(tmp)) {
             props.store(out, null);

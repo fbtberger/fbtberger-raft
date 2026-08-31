@@ -1502,7 +1502,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
         long includedTerm = store.getTermAt(applied);
+        // Timed separately from the body below, and it is the more dangerous half: this
+        // runs under the Raft lock, so whatever the state machine does here delays every
+        // heartbeat and every vote. The SPI asks implementations to be cheap here, and
+        // permits them not to be -- SqlCrudStateMachine reads its whole table on purpose,
+        // because deferring a read of a mutating table is the worse mistake. Nothing said
+        // how long that took.
+        long captureStartNanos = System.nanoTime();
         java.util.function.Supplier<byte[]> cowSnapshot = captureCowSnapshot();
+        metrics.captureSnapshotTimer().record(System.nanoTime() - captureStartNanos, TimeUnit.NANOSECONDS);
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
 
         snapshotInProgress = true;

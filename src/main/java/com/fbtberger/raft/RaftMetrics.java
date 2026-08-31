@@ -45,6 +45,7 @@ public final class RaftMetrics {
         private final Timer requestVoteTimer;
         private final Timer installSnapshotTimer;
         private final Timer takeSnapshotTimer;
+        private final Timer captureSnapshotTimer;
         private final Timer clientSubmitTimer;
 
         public RaftMetrics(MeterRegistry registry, String nodeId) {
@@ -91,6 +92,14 @@ public final class RaftMetrics {
                 // availability, not about disk.
                 this.takeSnapshotTimer = Timer.builder("raft.snapshot.duration")
                                 .tags(tags).description("Time to serialise a snapshot and compact the log").register(registry);
+                // The half nobody was measuring. StateMachine#prepareCowSnapshot runs under
+                // the Raft lock, and an implementation is free to serialise there rather
+                // than hand back a lazy supplier -- SqlCrudStateMachine does exactly that,
+                // deliberately, because deferring a read of a mutating table is worse. Under
+                // the lock means heartbeats wait too, so this is the one part of taking a
+                // snapshot that can cost a node its leadership without touching a disk.
+                this.captureSnapshotTimer = Timer.builder("raft.snapshot.capture")
+                                .tags(tags).description("Time the Raft lock is held capturing state machine state for a snapshot").register(registry);
                 this.clientSubmitTimer = Timer.builder("raft.client.submit")
                                 .tags(tags).description("Client command submit-to-commit time").register(registry);
         }
@@ -260,6 +269,10 @@ public final class RaftMetrics {
 
         public Timer requestVoteTimer() {
                 return requestVoteTimer;
+        }
+
+        public Timer captureSnapshotTimer() {
+                return captureSnapshotTimer;
         }
 
         public Timer takeSnapshotTimer() {
