@@ -1481,6 +1481,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
         snapshotInProgress = true;
         scheduler.execute(() -> {
+            // Timed, because this body occupies one of the scheduler's two threads, and the
+            // other four users of that pool are the heartbeat, the election timer, the read
+            // barrier and the transfer timeout. How long a snapshot takes is therefore a
+            // statement about availability, and until this timer existed nothing measured
+            // it: raft.snapshot.taken counts them, and a count cannot tell a 5 ms snapshot
+            // from a 2 s one. See raft.snapshot.duration.
+            long startNanos = System.nanoTime();
             try {
                 if (applied <= store.getSnapshotIndex()) {
                     return;
@@ -1490,6 +1497,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         applied, includedTerm, stateMachineData, configurationData);
                 store.saveSnapshotAndCompact(snapshot);
                 metrics.snapshotTaken();
+                metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                 log("snapshotted through index " + snapshot.lastIncludedIndex
                         + " (term " + snapshot.lastIncludedTerm
                         + "); log entries at or before it have been discarded");
@@ -1518,10 +1526,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
         long includedTerm = store.getTermAt(applied);
+        // Timed like the async path, and this one is the worse of the two: it holds the
+        // Raft lock throughout. A measurement that only covered the background path would
+        // report the cheaper case.
+        long startNanos = System.nanoTime();
         byte[] stateMachineData = stateMachine.takeSnapshot();
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
         store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
         metrics.snapshotTaken();
+        metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
         log("snapshotted through index " + applied + " (term " + includedTerm
                 + "); log entries at or before it have been discarded");
     }

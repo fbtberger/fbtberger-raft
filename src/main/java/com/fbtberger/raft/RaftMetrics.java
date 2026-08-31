@@ -44,6 +44,7 @@ public final class RaftMetrics {
         private final Timer appendEntriesTimer;
         private final Timer requestVoteTimer;
         private final Timer installSnapshotTimer;
+        private final Timer takeSnapshotTimer;
         private final Timer clientSubmitTimer;
 
         public RaftMetrics(MeterRegistry registry, String nodeId) {
@@ -83,6 +84,13 @@ public final class RaftMetrics {
                                 .tags(tags).description("RequestVote RPC handling time").register(registry);
                 this.installSnapshotTimer = Timer.builder("raft.rpc.install.snapshot")
                                 .tags(tags).description("InstallSnapshot RPC handling time").register(registry);
+                // How long taking one costs, as opposed to how many were taken. The counter
+                // says a snapshot happened; only this says what it did to the node while it
+                // was happening -- and the work runs on the same two-thread scheduler as the
+                // heartbeat and the election timer, so "what it cost" is a question about
+                // availability, not about disk.
+                this.takeSnapshotTimer = Timer.builder("raft.snapshot.duration")
+                                .tags(tags).description("Time to serialise a snapshot and compact the log").register(registry);
                 this.clientSubmitTimer = Timer.builder("raft.client.submit")
                                 .tags(tags).description("Client command submit-to-commit time").register(registry);
         }
@@ -252,6 +260,10 @@ public final class RaftMetrics {
 
         public Timer requestVoteTimer() {
                 return requestVoteTimer;
+        }
+
+        public Timer takeSnapshotTimer() {
+                return takeSnapshotTimer;
         }
 
         public Timer installSnapshotTimer() {
