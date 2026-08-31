@@ -329,9 +329,21 @@ public class StorageBenchmark {
     // a property of the backend, not of Raft. If the WAL does not have it, the demo cluster
     // is paying for recovery speed with a ceiling on how much log it may keep.
     //
-    // Parameterised over how much is discarded, because the shape of the curve IS the
-    // finding: flat for the WAL, linear for BDB, is the hypothesis. A single size could not
-    // tell those apart.
+    // Parameterised over how much is discarded, because the shape of the curve is the
+    // finding and a single size cannot show it. Measured (25 single shots each, quiet
+    // machine, laptop NVMe), in ms:
+    //
+    //   discarded      wal              bdb            ratio
+    //         200    0.211 +- 0.066    2.664 +- 0.892   12.6x
+    //        2000    0.403 +- 0.083   12.122 +- 3.939   30x
+    //       20000    1.476 +- 0.387   73.955 +- 6.104   50x
+    //
+    // "Flat versus linear" was the hypothesis and it is too coarse in both directions: over
+    // a hundredfold range BDB grows 28x and the WAL 7x, and both carry a fixed cost -- 2.7 ms
+    // and 0.21 ms -- that is the snapshot write itself, not the discarding. What separates
+    // them is the marginal cost per entry discarded: 3.6 us against 0.064 us, a factor of 56.
+    // That is why the ratio itself climbs with size, and it is the whole reason the demo
+    // cluster's snapshot threshold has an upper bound on BDB.
     @State(Scope.Thread)
     public static class CompactState {
 
