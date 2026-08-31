@@ -13,6 +13,7 @@ import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
+import com.fbtberger.raft.RaftStorage.Snapshot;
 import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
@@ -313,6 +314,86 @@ public class StorageBenchmark {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /** ~120 bytes: a kwatro command is a small protobuf, not a blob. */
+    // ── 4: compaction — the axis the storage choice was never made on ────────
+    //
+    // Berkeley DB was chosen over the WAL on two measurements: recovery, 7.8x, and blocking
+    // append, 2.2x. Compaction was not one of them, and it is where the two differ most in
+    // kind rather than degree. BDB deletes the discarded entries one record at a time inside
+    // one transaction; the WAL clears an index range and unlinks whole segment files. One is
+    // O(entries discarded), the other O(segments).
+    //
+    // That difference is not academic. On the Pi cluster, at a snapshot threshold of 20000,
+    // one compaction took 450-760 ms while an election timeout is 300 ms: heartbeats failed
+    // to all four peers, the leader stepped down, two terms passed in half a second. The
+    // threshold had to be bounded from above -- 2000, measured at 27 ms -- and that bound is
+    // a property of the backend, not of Raft. If the WAL does not have it, the demo cluster
+    // is paying for recovery speed with a ceiling on how much log it may keep.
+    //
+    // Parameterised over how much is discarded, because the shape of the curve IS the
+    // finding: flat for the WAL, linear for BDB, is the hypothesis. A single size could not
+    // tell those apart.
+    @State(Scope.Thread)
+    public static class CompactState {
+
+        @Param({"wal", "bdb"})
+        public String impl;
+
+        /** Entries the snapshot discards -- the demo cluster has run at 100, 2000 and 20000. */
+        @Param({"2000", "20000"})
+        public int discarded;
+
+        /**
+         * Entries left above the boundary. Never zero: a leader compacts while it is still
+         * appending, so a compaction that finds an empty log afterwards is not the one a
+         * cluster performs.
+         */
+        @Param({"500"})
+        public int keptAbove;
+
+        Path dir;
+        RaftStorage store;
+        Snapshot snapshot;
+
+        @Setup(Level.Invocation)
+        public void buildTheLogToCompact() throws IOException {
+            dir = Files.createTempDirectory("raft-bench-compact-");
+            store = open(impl, dir);
+            long index = 1;
+            List<LogEntry> chunk = new ArrayList<>(500);
+            int total = discarded + keptAbove;
+            for (int written = 0; written < total; written += 500) {
+                chunk.clear();
+                for (int i = 0; i < Math.min(500, total - written); i++) {
+                    chunk.add(LogEntry.newBuilder()
+                            .setIndex(index++).setTerm(1).setCommand(PAYLOAD).build());
+                }
+                store.appendEntries(chunk);
+            }
+            // The state machine payload is deliberately small and constant: this benchmark is
+            // about discarding log, not about serialising state. What the demo's state machine
+            // costs is measured separately, on the cluster, as raft.snapshot.capture.
+            snapshot = new Snapshot(discarded, 1, new byte[] {1}, new byte[] {2});
+        }
+
+        @TearDown(Level.Invocation)
+        public void discardStore() throws IOException {
+            if (store != null) {
+                store.close();
+                store = null;
+            }
+            deleteRecursively(dir);
+        }
+    }
+
+    /** One compaction, set up but not timed, so the clock covers only the discarding. */
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    @OutputTimeUnit(TimeUnit.MILLISECONDS)
+    public long compactAwayTheDiscardedEntries(CompactState s) {
+        s.store.saveSnapshotAndCompact(s.snapshot);
+        return s.store.getSnapshotIndex();
+    }
+
     private static final ByteString PAYLOAD =
             ByteString.copyFromUtf8("x".repeat(120));
 
