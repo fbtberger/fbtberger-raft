@@ -44,6 +44,18 @@ public final class BerkeleyDbStorage implements RaftStorage {
     private static final byte[] KEY_SNAPSHOT_STATE = "snapshotState".getBytes(StandardCharsets.UTF_8);
     private static final byte[] KEY_SNAPSHOT_CONFIG = "snapshotConfig".getBytes(StandardCharsets.UTF_8);
 
+    /**
+     * Entries deleted per transaction while compacting, and the number is chosen against
+     * the election timeout rather than against throughput.
+     *
+     * <p>Measured on the Pi cluster: 20000 entries took 450 ms, so roughly 22 us each. Five
+     * hundred is about 11 ms of monitor -- a thirtieth of {@code ELECTION_TIMEOUT_MAX_MS},
+     * which leaves room for an append to be delayed by a batch and still be nowhere near
+     * costing anyone their leadership. Smaller would buy little and pay a transaction for
+     * it; larger walks back towards the pause this split exists to remove.
+     */
+    private static final int COMPACTION_BATCH = 500;
+
     private final Environment env;
     private final Database metaDb; // currentTerm, votedFor, snapshot metadata + payload
     private final Database logDb;  // index -> LogEntry
@@ -99,6 +111,18 @@ public final class BerkeleyDbStorage implements RaftStorage {
                 LogEntry entry = parseEntry(value.getData());
                 this.lastLogIndex = entry.getIndex();
                 this.lastLogTerm = entry.getTerm();
+                if (this.lastLogIndex < snapshotIndex) {
+                    // Entries left below the snapshot boundary, which compaction discards
+                    // in batches after committing the boundary: a process that died in
+                    // between leaves some behind. They are not stale -- a committed entry
+                    // is immutable and the snapshot covers exactly them -- but the LAST
+                    // one of them is not the last log index, and reporting it as such puts
+                    // lastLogIndex below snapshotIndex, which is a state no invariant in
+                    // this class survives. The next compaction sweeps them; until then the
+                    // boundary is what the log ends at.
+                    this.lastLogIndex = snapshotIndex;
+                    this.lastLogTerm = snapshotTerm;
+                }
             } else {
                 // No entries physically in the log -- either nothing has
                 // ever been appended, or everything has been compacted away
@@ -295,14 +319,41 @@ public final class BerkeleyDbStorage implements RaftStorage {
      * were; only a prefix is ever discarded.
      */
     @Override
-    public synchronized void saveSnapshotAndCompact(Snapshot snapshot) {
+    public void saveSnapshotAndCompact(Snapshot snapshot) {
+        // Deliberately NOT synchronized as a whole, and split in two.
+        //
+        // It used to be one synchronized method holding one transaction while it deleted
+        // every entry up to the boundary -- and appendEntries is synchronized on the same
+        // monitor, so the log could not grow for as long as that took. The cost is
+        // proportional to the entries discarded, which makes it a function of the snapshot
+        // threshold rather than of anything bounded: measured on the Pi cluster at a
+        // threshold of 20000, 450 ms during which heartbeats failed to all four peers, the
+        // leader stepped down, and two elections passed in half a second.
+        // ELECTION_TIMEOUT_MAX_MS is 300 ms, so past a certain threshold compaction is not
+        // a pause but a scheduled leadership change.
+        //
+        // Giving snapshots their own thread (see RaftNode) removed the contention with the
+        // scheduler. This removes the contention with the log.
+        if (!recordSnapshotBoundary(snapshot)) {
+            return;
+        }
+        discardEntriesThrough(snapshot.lastIncludedIndex);
+    }
+
+    /**
+     * Commits the new boundary, which is what actually makes the entries below it
+     * redundant. Short, atomic, and the only part that must not be interrupted.
+     *
+     * @return false if this snapshot is not newer than the boundary already recorded
+     */
+    synchronized boolean recordSnapshotBoundary(Snapshot snapshot) {
         // The snapshot boundary must never move backwards: a background (COW)
         // snapshot in RaftNode decides to save off-lock, so if a newer snapshot
         // (e.g. one just installed by InstallSnapshot after a step-down/
         // re-election) landed in between, that stale save is dropped here rather
         // than overwriting the higher boundary and rewinding compaction.
         if (snapshotIndex != 0 && snapshot.lastIncludedIndex <= snapshotIndex) {
-            return;
+            return false;
         }
         Transaction txn = env.beginTransaction(null, null);
         try {
@@ -310,16 +361,6 @@ public final class BerkeleyDbStorage implements RaftStorage {
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_TERM), new DatabaseEntry(longToBytes(snapshot.lastIncludedTerm)));
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_STATE), new DatabaseEntry(snapshot.stateMachineData));
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_CONFIG), new DatabaseEntry(snapshot.configurationData));
-
-            try (Cursor cursor = logDb.openCursor(txn, null)) {
-                DatabaseEntry key = new DatabaseEntry();
-                DatabaseEntry value = new DatabaseEntry();
-                OperationStatus status = cursor.getFirst(key, value, LockMode.DEFAULT);
-                while (status == OperationStatus.SUCCESS && bytesToLong(key.getData()) <= snapshot.lastIncludedIndex) {
-                    cursor.delete();
-                    status = cursor.getNext(key, value, LockMode.DEFAULT);
-                }
-            }
             txn.commit();
         } catch (RuntimeException e) {
             txn.abort();
@@ -333,6 +374,49 @@ public final class BerkeleyDbStorage implements RaftStorage {
             this.lastLogIndex = snapshot.lastIncludedIndex;
             this.lastLogTerm = snapshot.lastIncludedTerm;
         }
+        return true;
+    }
+
+    /**
+     * Physical removal, in batches, with the monitor released between them.
+     *
+     * <p>Housekeeping rather than a state change: the boundary is already committed, so
+     * these entries are redundant the moment {@link #recordSnapshotBoundary} returns.
+     * Interrupting it -- by a crash, or simply by an append that wins the monitor -- costs
+     * disk, never correctness. {@code recoverCachedLogBounds} handles what a crash leaves
+     * behind, and the next compaction's cursor starts at the first key, so leftovers are
+     * swept then.
+     */
+    private void discardEntriesThrough(long boundary) {
+        while (deleteBatchThrough(boundary) == COMPACTION_BATCH) {
+            // Loop, not recursion, and nothing here: the point of leaving the method is
+            // that the monitor is free between batches, so a waiting appendEntries runs.
+            Thread.yield();
+        }
+    }
+
+    private synchronized int deleteBatchThrough(long boundary) {
+        int deleted = 0;
+        Transaction txn = env.beginTransaction(null, null);
+        try {
+            try (Cursor cursor = logDb.openCursor(txn, null)) {
+                DatabaseEntry key = new DatabaseEntry();
+                DatabaseEntry value = new DatabaseEntry();
+                OperationStatus status = cursor.getFirst(key, value, LockMode.DEFAULT);
+                while (status == OperationStatus.SUCCESS
+                        && bytesToLong(key.getData()) <= boundary
+                        && deleted < COMPACTION_BATCH) {
+                    cursor.delete();
+                    deleted++;
+                    status = cursor.getNext(key, value, LockMode.DEFAULT);
+                }
+            }
+            txn.commit();
+        } catch (RuntimeException e) {
+            txn.abort();
+            throw e;
+        }
+        return deleted;
     }
 
     @Override
