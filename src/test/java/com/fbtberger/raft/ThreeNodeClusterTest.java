@@ -4,6 +4,8 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.client.proto.ReconfigurationResponse;
+import com.fbtberger.raft.client.proto.TransferLeadershipRequest;
 import com.fbtberger.raft.transport.GrpcTransport;
 import com.fbtberger.raft.transport.GrpcTransportServer;
 import com.fbtberger.raft.transport.RaftTransport;
@@ -11,6 +13,7 @@ import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -24,6 +27,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -487,6 +491,76 @@ class ThreeNodeClusterTest {
             props.store(out, null);
         }
         return RaftConfig.load(tmp);
+    }
+
+    // ------------------------------------------------------------------
+    // Leadership transfer over the client service (§3.10)
+    // ------------------------------------------------------------------
+
+    /**
+     * The property the operator's command is bought for: the lead lands on the node that
+     * was named. Stopping the leader and waiting for a timeout also produces a new leader,
+     * but which one is up to whichever follower's random timer fires first -- and it costs
+     * an unavailability window to find out. This costs neither, and nobody is stopped.
+     */
+    @Test
+    void aTransferPutsTheLeadOnTheNamedNode() throws Exception {
+        awaitLeaderReady(2_000);
+        String incumbent = leaderId();
+        String target = nodes.keySet().stream()
+                .filter(id -> !id.equals(incumbent)).findFirst().orElseThrow();
+
+        ReconfigurationResponse answer = transferOn(incumbent, target);
+        assertTrue(answer.getSuccess(), "the transfer was refused: " + answer.getError());
+
+        // Both halves, because "the target is leading" is briefly true while the incumbent
+        // still thinks it is too, and a test that stops at the first half would pass on a
+        // cluster with two leaders.
+        awaitCondition(() -> nodes.get(target).role() == ServerRole.LEADER
+                && nodes.get(incumbent).role() != ServerRole.LEADER, 2_000);
+        assertEquals(target, leaderId());
+    }
+
+    /**
+     * A second transfer while one is in flight used to overwrite the first one's target and
+     * future: the pending abort timer then completed the <em>new</em> request, and the
+     * original caller waited for an answer that no longer had anywhere to arrive. Nobody
+     * hit it while the only way in was a human at a JMX console. A retrying client is not a
+     * human, which is exactly what the new RPC put in front of it.
+     */
+    @Test
+    void aSecondTransferIsRefusedRatherThanStealingTheFirstOnesAnswer() throws Exception {
+        awaitLeaderReady(2_000);
+        // A member the leader cannot reach: never started, never served. Its matchIndex
+        // stays at zero, so the transfer cannot complete and stays in flight for the whole
+        // abort timeout -- which is what makes this test deterministic rather than a race.
+        leader().addServer("n4", "localhost:9094").get(2, TimeUnit.SECONDS);
+
+        CompletableFuture<Void> first = leader().transferLeadership("n4");
+        ReconfigurationResponse second = transferOn(leaderId(), "n4");
+
+        assertFalse(second.getSuccess(), "the second transfer must not be accepted");
+        assertTrue(second.getError().contains("already in flight"), second.getError());
+        assertTrue(second.getError().contains("retry"),
+                "a rejection meant to be repeated must say so, or no client will: " + second.getError());
+
+        // The first request still gets its own answer -- the point of the guard.
+        ExecutionException failed = assertThrows(ExecutionException.class,
+                () -> first.get(2, TimeUnit.SECONDS));
+        assertTrue(failed.getCause().getMessage().contains("timed out"), failed.getCause().getMessage());
+    }
+
+    /** Drives the client-facing service directly: the adapter and RaftNode, without a socket. */
+    private ReconfigurationResponse transferOn(String nodeId, String targetId) throws Exception {
+        CompletableFuture<ReconfigurationResponse> answer = new CompletableFuture<>();
+        new RaftClientGrpcService(nodes.get(nodeId)).transferLeadership(
+                TransferLeadershipRequest.newBuilder().setTargetId(targetId).build(),
+                new StreamObserver<>() {
+                    @Override public void onNext(ReconfigurationResponse value) { answer.complete(value); }
+                    @Override public void onError(Throwable t) { answer.completeExceptionally(t); }
+                    @Override public void onCompleted() { }
+                });
+        return answer.get(3, TimeUnit.SECONDS);
     }
 
     // ------------------------------------------------------------------

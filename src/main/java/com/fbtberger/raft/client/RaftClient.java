@@ -7,6 +7,7 @@ package com.fbtberger.raft.client;
 import com.fbtberger.raft.client.proto.AddLearnerRequest;
 import com.fbtberger.raft.client.proto.AddServerRequest;
 import com.fbtberger.raft.client.proto.PromoteLearnerRequest;
+import com.fbtberger.raft.client.proto.TransferLeadershipRequest;
 import com.fbtberger.raft.client.proto.QueryRequest;
 import com.fbtberger.raft.client.proto.QueryResponse;
 import com.fbtberger.raft.client.proto.RaftClientServiceGrpc;
@@ -230,11 +231,41 @@ public final class RaftClient implements AutoCloseable {
                 .removeLearner(request));
     }
 
+    /** Hands leadership to another member (§3.10), with the default timeout per attempted node. */
+    public void transferLeadership(String targetId) throws RaftClientException {
+        transferLeadership(targetId, DEFAULT_TIMEOUT);
+    }
+
     /**
-     * Shared retry loop for {@link #addServer} / {@link #removeServer} and the
-     * learner operations: the same
+     * Asks the leader to hand leadership to {@code targetId} (§3.10): it stops taking new
+     * commands, brings the target's log level with its own, and tells it to stand for
+     * election immediately -- which the target's voters honour despite leader stickiness,
+     * because the incumbent asked for it.
+     *
+     * <p>The target must be a voting member. Returning normally means the target was told
+     * to campaign, not that it has won; the election is a cluster-wide event with its own
+     * timing, and no request/response can honestly claim it. Confirm by reading the roles.
+     *
+     * <p>The alternative -- stopping the leader and letting the timeout elect someone --
+     * puts the choice of successor up to chance and costs an unavailability window. This
+     * costs neither.
+     */
+    public void transferLeadership(String targetId, Duration perAttemptTimeout) throws RaftClientException {
+        TransferLeadershipRequest request = TransferLeadershipRequest.newBuilder().setTargetId(targetId).build();
+        reconfigure(nodeId -> stubFor(nodeId)
+                .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .transferLeadership(request));
+    }
+
+    /**
+     * Shared retry loop for {@link #addServer} / {@link #removeServer}, the learner
+     * operations and {@link #transferLeadership}: the same
      * leader-hint-following strategy as {@link #submit}, just adapted to the
      * reconfiguration RPCs' response shape (no result payload, only success/failure).
+     *
+     * <p>A leadership transfer is not a reconfiguration, and shares this deliberately: it
+     * is leader-only, it is refused with a leader hint by everyone else, and its rejections
+     * carry a reason. Those are the only properties this loop uses.
      */
     private void reconfigure(Function<String, ReconfigurationResponse> call) throws RaftClientException {
         RaftClientException lastError = null;

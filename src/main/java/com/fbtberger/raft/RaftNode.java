@@ -1811,6 +1811,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 result.complete(null);
                 return result;
             }
+            // A second transfer while one is in flight used to overwrite the target and
+            // the future of the first: the pending timeout then completed the NEW request
+            // exceptionally and the old caller waited forever. Unreachable while the only
+            // way in was a human at a JMX console; a client that retries -- which is what
+            // TransferLeadership over RaftClientService made possible -- walks straight
+            // into it. Refuse, in the words the caller is meant to act on.
+            if (leaderTransferTarget != null) {
+                result.completeExceptionally(new IllegalStateException(
+                        "a leadership transfer to " + leaderTransferTarget
+                                + " is already in flight; retry once it has finished"));
+                return result;
+            }
 
             leaderTransferTarget = targetId;
             leaderTransferResult = result;
@@ -1824,7 +1836,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         leaderTransferTarget = null;
                         leaderTransferTimeout = null;
                         leaderTransferResult = null;
-                        result.completeExceptionally(new RuntimeException("leadership transfer timed out"));
+                        // Ends in "retry" on purpose: that word is how this class marks
+                        // every rejection a caller is meant to repeat, and a transfer that
+                        // ran out of time is one -- the leader has aborted and resumed
+                        // normal service, so asking again is both safe and usually enough.
+                        // The target was most likely still catching up.
+                        result.completeExceptionally(new RuntimeException(
+                                "leadership transfer timed out; retry once the target has caught up"));
                     }
                 } finally {
                     lock.unlock();

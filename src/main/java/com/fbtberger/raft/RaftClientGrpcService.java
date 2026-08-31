@@ -15,6 +15,7 @@ import com.fbtberger.raft.client.proto.RemoveLearnerRequest;
 import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
+import com.fbtberger.raft.client.proto.TransferLeadershipRequest;
 import com.google.protobuf.ByteString;
 import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.Timer;
@@ -92,6 +93,26 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
     @Override
     public void removeLearner(RemoveLearnerRequest request, StreamObserver<ReconfigurationResponse> responseObserver) {
         raftNode.removeLearner(request.getId()).whenComplete((result, throwable) -> {
+            responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
+            responseObserver.onCompleted();
+        });
+    }
+
+    /**
+     * Leadership transfer (§3.10). Unlike its neighbours this changes no membership --
+     * it hands the lead to a server already in the configuration -- but the failure
+     * modes are identical, so it answers in the same shape: a follower rejects it with a
+     * leader hint, and the leader rejects it with a reason ("not a current cluster
+     * member", "leadership transfer timed out").
+     *
+     * <p>Success here means the {@code TimeoutNow} RPC reached the target, not that the
+     * target has won its election. The election is a cluster-wide event with its own
+     * timing; a request/response cannot honestly report it. Callers confirm by looking.
+     */
+    @Override
+    public void transferLeadership(TransferLeadershipRequest request,
+                                   StreamObserver<ReconfigurationResponse> responseObserver) {
+        raftNode.transferLeadership(request.getTargetId()).whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? reconfigurationSuccess() : reconfigurationFailure(unwrap(throwable)));
             responseObserver.onCompleted();
         });

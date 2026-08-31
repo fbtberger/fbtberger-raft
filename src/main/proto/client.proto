@@ -46,6 +46,19 @@ service RaftClientService {
   rpc AddLearner(AddLearnerRequest) returns (ReconfigurationResponse);
   rpc PromoteLearner(PromoteLearnerRequest) returns (ReconfigurationResponse);
   rpc RemoveLearner(RemoveLearnerRequest) returns (ReconfigurationResponse);
+
+  // Leadership transfer (§3.10): asks the leader to hand the lead to target_id
+  // rather than waiting for it to fail. The membership does not change, so this
+  // is not a reconfiguration -- but it is leader-only, refused with a leader
+  // hint by anyone else, and refused with a reason worth reading by the leader,
+  // which is every property the response below carries. A message of its own
+  // would fork the client's leader-following walk without changing behaviour.
+  //
+  // Until this existed the operation was reachable only through the JMX MBean
+  // (RaftNodeMXBean#transferLeadership), which means: not from an operator's
+  // machine, and not on a host carrying only a JRE. RaftNode has been able to
+  // do it since v125; nothing could ask.
+  rpc TransferLeadership(TransferLeadershipRequest) returns (ReconfigurationResponse);
 }
 
 message SubmitRequest {
@@ -105,6 +118,12 @@ message PromoteLearnerRequest {
 
 message RemoveLearnerRequest {
   string id = 1;
+}
+
+message TransferLeadershipRequest {
+  // Must already be a voting member: a leader cannot hand the lead to a server
+  // that is not in the configuration, and a learner never stands for election.
+  string target_id = 1;
 }
 
 message ReconfigurationResponse {
