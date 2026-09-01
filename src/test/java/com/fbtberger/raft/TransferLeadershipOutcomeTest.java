@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -105,6 +106,37 @@ class TransferLeadershipOutcomeTest {
                 thrown.getCause().getMessage());
     }
 
+    /**
+     * One transfer must produce exactly one TimeoutNow, however many replication responses
+     * arrive while it is outstanding.
+     *
+     * <p>checkTransferReadyLocked() runs from every AppendEntries response for the target, and
+     * the flag that says "already sent" used to be cleared only in the outbound call's
+     * asynchronous callback. Under load several responses arrive first, and each sent another.
+     *
+     * <p>The target then defeats itself: every TimeoutNow abandons the campaign the previous
+     * one started. Measured on the cluster, inside four milliseconds -- three sends, three
+     * elections, terms 81, 82 and 83, none of them finished, and the target ended a follower
+     * voting for the leader it was meant to replace. It is why the transfer worked on an idle
+     * cluster and never worked under load: idle means one response.
+     */
+    @Test
+    void oneTransferSendsOneTimeoutNowHoweverManyResponsesArrive() throws Exception {
+        ControllableTransport peer = new ControllableTransport();
+        node = leaderWith(peer);
+
+        node.transferLeadership("n2");
+        assertTrue(peer.timeoutNowSent.await(3, TimeUnit.SECONDS));
+
+        // The transport answers AppendEntries instantly, so heartbeats keep landing while the
+        // TimeoutNow future is deliberately left pending -- exactly the window that used to
+        // produce a second and a third send.
+        Thread.sleep(1_000);
+
+        assertEquals(1, peer.timeoutNowCalls.get(),
+                "every extra TimeoutNow restarts the target's election and costs it the one before");
+    }
+
     /** A two-member cluster whose peer answers AppendEntries and holds TimeoutNow open. */
     private RaftNode leaderWith(ControllableTransport peer) throws Exception {
         store = new InMemoryStorage();
@@ -143,11 +175,14 @@ class TransferLeadershipOutcomeTest {
 
         final CountDownLatch timeoutNowSent = new CountDownLatch(1);
         final CompletableFuture<TimeoutNowResponse> timeoutNowResult = new CompletableFuture<>();
+        final java.util.concurrent.atomic.AtomicInteger timeoutNowCalls =
+                new java.util.concurrent.atomic.AtomicInteger();
         final AtomicReference<TimeoutNowRequest> lastRequest = new AtomicReference<>();
 
         @Override
         public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
             lastRequest.set(request);
+            timeoutNowCalls.incrementAndGet();
             timeoutNowSent.countDown();
             return timeoutNowResult;
         }

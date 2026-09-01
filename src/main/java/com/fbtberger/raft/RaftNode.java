@@ -169,6 +169,21 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private volatile String leaderTransferTarget = null;
     private volatile CompletableFuture<Void> leaderTransferResult = null;
     private volatile ScheduledFuture<?> leaderTransferTimeout = null;
+    /**
+     * Whether TimeoutNow has already gone out for the transfer in flight.
+     *
+     * <p>checkTransferReadyLocked() runs from every AppendEntries response for the target, and
+     * the state it used to test -- leaderTransferTarget -- is only cleared in the outbound
+     * call's asynchronous callback. Under load several responses arrive before that callback
+     * returns, so each of them sent another TimeoutNow.
+     *
+     * <p>The target then defeats itself: every TimeoutNow abandons the campaign the previous
+     * one started. Measured on the cluster, in four milliseconds -- three sends, three
+     * elections, terms 81, 82, 83, none of them finished, and the target ended up a follower
+     * voting for the leader it was supposed to replace. It explains why the transfer worked
+     * when the cluster was idle and never worked under load: idle means one response.
+     */
+    private volatile boolean leaderTransferSent = false;
 
     // Linearizable reads (ReadIndex / Lease): pending read barriers awaiting
     // leadership confirmation from a majority of peers.
@@ -736,6 +751,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         leaderTransferTarget = null;
         leaderTransferResult = null;
+        leaderTransferSent = false;
         if (leaderTransferTimeout != null) {
             leaderTransferTimeout.cancel(false);
             leaderTransferTimeout = null;
@@ -1873,6 +1889,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
             leaderTransferTarget = targetId;
             leaderTransferResult = result;
+            leaderTransferSent = false;
             log("starting leadership transfer to " + targetId);
 
             leaderTransferTimeout = scheduler.schedule(() -> {
@@ -1883,6 +1900,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         leaderTransferTarget = null;
                         leaderTransferTimeout = null;
                         leaderTransferResult = null;
+                        leaderTransferSent = false;
                         // Ends in "retry" on purpose: that word is how this class marks
                         // every rejection a caller is meant to repeat, and a transfer that
                         // ran out of time is one -- the leader has aborted and resumed
@@ -1908,6 +1926,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         String targetId = leaderTransferTarget;
         CompletableFuture<Void> result = leaderTransferResult;
         if (targetId == null || result == null) return;
+        // One TimeoutNow per transfer. See leaderTransferSent: without this, every
+        // AppendEntries response that arrives before the first call's callback sends another,
+        // and each one restarts the target's election instead of letting it finish.
+        if (leaderTransferSent) return;
 
         long targetMatch = matchIndex.getOrDefault(targetId, 0L);
         if (targetMatch < store.getLastLogIndex()) return;
@@ -1915,6 +1937,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         RaftTransport transport = peerTransports.get(targetId);
         if (transport == null) return;
 
+        leaderTransferSent = true;
         log("target " + targetId + " is caught up, sending TimeoutNow");
         long currentTerm = store.getCurrentTerm();
         transport.timeoutNow(TimeoutNowRequest.newBuilder()
@@ -1923,6 +1946,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             try {
                 leaderTransferTarget = null;
                 leaderTransferResult = null;
+                leaderTransferSent = false;
                 if (leaderTransferTimeout != null) {
                     leaderTransferTimeout.cancel(false);
                     leaderTransferTimeout = null;
