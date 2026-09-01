@@ -17,9 +17,14 @@ import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.google.protobuf.ByteString;
+import com.fbtberger.raft.transport.TlsConfig;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.StatusRuntimeException;
+
+import javax.net.ssl.SSLException;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -72,20 +77,48 @@ public final class RaftClient implements AutoCloseable {
     private static final String NOT_LEADER = "not leader";
 
     private final Map<String, String> clusterAddresses; // nodeId -> host:port
+    private final TlsConfig tlsConfig;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile String knownLeaderId; // best guess; null means "unknown, try everyone"
 
     /**
+     * A plaintext client, which is what this class used to be able to be and nothing else.
+     *
      * @param clusterAddresses every node's id mapped to its "host:port" gRPC
      *                         address -- typically the same address book the
      *                         servers themselves use, e.g. a node's own
      *                         {@code RaftConfig.peerAddresses()}.
      */
     public RaftClient(Map<String, String> clusterAddresses) {
+        this(clusterAddresses, TlsConfig.disabled());
+    }
+
+    /**
+     * A client that speaks the same transport security as the cluster's peers.
+     *
+     * <p>The peer transport has had TLS since it was written, and on the kwatro production
+     * cluster it is switched on -- all five members run mTLS. This channel did not have the
+     * option at all: {@code usePlaintext()} was hard-coded, so the commands the web tier
+     * forwards with {@code SubmitRaftCommand}, and every membership change an operator makes,
+     * crossed the same network in the clear while the heartbeats beside them were encrypted
+     * and mutually authenticated. That asymmetry was not a decision anyone took; it was a
+     * constructor that could not express the other case.
+     *
+     * <p>Deliberately the same {@link TlsConfig} the servers read from their own properties,
+     * and the same builder idiom as {@code GrpcTransportFactory}, so a cluster and the tools
+     * that talk to it cannot end up configured by two different vocabularies.
+     *
+     * <p>Note what this does <em>not</em> do: a client certificate proves who is calling, and
+     * nothing here checks that the caller is allowed to reconfigure the cluster. mTLS on this
+     * channel narrows the set of people who can reach it to those holding a cluster
+     * certificate; it is not authorisation.
+     */
+    public RaftClient(Map<String, String> clusterAddresses, TlsConfig tlsConfig) {
         if (clusterAddresses.isEmpty()) {
             throw new IllegalArgumentException("clusterAddresses must not be empty");
         }
         this.clusterAddresses = new LinkedHashMap<>(clusterAddresses);
+        this.tlsConfig = tlsConfig;
     }
 
     /** Submits a command with the default timeout per attempted node. */
@@ -325,9 +358,31 @@ public final class RaftClient implements AutoCloseable {
     }
 
     private RaftClientServiceGrpc.RaftClientServiceBlockingStub stubFor(String nodeId) {
-        ManagedChannel channel = channels.computeIfAbsent(nodeId, id ->
-                ManagedChannelBuilder.forTarget(clusterAddresses.get(id)).usePlaintext().build());
+        ManagedChannel channel = channels.computeIfAbsent(nodeId, this::openChannel);
         return RaftClientServiceGrpc.newBlockingStub(channel);
+    }
+
+    /** Same shape as {@code GrpcTransportFactory.connect}, so both ends read alike. */
+    private ManagedChannel openChannel(String nodeId) {
+        String address = clusterAddresses.get(nodeId);
+        if (!tlsConfig.enabled()) {
+            return ManagedChannelBuilder.forTarget(address).usePlaintext().build();
+        }
+        try {
+            var ssl = GrpcSslContexts.forClient();
+            // A client certificate only when the cluster asks for one. Against a one-way-TLS
+            // server, offering one is harmless; requiring the operator to have one when the
+            // server never checks would be a configuration people work around.
+            if (tlsConfig.mtlsEnabled()) {
+                ssl.keyManager(tlsConfig.certFile(), tlsConfig.keyFile());
+            }
+            return NettyChannelBuilder.forTarget(address)
+                    .sslContext(ssl.trustManager(tlsConfig.caFile()).build())
+                    .build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("failed to create TLS channel to " + nodeId
+                    + " (" + address + ")", e);
+        }
     }
 
     @Override
