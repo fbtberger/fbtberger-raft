@@ -1927,7 +1927,21 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     leaderTransferTimeout.cancel(false);
                     leaderTransferTimeout = null;
                 }
-                if (t != null) {
+                // A failed TimeoutNow response is not a failed transfer, and the case where
+                // it lies is the case where everything went right. The target campaigns the
+                // instant it receives the message, wins, and this node steps down -- which
+                // tears down the very call whose answer we are waiting for. gRPC reports
+                // CANCELLED. Measured in a rehearsal against the Pi cluster: the operator
+                // command printed "the cluster refused (CANCELLED: io.grpc.Context was
+                // cancelled without error)" while the run's own leader log recorded
+                // "node3 -> node1 (gap 0.00 s)". The faster the transfer works, the more
+                // reliably it used to report failure.
+                //
+                // So the outcome is read from the thing that is actually observable here:
+                // whether this node is still the leader. If it is not, the transfer did what
+                // it was asked to do, whatever became of the response. If it still is,
+                // nothing happened and the error stands.
+                if (t != null && role == ServerRole.LEADER) {
                     result.completeExceptionally(t);
                 } else {
                     result.complete(null);
