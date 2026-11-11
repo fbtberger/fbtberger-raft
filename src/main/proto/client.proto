@@ -82,6 +82,17 @@ message SubmitResponse {
 
 message QueryRequest {
   bytes query = 1;
+
+  // Serve this read from the leader lease (SS6.4's second option) instead of a
+  // ReadIndex barrier. Unset means ReadIndex, which is the safe default and what
+  // every caller that predates this field gets -- a proto3 bool read off a message
+  // an older client never wrote is false.
+  //
+  // The reverse is the trap: a NEW client talking to an OLD server. The server
+  // ignores the field it does not know, serves a ReadIndex read, and answers
+  // successfully. Nothing in the response says which path ran, so a lease
+  // measurement against a stale node silently measures ReadIndex.
+  bool lease = 2;
 }
 
 message QueryResponse {

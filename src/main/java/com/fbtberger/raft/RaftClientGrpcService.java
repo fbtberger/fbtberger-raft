@@ -18,6 +18,8 @@ import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.fbtberger.raft.client.proto.TransferLeadershipRequest;
 import com.google.protobuf.ByteString;
 import io.grpc.stub.StreamObserver;
+
+import java.util.concurrent.CompletableFuture;
 import io.micrometer.core.instrument.Timer;
 
 import java.util.concurrent.CompletionException;
@@ -52,7 +54,13 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
 
     @Override
     public void query(QueryRequest request, StreamObserver<QueryResponse> responseObserver) {
-        raftNode.query(request.getQuery().toByteArray()).whenComplete((result, throwable) -> {
+        // The request picks the path, not the server's configuration: one cluster has
+        // to be able to serve both during the same run, or the two cannot be compared
+        // without a restart in between -- and a restart is a different experiment.
+        byte[] q = request.getQuery().toByteArray();
+        CompletableFuture<byte[]> answer =
+                request.getLease() ? raftNode.queryWithLease(q) : raftNode.query(q);
+        answer.whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
             responseObserver.onCompleted();
         });

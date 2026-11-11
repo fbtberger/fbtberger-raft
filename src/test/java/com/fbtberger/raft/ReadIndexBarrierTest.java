@@ -27,6 +27,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -202,6 +203,58 @@ class ReadIndexBarrierTest {
      * node may not touch its configuration. Tests call {@link #silence} afterwards to take the
      * quorum away deliberately.
      */
+    // ── the other half of §6.4: the leader lease ─────────────────────────────
+
+    /**
+     * The lease path answers from the state machine with no confirmation round. That is the
+     * whole point of it, and until {@code queryWithLease} existed nothing in this codebase
+     * called {@code leaseRead()} at all -- the method was reachable only from its own Javadoc.
+     */
+    @Test
+    void aLeaseReadIsAnsweredWhileTheQuorumIsStillAcknowledging() throws Exception {
+        startLeader();                       // n2 and n3 are acking, so the lease is held
+        node.submitCommand("SET x 42".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .get(OK, TimeUnit.MILLISECONDS);
+
+        byte[] answer = node.queryWithLease("GET x".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .get(OK, TimeUnit.MILLISECONDS);
+
+        assertEquals("42", new String(answer, java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /**
+     * And this is the test that stops the lease path being sold as something it is not.
+     *
+     * <p>A lease read is widely described -- including on this project's own slides -- as the
+     * fast path you take by accepting that it <em>might</em> answer from stale state. In this
+     * implementation it will not, because {@code leaseRead()} falls back to {@code readIndex()}
+     * the moment the lease is not held, and the lease is held only while a quorum has
+     * acknowledged inside the election-timeout window. Cut a leader off from its majority and
+     * this blocks exactly as {@link #query} would.
+     *
+     * <p>Which locates the real exposure: not a partition, but the window between the last
+     * acknowledgement and the next check. A clock that jumps, or a process paused across that
+     * window and resumed believing no time passed, answers from a lease it no longer holds.
+     * That distinction decides what may honestly be claimed from a stage, so it is pinned here.
+     */
+    @Test
+    void aLeaderWithoutItsQuorumWillNotServeFromTheLeaseEither() throws Exception {
+        startLeader();
+        silence("n2", "n3");
+
+        // Past the lease window -- 150 ms is ELECTION_TIMEOUT_MIN_MS, and the margin is
+        // deliberately large because the assertion below is an assertion about *not*
+        // happening, and a flaky one of those is worse than none.
+        Thread.sleep(600);
+
+        CompletableFuture<byte[]> read =
+                node.queryWithLease("GET x".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        assertThrows(TimeoutException.class, () -> read.get(1, TimeUnit.SECONDS),
+                "a leader that cannot reach a majority must not answer from its lease");
+        assertFalse(read.isDone());
+    }
+
     private void startLeader() throws Exception {
         RaftConfig config = configFor("n1", Map.of(
                 "n1", ADDRESS_OF.get("n1"),

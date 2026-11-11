@@ -1726,6 +1726,31 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     /**
+     * Serves a read through the leader lease (§6.4's second option) rather than a
+     * ReadIndex barrier: no heartbeat round-trip, the answer comes straight out of
+     * the state machine.
+     *
+     * <p>What this buys and what it costs is on {@link #leaseRead()}. What is worth
+     * saying <em>here</em>, because it is the thing people expect and do not get:
+     * this is not a switch that serves stale data. {@link #leaseRead()} falls back
+     * to {@link #readIndex()} whenever the lease is not currently held, and the
+     * lease is held only while a quorum has acknowledged a heartbeat inside
+     * {@code ELECTION_TIMEOUT_MIN_MS}. A leader cut off from its majority loses the
+     * lease within that window and this method then blocks exactly as
+     * {@link #query} would.
+     *
+     * <p>So the exposure is not partition, it is <em>time</em>: the window between
+     * the last quorum acknowledgement and the moment the lease is reconsidered. A
+     * leader whose clock jumps, or whose process is paused past that window and
+     * resumes believing no time passed, can answer from a lease it no longer holds.
+     * That is the assumption slide 22 asks you to accept knowingly -- it is about
+     * clocks, not about cables.
+     */
+    public CompletableFuture<byte[]> queryWithLease(byte[] query) {
+        return leaseRead().thenApply(ignored -> stateMachine.read(query));
+    }
+
+    /**
      * Lease-based linearizable read: serves the read immediately (no
      * heartbeat round-trip) if a majority of peers have acknowledged
      * a heartbeat within the election timeout window, proving no other

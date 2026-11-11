@@ -166,6 +166,11 @@ public final class RaftClient implements AutoCloseable {
         return query(query, DEFAULT_TIMEOUT);
     }
 
+    /** Runs a linearizable read through {@link ReadMode#READ_INDEX}. */
+    public byte[] query(byte[] query, Duration perAttemptTimeout) throws RaftClientException {
+        return query(query, perAttemptTimeout, ReadMode.READ_INDEX);
+    }
+
     /**
      * Runs a linearizable read (§6.4), following the same leader-hint walk as
      * {@link #submit}: reads are leader-only here, because a follower can be
@@ -174,8 +179,16 @@ public final class RaftClient implements AutoCloseable {
      * @return the state machine's answer
      * @throws RaftClientException if no node in the cluster answered the query
      */
-    public byte[] query(byte[] query, Duration perAttemptTimeout) throws RaftClientException {
-        QueryRequest request = QueryRequest.newBuilder().setQuery(ByteString.copyFrom(query)).build();
+    public byte[] query(byte[] query, Duration perAttemptTimeout, ReadMode mode)
+            throws RaftClientException {
+        // An old server ignores the lease field and answers a ReadIndex read successfully,
+        // and the response carries no record of which path ran. A lease measurement against
+        // a cluster that predates the field therefore measures ReadIndex and says so
+        // nowhere -- check the server version, not the exit status.
+        QueryRequest request = QueryRequest.newBuilder()
+                .setQuery(ByteString.copyFrom(query))
+                .setLease(mode == ReadMode.LEASE)
+                .build();
         RaftClientException lastError = null;
 
         for (String nodeId : candidateOrder()) {

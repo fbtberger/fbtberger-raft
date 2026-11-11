@@ -169,10 +169,33 @@ class RaftClientLeaderDiscoveryTest {
         }
     }
 
+    /**
+     * The read protocol is chosen per request, and the only place that choice exists is the
+     * wire: both paths return the same bytes, and the response says nothing about which ran.
+     * So the one thing worth pinning is that the client actually sets the field -- a
+     * {@link ReadMode#LEASE} run that quietly sent {@code lease=false} would measure
+     * ReadIndex and report success either way.
+     */
+    @Test
+    @DisplayName("The read mode travels with the request, and ReadIndex stays the default")
+    void theReadModeIsCarriedOnTheWire() throws Exception {
+        start("n1", StubNode.leaderReturning("42"));
+
+        try (RaftClient client = new RaftClient(cluster)) {
+            client.query(cmd(), java.time.Duration.ofSeconds(2), ReadMode.LEASE);
+            client.query(cmd(), java.time.Duration.ofSeconds(2), ReadMode.READ_INDEX);
+            client.query(cmd());                     // the overload that predates the field
+        }
+
+        assertEquals(List.of(true, false, false), nodes.get("n1").leaseFlags);
+    }
+
     /** A server that answers like a leader or like a follower, and remembers being asked. */
     private static final class StubNode extends RaftClientServiceGrpc.RaftClientServiceImplBase {
         final List<String> asked = new CopyOnWriteArrayList<>();
         final List<String> queried = new CopyOnWriteArrayList<>();
+        /** Which read protocol each query asked for -- the flag only exists on the wire. */
+        final List<Boolean> leaseFlags = new CopyOnWriteArrayList<>();
         private final boolean leader;
         private final String hint;
         private final String result;
@@ -197,6 +220,7 @@ class RaftClientLeaderDiscoveryTest {
         @Override
         public void query(QueryRequest request, StreamObserver<QueryResponse> observer) {
             queried.add(request.getQuery().toStringUtf8());
+            leaseFlags.add(request.getLease());
             QueryResponse.Builder b = QueryResponse.newBuilder().setSuccess(leader);
             if (leader) b.setResult(ByteString.copyFromUtf8(result));
             else b.setLeaderHint(hint).setError("not leader");
