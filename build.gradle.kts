@@ -36,7 +36,6 @@ pitest {
     junit5PluginVersion.set("1.2.0")
     targetClasses.set(listOf(
         "com.fbtberger.raft.Quorum*",
-        "com.fbtberger.raft.ElectionSwitches*",
         "com.fbtberger.raft.RaftConfig*",
         "com.fbtberger.raft.HealthCheck*",
         "com.fbtberger.raft.KeyValueStateMachine*",
@@ -45,11 +44,6 @@ pitest {
     ))
     targetTests.set(listOf(
         "com.fbtberger.raft.QuorumTest",
-        "com.fbtberger.raft.ElectionSwitchesTest",
-        // ElectionDefectSwitchTest is what actually pins both directions of the switches
-        // (CLAUDE.md: the defect must really appear in front of an audience). Leaving it out
-        // made ElectionSwitches look worse than it is.
-        "com.fbtberger.raft.ElectionDefectSwitchTest",
         "com.fbtberger.raft.RaftConfigOfTest",
         "com.fbtberger.raft.HealthCheckTest",
         "com.fbtberger.raft.KeyValueStateMachineTest",

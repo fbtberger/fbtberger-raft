@@ -55,11 +55,10 @@ public final class RaftConfig {
     private final boolean learner;
     private final RpcTimeouts rpcTimeouts;
     private final TlsConfig tlsConfig;
-    private final ElectionSwitches electionSwitches;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
                        int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
-                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ElectionSwitches electionSwitches) {
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
@@ -70,7 +69,6 @@ public final class RaftConfig {
         this.learner = learner;
         this.rpcTimeouts = rpcTimeouts;
         this.tlsConfig = tlsConfig;
-        this.electionSwitches = electionSwitches;
     }
 
     public static RaftConfig load(Path propertiesFile) throws IOException {
@@ -107,8 +105,7 @@ public final class RaftConfig {
         }
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
         TlsConfig tlsConfig = TlsConfig.fromProperties(props);
-        ElectionSwitches electionSwitches = ElectionSwitches.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, electionSwitches);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
     }
 
     /**
@@ -142,20 +139,7 @@ public final class RaftConfig {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
         return new RaftConfig(selfId, selfPort, dataDir, copy,
-                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
-                ElectionSwitches.defaults());
-    }
-
-    /**
-     * A copy of this configuration with different {@link ElectionSwitches}. The switches are the
-     * one part of the configuration that is deliberately not a constructor parameter of
-     * {@link #of}: production never sets them, so a caller that wants a defect armed has to say
-     * so in a separate, greppable call.
-     */
-    public RaftConfig withElectionSwitches(ElectionSwitches switches) {
-        return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
-                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
-                switches);
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
     }
 
     private static String require(Properties props, String key) {
@@ -211,10 +195,4 @@ public final class RaftConfig {
 
     public TlsConfig tlsConfig() { return tlsConfig; }
 
-    /**
-     * The election-path switches (see {@link ElectionSwitches}). Defaults to every defect fixed;
-     * only a {@code .properties} file, a {@code -D} override or {@link #withElectionSwitches}
-     * can arm one.
-     */
-    public ElectionSwitches electionSwitches() { return electionSwitches; }
 }

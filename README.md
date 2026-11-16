@@ -182,32 +182,22 @@ tls.key.path=/path/to/key.pem
 tls.ca.path=/path/to/ca.pem
 tls.mtls.enabled=false
 
-# Election switches -- defaults shown. See "Election switches" below before
-# changing any of these: the non-default value of each one is a known defect.
-raft.prevote.quorum-latch=true
-raft.election.boot-delay-factor=6
-raft.prevote.leader-stickiness=true
 ```
 
-### Election switches
+### The three election guards
 
-Three keys can put a fixed election defect back into a running node, so a talk can show the
-failure instead of describing it. Each defaults to the fixed behaviour, and a `-D` system
-property of the same name overrides the file — one artifact and one properties file can
-therefore serve a run with the defect and a run without it.
+Two production incidents left three guards on the election path. All three are unconditional --
+until 2026-11-16 each could be switched off at runtime so a talk could show the failure instead
+of describing it, and that is gone with the talk.
 
-| Key | Default | The non-default value restores |
-|---|---|---|
-| `raft.prevote.quorum-latch` | `true` | **Issue #3.** The PreVote quorum handler fires once per grant instead of once per round: two peers granting the same round run two full elections, no step-down in between. |
-| `raft.election.boot-delay-factor` | `6` | **Issue #2, requester side.** `1` puts a freshly started node on the ordinary 150–300 ms timeout, so it campaigns before a live leader's transport has reconnected to it (the measured gap was 498–802 ms). |
-| `raft.prevote.leader-stickiness` | `true` | **Issue #2, responder side.** A LEADER stops counting as having leader contact and grants the (pre-)vote that unseats it. With three voters this grant *is* the challenger's quorum. |
+| Guard | What it stops |
+|---|---|
+| PreVote quorum latch | **Issue #3.** A decided PreVote round is consumed, so its later grants are dropped. Without it the handler fired once per grant: two peers granting the same round ran two full elections, no step-down in between. |
+| Boot grace (`BOOT_DELAY_FACTOR` = 6) | **Issue #2, requester side.** A freshly started node waits six ordinary timeouts before its first campaign, because a live leader's transport needs 498-802 ms to reconnect to it against a 150-300 ms timeout. Only the first timer is scaled. |
+| Leader stickiness | **Issue #2, responder side.** A LEADER counts as having leader contact, so it does not grant the (pre-)vote that would unseat it. With three voters that grant *is* the challenger's quorum. |
 
-Issue #2 needs both of its switches to reproduce: the boot delay decides whether the restarting
-node campaigns, stickiness decides whether it wins. Lower the boot delay alone and the node
-campaigns and is refused by everyone — visible in the log, no leader change.
-
-A node whose switches are not all default logs that at WARN on startup, so a demo trace can
-still be read months later.
+Issue #2 took both of its guards: the boot grace decides whether the restarting node campaigns,
+stickiness decides whether it wins. `ElectionFixesTest` pins each one.
 
 ## Building
 

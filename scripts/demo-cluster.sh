@@ -3,15 +3,15 @@
 # Copyright 2026 fbtBerger Technology
 # SPDX-License-Identifier: Apache-2.0
 #
-# A three-node Raft cluster on one machine, for demonstrating the election
-# defects that ElectionSwitches can arm (see README, "Election switches").
-# No Docker, no database: the state machine is the built-in key-value store,
-# and neither defect has anything to do with what is being replicated.
+# A three-node Raft cluster on one machine. No Docker, no database: the state
+# machine is the built-in key-value store.
 #
-#   scripts/demo-cluster.sh start                  # all fixes on -- the control run
-#   scripts/demo-cluster.sh start --defect prevote # issue #3: two elections, one round
-#   scripts/demo-cluster.sh start --defect restart # issue #2: arm, then restart a node
-#   scripts/demo-cluster.sh restart-node 2         # the move that shows issue #2
+# It was written to demonstrate two election defects, armed through runtime
+# switches that no longer exist (removed 2026-11-16 with the talk they were for).
+# What is left is a local cluster to watch elections and failover on.
+#
+#   scripts/demo-cluster.sh start                  # three nodes, one leader
+#   scripts/demo-cluster.sh restart-node 2         # stop and start one node
 #   scripts/demo-cluster.sh elections              # every election line, all nodes, in order
 #   scripts/demo-cluster.sh status | logs [n] | stop
 #
@@ -32,12 +32,12 @@ LOG_DIR="$RUN_DIR/logs"
 JAR="$REPO_ROOT/build/libs/fbtberger-raft-1.0.0-all.jar"
 NODES=(1 2 3)
 
-# The switch defaults live in ElectionSwitches; repeating them here would be a
-# second source of truth. An empty SWITCHES means "whatever the library ships".
-SWITCHES=()
+# Extra -D options for every node, passed through as given. Empty means the
+# library's own defaults.
+JVM_OPTS=()
 
 usage() {
-    sed -n '7,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    sed -n '/^# A three-node/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     exit "${1:-0}"
 }
 
@@ -68,7 +68,7 @@ start_node() {
     # 0<> opens the FIFO read-write, so the descriptor is its own writer and the
     # CLI never sees EOF. Redirecting from /dev/null instead would end
     # RaftServer's readLine loop immediately and shut the node down again.
-    (cd "$REPO_ROOT" && exec java "${SWITCHES[@]}" -jar "$JAR" \
+    (cd "$REPO_ROOT" && exec java "${JVM_OPTS[@]}" -jar "$JAR" \
         "config/local/node$n.properties" \
         > "$LOG_DIR/node$n.log" 2>&1 0<> "$fifo") &
     echo $! > "$RUN_DIR/node$n.pid"
@@ -102,43 +102,31 @@ stop_node() {
     echo "node$n stopped"
 }
 
-parse_switches() {
+parse_jvm_opts() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --defect)
-                case "${2:-}" in
-                    none)    ;;
-                    prevote) SWITCHES+=(-Draft.prevote.quorum-latch=false) ;;
-                    # Issue #2 needs both halves: the boot delay decides whether the
-                    # restarting node campaigns, stickiness whether it wins. Arming
-                    # only one produces a node that campaigns and is refused.
-                    restart) SWITCHES+=(-Draft.election.boot-delay-factor=1
-                                        -Draft.prevote.leader-stickiness=false) ;;
-                    *) echo "unknown defect '${2:-}' (none|prevote|restart)" >&2; exit 2 ;;
-                esac
-                shift 2 ;;
-            -D*) SWITCHES+=("$1"); shift ;;
+            -D*) JVM_OPTS+=("$1"); shift ;;
             *) echo "unknown option '$1'" >&2; usage 2 ;;
         esac
     done
 }
 
 cmd_start() {
-    parse_switches "$@"
+    parse_jvm_opts "$@"
     require_jar
     mkdir -p "$LOG_DIR" "$RUN_DIR/data"
-    if [[ ${#SWITCHES[@]} -gt 0 ]]; then
-        echo "election switches: ${SWITCHES[*]}"
+    if [[ ${#JVM_OPTS[@]} -gt 0 ]]; then
+        echo "jvm options: ${JVM_OPTS[*]}"
     else
-        echo "election switches: library defaults (every fix on)"
+        echo "jvm options: none (library defaults)"
     fi
-    # Remembered for restart-node: a node that comes back with the library defaults
-    # while the rest of the cluster runs an armed defect is a different experiment
-    # than the one being demonstrated, and nothing in the log would say so.
-    if [[ ${#SWITCHES[@]} -gt 0 ]]; then
-        printf '%s\n' "${SWITCHES[@]}" > "$RUN_DIR/switches"
+    # Remembered for restart-node: a node that comes back without the options the rest
+    # of the cluster was started with is a different experiment, and nothing in the log
+    # would say so.
+    if [[ ${#JVM_OPTS[@]} -gt 0 ]]; then
+        printf '%s\n' "${JVM_OPTS[@]}" > "$RUN_DIR/jvm-opts"
     else
-        : > "$RUN_DIR/switches"   # printf of an empty array would leave a blank line behind
+        : > "$RUN_DIR/jvm-opts"   # printf of an empty array would leave a blank line behind
     fi
     for n in "${NODES[@]}"; do start_node "$n"; done
     echo
@@ -184,10 +172,10 @@ cmd_send() {
 # incumbent heartbeating before the node comes back, or there is nothing to unseat.
 cmd_restart_node() {
     local n="$1"
-    if [[ ${#SWITCHES[@]} -eq 0 && -s "$RUN_DIR/switches" ]]; then
-        mapfile -t SWITCHES < "$RUN_DIR/switches"
+    if [[ ${#JVM_OPTS[@]} -eq 0 && -s "$RUN_DIR/jvm-opts" ]]; then
+        mapfile -t JVM_OPTS < "$RUN_DIR/jvm-opts"
     fi
-    [[ ${#SWITCHES[@]} -gt 0 ]] && echo "election switches: ${SWITCHES[*]}"
+    [[ ${#JVM_OPTS[@]} -gt 0 ]] && echo "jvm options: ${JVM_OPTS[*]}"
     stop_node "$n"
     sleep 2
     start_node "$n"
@@ -200,7 +188,7 @@ case "${1:-}" in
     elections)    cmd_elections ;;
     logs)         shift; cmd_logs "$@" ;;
     send)         shift; cmd_send "$@" ;;
-    restart-node) shift; parse_switches "${@:2}"; cmd_restart_node "$1" ;;
+    restart-node) shift; parse_jvm_opts "${@:2}"; cmd_restart_node "$1" ;;
     -h|--help|"") usage ;;
     *)            echo "unknown command '$1'" >&2; usage 2 ;;
 esac

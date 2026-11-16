@@ -29,21 +29,25 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Each {@link ElectionSwitches} entry, in both directions: fixed behaviour with the default, the
- * documented historic defect with the switch armed.
+ * The three election guards that were once switchable, each pinned in its fixed direction.
  *
- * <p>Both directions matter. A test that only pins the fix cannot tell a working guard from a
- * guard that was never reachable, and the talks depend on the armed direction actually failing --
- * a demo whose bug refuses to appear in front of a room is worse than no demo. These assertions
- * are what says the failure is still there to be shown.
+ * <p>Until 2026-11-16 this class asserted both directions: the fix with the switch at its
+ * default, and the historic defect with the switch armed, because a talk needed the bug to
+ * actually appear in front of a room. The switches are gone and so are those three assertions.
+ * What survives is the half that still has something to protect -- and it has to survive
+ * somewhere, because deleting a defect switch is an easy way to delete the only test of the fix
+ * it was the opposite of.
+ *
+ * <p>What is lost with the armed direction is worth writing down: a test that only pins the fix
+ * cannot tell a working guard from a guard that was never reachable. Each of these three was
+ * observed failing before it was fixed -- issue #3 as two full elections 52 ms apart, issue #2
+ * as a restart that took the leadership off a healthy leader -- so the guards were reachable
+ * when they were built. Nothing here re-establishes that.
  *
  * <p>Same harness as {@link ElectionGuardTest} and {@link PreVoteStickinessTest}: peers that
  * answer inline, so a whole election runs on the calling thread with no sleeps and no races.
- * Note that the armed defects here are <em>deterministic</em>, while the production incidents
- * were races (issue #3 appeared in one restart out of three). The switch reproduces the shape,
- * not the timing.
  */
-class ElectionDefectSwitchTest {
+class ElectionFixesTest {
 
     private static final Map<String, String> ADDRESS_OF = Map.of(
             "n1", "localhost:7401", "n2", "localhost:7402", "n3", "localhost:7403");
@@ -60,15 +64,15 @@ class ElectionDefectSwitchTest {
         if (node != null) node.shutdown();
     }
 
-    // -- raft.prevote.quorum-latch (issue #3) ----------------------------------
+    // -- the PreVote quorum latch (issue #3) -----------------------------------
 
     /**
      * Two peers grant the same PreVote round. Latched, the second grant changes nothing: the
      * round was already converted into an election by the first.
      */
     @Test
-    void aLatchedRoundElectsOnceEvenWhenEveryPeerGrants() {
-        boot(ElectionSwitches.defaults());
+    void aDecidedRoundElectsOnceEvenWhenEveryPeerGrants() {
+        boot();
 
         node.startElection();
 
@@ -78,25 +82,7 @@ class ElectionDefectSwitchTest {
                 "exactly one election was campaigned for");
     }
 
-    /**
-     * THE DEFECT, armed. Every grant past the threshold runs its own election, so the node wins
-     * a term and then immediately unseats itself to win the next one -- the "two full elections
-     * in 52 ms, no step-down in between" shape from issue #3.
-     */
-    @Test
-    void anUnlatchedRoundElectsOncePerGrant() {
-        boot(new ElectionSwitches(false, ElectionSwitches.DEFAULT_BOOT_DELAY_FACTOR, true));
-
-        node.startElection();
-
-        assertEquals(ServerRole.LEADER, node.role(), "it still ends up leader -- of a later term");
-        assertEquals(2, store.getCurrentTerm(),
-                "the second grant of the same round bumped the term again");
-        assertEquals(List.of(1L, 2L), distinctTerms(peers.voteRpcTerms()),
-                "two complete elections out of one PreVote round");
-    }
-
-    // -- raft.election.boot-delay-factor (issue #2, requester side) -------------
+    // -- the boot grace (issue #2, requester side) ------------------------------
 
     /**
      * A node that has just come up waits out several ordinary timeouts before campaigning, so a
@@ -105,7 +91,7 @@ class ElectionDefectSwitchTest {
      */
     @Test
     void aFreshNodeArmsAnExtendedFirstTimer() {
-        boot(ElectionSwitches.defaults());
+        boot();
 
         node.start();
 
@@ -114,25 +100,13 @@ class ElectionDefectSwitchTest {
                 "expected a 6x boot grace, was " + node.lastArmedElectionTimeoutMs + " ms");
     }
 
-    /** The defect, armed: straight onto the ordinary schedule, well inside the reconnect gap. */
-    @Test
-    void withTheFactorAtOneAFreshNodeCampaignsOnTheOrdinarySchedule() {
-        boot(new ElectionSwitches(true, 1, true));
-
-        node.start();
-
-        assertTrue(node.lastArmedElectionTimeoutMs >= ELECTION_TIMEOUT_MIN_MS
-                        && node.lastArmedElectionTimeoutMs <= ELECTION_TIMEOUT_MAX_MS,
-                "expected an ordinary timeout, was " + node.lastArmedElectionTimeoutMs + " ms");
-    }
-
     /**
      * The grace is a boot grace, not a permanent slowdown: the first thing that resets the timer
      * puts the node back on the normal schedule, or every real failover would inherit the delay.
      */
     @Test
     void theBootGraceAppliesToTheFirstTimerOnly() {
-        boot(ElectionSwitches.defaults());
+        boot();
         node.start();
         int bootTimeout = node.lastArmedElectionTimeoutMs;
 
@@ -145,15 +119,15 @@ class ElectionDefectSwitchTest {
                         + bootTimeout + " ms)");
     }
 
-    // -- raft.prevote.leader-stickiness (issue #2, responder side) -------------
+    // -- leader stickiness (issue #2, responder side) ---------------------------
 
     /**
      * The half of issue #2 that decides the outcome: with three voters the challenger needs one
      * foreign grant, and the incumbent must not be the one who supplies it.
      */
     @Test
-    void aLeaderWithStickinessDeniesTheVoteThatWouldUnseatIt() {
-        boot(ElectionSwitches.defaults());
+    void aLeaderDeniesTheVoteThatWouldUnseatIt() {
+        boot();
         node.startElection();
         assertEquals(ServerRole.LEADER, node.role(), "precondition: the node should have won");
 
@@ -162,41 +136,28 @@ class ElectionDefectSwitchTest {
         assertFalse(response.getVoteGranted());
     }
 
-    /** The defect, armed: the incumbent hands the challenger the quorum. */
-    @Test
-    void withoutStickinessALeaderGrantsThatVote() {
-        boot(new ElectionSwitches(true, ElectionSwitches.DEFAULT_BOOT_DELAY_FACTOR, false));
-        node.startElection();
-        assertEquals(ServerRole.LEADER, node.role(), "precondition: the node should have won");
-
-        PreVoteResponse response = node.handlePreVote(upToDatePreVoteFrom("n2"));
-
-        assertTrue(response.getVoteGranted(),
-                "issue #2: the leader's own grant is what unseated it");
-    }
-
     /**
-     * The switch must not reach beyond the leader case it exists for -- a follower that is being
-     * heartbeated still refuses, with or without it. Otherwise "stickiness off" would be a much
-     * larger change than the defect it reproduces.
+     * The stickiness line is about the LEADER case only. A follower that is being heartbeated
+     * refuses on the timestamp instead, and that path has to keep working on its own -- it is
+     * what denies a challenger on the other four nodes of a five-node cluster.
      */
     @Test
-    void aHeartbeatedFollowerRefusesRegardlessOfTheSwitch() {
-        boot(new ElectionSwitches(true, ElectionSwitches.DEFAULT_BOOT_DELAY_FACTOR, false));
+    void aHeartbeatedFollowerRefusesOnTheTimestamp() {
+        boot();
         node.handleAppendEntries(heartbeatFrom("n3", 1));
 
         PreVoteResponse response = node.handlePreVote(upToDatePreVoteFrom("n2"));
 
         assertFalse(response.getVoteGranted(),
-                "a follower in contact with a leader denies on the timestamp, not on the switch");
+                "a follower in contact with a leader denies on the timestamp");
     }
 
     // -- Harness ---------------------------------------------------------------
 
-    private void boot(ElectionSwitches switches) {
+    private void boot() {
         peers = new RecordingPeers();
         store = new InMemoryStorage();
-        node = new RaftNode(configFor("n1").withElectionSwitches(switches), store,
+        node = new RaftNode(configFor("n1"), store,
                 new KeyValueStateMachine(), peers, RaftMetrics.noop());
     }
 
@@ -227,7 +188,7 @@ class ElectionDefectSwitchTest {
             java.util.Properties props = new java.util.Properties();
             props.setProperty("node.id", selfId);
             props.setProperty("node.port", "7401");
-            props.setProperty("data.dir", "/tmp/raft-defectswitch-unused/" + selfId);
+            props.setProperty("data.dir", "/tmp/raft-electionfixes-unused/" + selfId);
             ADDRESS_OF.forEach((id, addr) -> props.setProperty("peer." + id, addr));
             java.nio.file.Path tmp =
                     java.nio.file.Files.createTempFile("raft-defectswitch-", ".properties");

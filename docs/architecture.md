@@ -113,16 +113,16 @@ comparisons above still hold; the latch is what states the rule, and it keeps ho
 future caller ever reaches quorum without moving the term.
 
 **Boot grace (issue #2, requester side).** The first election timer after `start()` is scaled by
-`raft.election.boot-delay-factor` (default 6), because a restarting node has to outwait the
+`RaftNode.BOOT_DELAY_FACTOR` (6), because a restarting node has to outwait the
 incumbent's transport reconnecting to it -- measured at 498-802 ms, against an ordinary timeout
 of 150-300 ms -- not merely the heartbeat interval. Only that first timer is scaled: anything
 that resets the timer, which any heartbeat does, puts the node back on the ordinary schedule, so
 a real failover is not slowed down.
 
-**Switching the defects back on.** All three of the above are runtime switches
-(`ElectionSwitches`), defaulting to the fixed behaviour, so the talks can demonstrate the
-failures rather than assert them. See the README's "Election switches"; `ElectionDefectSwitchTest`
-pins both directions of each.
+**All three are unconditional.** They were runtime switches (`ElectionSwitches`) until
+2026-11-16, defaulting to the fixed behaviour, so the talks could demonstrate the failures
+rather than assert them. The switches are gone; `ElectionFixesTest` pins each guard in its
+fixed direction.
 
 # 5. Leadership Transfer (§3.10)
 
