@@ -127,6 +127,9 @@ dependencies {
     testImplementation("io.grpc:grpc-inprocess:$grpcVersion")
     testImplementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
     testImplementation("org.awaitility:awaitility:4.2.1")
+    // Visible to tests that assert on what a node logged: a refusal nobody can read is the
+    // defect RefusedVoteSaysWhyTest exists for. At runtime this is already the backend.
+    testImplementation("ch.qos.logback:logback-classic:1.5.6")
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
     testAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 }

@@ -137,6 +137,61 @@ class TransferLeadershipOutcomeTest {
                 "every extra TimeoutNow restarts the target's election and costs it the one before");
     }
 
+    /**
+     * No command is accepted between TimeoutNow and the target actually winning.
+     *
+     * <p>§3.10 says the leader stops serving clients for the duration of a transfer, and this
+     * node did -- until the TimeoutNow response came back, which is about a millisecond and
+     * long before the election it started has finished. Every command let through in the rest
+     * of that window appends an entry the candidate does not have, and §5.4.1 then obliges
+     * every voter to refuse it.
+     *
+     * <p>Measured on the Pi cluster under 200 writes/s: twelve milliseconds between the
+     * acknowledged TimeoutNow and the old leader stepping down, a candidate that got not one
+     * vote, 0.30 s without a commit, 92 refused writes, and the leadership on a third node.
+     * The transfer only ever worked when that window happened to be empty.
+     */
+    @Test
+    void noWriteIsAcceptedBetweenTimeoutNowAndTheTargetWinning() throws Exception {
+        ControllableTransport peer = new ControllableTransport();
+        node = leaderWith(peer);
+
+        node.transferLeadership("n2");
+        assertTrue(peer.timeoutNowSent.await(3, TimeUnit.SECONDS));
+
+        // The acknowledgement, which is all this node learns for now: the target has been
+        // told to campaign. It has not won anything yet, and this node is still the leader.
+        peer.timeoutNowResult.complete(TimeoutNowResponse.getDefaultInstance());
+        assertEquals(ServerRole.LEADER, node.role(), "the premise of the test is gone");
+
+        ExecutionException refused = assertThrows(ExecutionException.class,
+                () -> node.submitCommand("SET b 2".getBytes(StandardCharsets.UTF_8))
+                        .get(3, TimeUnit.SECONDS));
+        assertTrue(refused.getCause() instanceof RaftNode.NotLeaderException,
+                "a write here makes the candidate's log stale: " + refused.getCause());
+    }
+
+    /**
+     * A transfer that failed outright does not leave the leader refusing writes.
+     *
+     * <p>The block has to end somewhere, and the one case where nothing is in flight any more
+     * is a TimeoutNow that did not arrive while this node is still leading. Without this the
+     * fix above would trade a broken transfer for a cluster that stops serving.
+     */
+    @Test
+    void aTimeoutNowThatNeverArrivedLetsWritesResume() throws Exception {
+        ControllableTransport peer = new ControllableTransport();
+        node = leaderWith(peer);
+
+        CompletableFuture<Void> transfer = node.transferLeadership("n2");
+        assertTrue(peer.timeoutNowSent.await(3, TimeUnit.SECONDS));
+        peer.timeoutNowResult.completeExceptionally(new RuntimeException("UNAVAILABLE"));
+        assertThrows(ExecutionException.class, () -> transfer.get(3, TimeUnit.SECONDS));
+
+        assertEquals(ServerRole.LEADER, node.role());
+        node.submitCommand("SET c 3".getBytes(StandardCharsets.UTF_8)).get(3, TimeUnit.SECONDS);
+    }
+
     /** A two-member cluster whose peer answers AppendEntries and holds TimeoutNow open. */
     private RaftNode leaderWith(ControllableTransport peer) throws Exception {
         store = new InMemoryStorage();

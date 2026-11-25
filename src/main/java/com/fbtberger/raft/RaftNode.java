@@ -813,6 +813,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 log("granted vote to " + request.getCandidateId() + " for term " + currentTerm);
                 return RequestVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(true).build();
             }
+            // Say why. This return was silent, and on 2026-11-25 that silence cost an hour on
+            // a cluster where a leadership transfer kept failing: the target campaigned, every
+            // voter adopted its term, nobody granted it anything, and no node anywhere recorded
+            // a reason. The PreVote handler learned this in v122 (issue #2) -- "the one side
+            // that knows the reason was the silent one" -- and RequestVote never did.
+            log("denied vote to " + request.getCandidateId() + " for term " + currentTerm
+                    + " (canVote=" + canVote + ", logOk=" + logOk
+                    + ", votedFor=" + votedFor
+                    + ", mine=" + store.getLastLogTerm() + "/" + store.getLastLogIndex()
+                    + ", theirs=" + request.getLastLogTerm() + "/" + request.getLastLogIndex()
+                    + ", transfer=" + request.getLeadershipTransfer() + ")");
             return RequestVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(false).build();
         } finally {
             lock.unlock();
@@ -1907,10 +1918,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 try {
                     if (leaderTransferTarget != null) {
                         log("leadership transfer to " + leaderTransferTarget + " timed out, aborting");
-                        leaderTransferTarget = null;
-                        leaderTransferTimeout = null;
-                        leaderTransferResult = null;
-                        leaderTransferSent = false;
+                        clearTransferLocked();
                         // Ends in "retry" on purpose: that word is how this class marks
                         // every rejection a caller is meant to repeat, and a transfer that
                         // ran out of time is one -- the leader has aborted and resumed
@@ -1930,6 +1938,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             lock.unlock();
         }
         return result;
+    }
+
+    /** Forget the transfer in flight: writes are accepted again and the abort timer is off. */
+    private void clearTransferLocked() {
+        leaderTransferTarget = null;
+        leaderTransferResult = null;
+        leaderTransferSent = false;
+        if (leaderTransferTimeout != null) {
+            leaderTransferTimeout.cancel(false);
+            leaderTransferTimeout = null;
+        }
     }
 
     private void checkTransferReadyLocked() {
@@ -1954,13 +1973,24 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 .setTerm(currentTerm).build()).whenComplete((resp, t) -> {
             lock.lock();
             try {
-                leaderTransferTarget = null;
-                leaderTransferResult = null;
-                leaderTransferSent = false;
-                if (leaderTransferTimeout != null) {
-                    leaderTransferTimeout.cancel(false);
-                    leaderTransferTimeout = null;
-                }
+                // The block on new commands stays up until the transfer is decided, not until
+                // this RPC is answered. TimeoutNow is acknowledged in about a millisecond; the
+                // target's election takes longer, and this node remains leader meanwhile. Every
+                // command accepted in that window appends an entry the candidate does not have,
+                // which makes its log stale -- and §5.4.1 then tells every voter to refuse it.
+                //
+                // Measured on the Pi cluster on 2026-11-25 under 200 writes/s: TimeoutNow out
+                // at 22:00:05.832, this node still leading until 22:00:05.844, and in those
+                // twelve milliseconds the target's campaign became unwinnable. It got no vote
+                // from anyone, the cluster went 0.30 s without a commit, 92 writes were refused,
+                // and the leadership ended up on a third node -- the one demo that needed the
+                // target to lead was skipped as a result. Transfers "worked" whenever the gap
+                // happened to be empty, which is why an idle cluster never showed this.
+                //
+                // So: on the way out, only the failure case clears the state. Success leaves it
+                // standing for becomeFollowerLocked (the transfer worked) or for the abort
+                // timer (it did not), both of which already clear it.
+                //
                 // A failed TimeoutNow response is not a failed transfer, and the case where
                 // it lies is the case where everything went right. The target campaigns the
                 // instant it receives the message, wins, and this node steps down -- which
@@ -1976,6 +2006,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 // it was asked to do, whatever became of the response. If it still is,
                 // nothing happened and the error stands.
                 if (t != null && role == ServerRole.LEADER) {
+                    // Nothing happened: release the block and let writes through again.
+                    clearTransferLocked();
                     result.completeExceptionally(t);
                 } else {
                     result.complete(null);
