@@ -201,6 +201,10 @@ message TimeoutNowResponse {
   // Set by a witness: it has no state machine, so it does not take the lead on
   // request. The leader fails the transfer at once instead of waiting it out.
   bool witness = 1;
+  // Set by a node that ignored the request because the sender is not the leader
+  // it follows. The leader fails the transfer at once; without it this answer
+  // was indistinguishable from "will campaign".
+  bool declined = 2;
 }
 
 // ReadIndex RPC (dissertation §6.4, "followers can also help offload the

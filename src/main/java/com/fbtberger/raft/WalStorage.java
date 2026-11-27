@@ -141,6 +141,22 @@ public final class WalStorage implements RaftStorage {
         if (!tmp.renameTo(metaFile)) {
             throw new UncheckedIOException(new IOException("rename meta.tmp -> meta failed"));
         }
+        syncDirectory();
+    }
+
+    /**
+     * Makes a rename or a new file in the data directory durable. The file's own fsync
+     * covers its bytes, not its name: after a power failure the directory can still hold
+     * the old entry, and for {@code meta} that is the term and the vote this node already
+     * answered with. Best effort where the platform cannot open a directory.
+     */
+    private void syncDirectory() {
+        try (java.nio.channels.FileChannel dir = java.nio.channels.FileChannel.open(
+                dataDir.toPath(), java.nio.file.StandardOpenOption.READ)) {
+            dir.force(true);
+        } catch (IOException | UnsupportedOperationException notSupportedHere) {
+            // Windows refuses to open a directory this way; there is nothing further to do.
+        }
     }
 
     private void recoverMeta() throws IOException {
@@ -235,6 +251,7 @@ public final class WalStorage implements RaftStorage {
         segmentFiles.put(segId, segFile);
         activeSegmentId = segId;
         activeSegment = new RandomAccessFile(segFile, "rw");
+        syncDirectory();
     }
 
     private File segmentFile(int segId) {
@@ -455,6 +472,7 @@ public final class WalStorage implements RaftStorage {
             tmp.delete();
             throw new UncheckedIOException(new IOException("rename " + tmp.getName() + " -> snapshot failed"));
         }
+        syncDirectory();
         this.snapshotMeta = meta;
 
         index.headMap(meta.lastIncludedIndex, true).clear();
@@ -548,30 +566,65 @@ public final class WalStorage implements RaftStorage {
             int segId = entry.getKey();
             File segFile = entry.getValue();
             if (segId == activeSegmentId) {
-                recoverSegment(segId, activeSegment);
+                recoverSegment(segId, activeSegment, true);
             } else {
-                try (RandomAccessFile raf = new RandomAccessFile(segFile, "rw")) {
-                    recoverSegment(segId, raf);
+                try (RandomAccessFile raf = new RandomAccessFile(segFile, "r")) {
+                    recoverSegment(segId, raf, false);
                 }
             }
         }
+        refuseALogWithAHole();
     }
 
-    private void recoverSegment(int segId, RandomAccessFile raf) throws IOException {
+    /**
+     * The recovered entries must be consecutive. Every caller assumes that an index between
+     * the first and the last entry has an entry, and a node that reports a last index it
+     * cannot back up can be elected on the strength of entries it does not hold.
+     */
+    private void refuseALogWithAHole() {
+        long expected = -1;
+        for (long idx : index.keySet()) {
+            if (expected != -1 && idx != expected) {
+                throw new IllegalStateException("WAL in " + dataDir + " has no entry between index "
+                        + (expected - 1) + " and " + idx + ". " + HOW_TO_RECOVER);
+            }
+            expected = idx + 1;
+        }
+    }
+
+    private static final String HOW_TO_RECOVER = "This node acknowledged entries it can no longer "
+            + "produce, so it must not start from this directory. Empty the directory and let the "
+            + "node rejoin and catch up from the leader.";
+
+    /**
+     * Reads one segment into the index.
+     *
+     * <p>A frame that cannot be read means two different things. At the end of the last
+     * segment it is the write that was in progress when the process died: never
+     * acknowledged, and cut off. Anywhere in an older segment it is damage to entries that
+     * were synced and acknowledged, and everything after it would be recovered with a hole
+     * in front of it -- so that refuses to start and leaves the file as it is.
+     */
+    private void recoverSegment(int segId, RandomAccessFile raf, boolean last) throws IOException {
         long fileLen = raf.length();
         long pos = 0;
         raf.seek(0);
         while (pos < fileLen) {
-            if (fileLen - pos < FRAME_HEADER_SIZE) break;
+            if (fileLen - pos < FRAME_HEADER_SIZE) {
+                refuseDamageUnlessLast(segId, pos, last);
+                break;
+            }
             int len = raf.readInt();
             int expectedCrc = raf.readInt();
             if (len <= 0 || pos + FRAME_HEADER_SIZE + len > fileLen) {
+                refuseDamageUnlessLast(segId, pos, last);
                 raf.setLength(pos);
                 break;
             }
             byte[] buf = new byte[len];
             raf.readFully(buf);
             if (crc32(buf) != expectedCrc) {
+                refuseDamageUnlessLast(segId, pos, last);
                 raf.setLength(pos);
                 break;
             }
@@ -584,11 +637,18 @@ public final class WalStorage implements RaftStorage {
                 lastLogIndex = entry.getIndex();
                 lastLogTerm = entry.getTerm();
             } catch (InvalidProtocolBufferException e) {
+                refuseDamageUnlessLast(segId, pos, last);
                 raf.setLength(pos);
                 break;
             }
             pos += FRAME_HEADER_SIZE + len;
         }
+    }
+
+    private void refuseDamageUnlessLast(int segId, long pos, boolean last) {
+        if (last) return;
+        throw new IllegalStateException("WAL segment " + segmentFile(segId).getName() + " in " + dataDir
+                + " is damaged at offset " + pos + ", and later segments follow it. " + HOW_TO_RECOVER);
     }
 
     @Override
