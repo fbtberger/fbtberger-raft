@@ -394,6 +394,27 @@ abstract class RaftStorageContract {
     }
 
     @Test
+    void aSnapshotSavedWithoutSessionsHasAnEmptyTableNotNull() {
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(5, 3, "hello".getBytes(), "cfg".getBytes()));
+
+        assertEquals(0, store.getSnapshot().sessionData.length);
+    }
+
+    @Test
+    void theSessionTableSurvivesAReopen() {
+        // §8: the table is replicated state. A store that dropped it would hand RaftNode a
+        // snapshot whose state already contains a command and no record of having applied it.
+        byte[] sessions = "sessions".getBytes();
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b")));
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(2, 1, "state".getBytes(), "cfg".getBytes(), sessions));
+        assertArrayEquals(sessions, store.getSnapshot().sessionData);
+        reopen();
+
+        assertArrayEquals(sessions, store.getSnapshot().sessionData);
+        assertArrayEquals("cfg".getBytes(), store.getSnapshot().configurationData);
+    }
+
+    @Test
     void theSnapshotBoundaryNeverMovesBackwards() {
         // A background (COW) snapshot in RaftNode decides to save off-lock. If a newer snapshot --
         // e.g. one installed by InstallSnapshot after a step-down -- landed in between, the stale

@@ -35,6 +35,7 @@ public final class RaftMetrics {
         private final Counter entriesApplied;
         private final Counter stepDowns;
         private final Counter clientRejected;
+        private final Counter clientDuplicates;
         private final Counter replicationSent;
         private final Counter snapshotChunksSent;
         private final Counter snapshotChunksReceived;
@@ -68,6 +69,8 @@ public final class RaftMetrics {
                                 .tags(tags).description("Times this node stepped down to follower").register(registry);
                 this.clientRejected = Counter.builder("raft.client.rejected")
                                 .tags(tags).description("Client submissions rejected (not leader)").register(registry);
+                this.clientDuplicates = Counter.builder("raft.client.duplicate")
+                                .tags(tags).description("Committed commands not applied again because their client session had seen them").register(registry);
                 this.replicationSent = Counter.builder("raft.replication.sent")
                                 .tags(tags).description("Log entries sent to followers").register(registry);
                 this.snapshotChunksSent = Counter.builder("raft.snapshot.chunk.sent")
@@ -241,6 +244,10 @@ public final class RaftMetrics {
 
         public void clientRejected() {
                 clientRejected.increment();
+        }
+
+        public void clientDuplicate() {
+                clientDuplicates.increment();
         }
 
         public void replicationSent(int entryCount) {

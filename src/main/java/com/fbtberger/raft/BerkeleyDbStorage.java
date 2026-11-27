@@ -43,6 +43,9 @@ public final class BerkeleyDbStorage implements RaftStorage {
     private static final byte[] KEY_SNAPSHOT_TERM = "snapshotTerm".getBytes(StandardCharsets.UTF_8);
     private static final byte[] KEY_SNAPSHOT_STATE = "snapshotState".getBytes(StandardCharsets.UTF_8);
     private static final byte[] KEY_SNAPSHOT_CONFIG = "snapshotConfig".getBytes(StandardCharsets.UTF_8);
+    // Absent in an environment written before client sessions existed; readBytes turns
+    // that into an empty table, which is exactly what such a snapshot holds.
+    private static final byte[] KEY_SNAPSHOT_SESSIONS = "snapshotSessions".getBytes(StandardCharsets.UTF_8);
 
     private final Environment env;
     private final Database metaDb; // currentTerm, votedFor, snapshot metadata + payload
@@ -284,7 +287,7 @@ public final class BerkeleyDbStorage implements RaftStorage {
         if (snapshotIndex == 0) return null;
         byte[] stateData = readBytes(KEY_SNAPSHOT_STATE);
         byte[] configData = readBytes(KEY_SNAPSHOT_CONFIG);
-        return new Snapshot(snapshotIndex, snapshotTerm, stateData, configData);
+        return new Snapshot(snapshotIndex, snapshotTerm, stateData, configData, readBytes(KEY_SNAPSHOT_SESSIONS));
     }
 
     /**
@@ -322,6 +325,7 @@ public final class BerkeleyDbStorage implements RaftStorage {
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_TERM), new DatabaseEntry(longToBytes(snapshot.lastIncludedTerm)));
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_STATE), new DatabaseEntry(snapshot.stateMachineData));
             metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_CONFIG), new DatabaseEntry(snapshot.configurationData));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_SESSIONS), new DatabaseEntry(snapshot.sessionData));
 
             try (Cursor cursor = logDb.openCursor(txn, null)) {
                 DatabaseEntry key = new DatabaseEntry();

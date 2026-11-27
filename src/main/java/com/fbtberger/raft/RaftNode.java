@@ -142,6 +142,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     private final Map<Long, CompletableFuture<byte[]>> pendingClientRequests = new ConcurrentHashMap<>();
 
+    /**
+     * Client sessions (§8): which tagged commands have been applied, and with what result.
+     * Replicated state -- changed only in {@link #applyCommittedEntries}, saved in every
+     * snapshot, replaced whenever one is restored. Guarded by {@code lock}.
+     */
+    private final ClientSessions clientSessions = new ClientSessions();
+
     // Leader-side: in-progress chunked snapshot transfers per peer (§7).
     private final Map<String, SnapshotTransfer> snapshotTransfers = new ConcurrentHashMap<>();
 
@@ -292,6 +299,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         RaftStorage.Snapshot existingSnapshot = store.getSnapshot();
         if (existingSnapshot != null) {
             stateMachine.restoreSnapshot(existingSnapshot.stateMachineData);
+            clientSessions.restore(existingSnapshot.sessionData);
             lastApplied.set(existingSnapshot.lastIncludedIndex);
             commitIndex.set(Math.max(commitIndex.get(), existingSnapshot.lastIncludedIndex));
         }
@@ -1084,6 +1092,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
                 store.saveSnapshotAndCompact(snapshot);
                 stateMachine.restoreSnapshot(snapshot.stateMachineData);
+                // The table belongs to the same index as the state it sits beside. Keeping
+                // our own would pair the leader's state with our older idea of which
+                // commands produced it.
+                clientSessions.restore(snapshot.sessionData);
 
                 if (snapshot.lastIncludedIndex > commitIndex.get()) {
                     commitIndex.set(snapshot.lastIncludedIndex);
@@ -1257,7 +1269,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (snapshot == null) {
                 return;
             }
-            byte[] packed = packSnapshotData(snapshot.stateMachineData, snapshot.configurationData);
+            byte[] packed = packSnapshotData(snapshot.stateMachineData, snapshot.configurationData,
+                    snapshot.sessionData);
             transfer = new SnapshotTransfer(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm, packed);
             snapshotTransfers.put(peerId, transfer);
         }
@@ -1447,6 +1460,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             long index = lastApplied.incrementAndGet();
             LogEntry entry = store.getLogEntry(index);
             byte[] result;
+            RuntimeException refusal = null;
             if (entry.hasConfiguration()) {
                 result = new byte[0];
                 ClusterConfiguration cfg = entry.getConfiguration();
@@ -1462,15 +1476,40 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     log("stepping down: committed configuration no longer includes us");
                     becomeFollowerLocked(store.getCurrentTerm());
                 }
-            } else {
+            } else if (entry.getClientId().isEmpty()) {
                 // With the index: a state machine with durable storage cannot tell a
                 // first application from a replay without it (see StateMachine#apply).
                 result = stateMachine.apply(index, entry.getCommand().toByteArray());
+            } else {
+                // §8: a tagged command reaches the state machine once. The entry itself
+                // stays in the log either way -- it was committed, and every server has to
+                // reach this same verdict from the same table at the same index.
+                ClientSessions.Lookup seen = clientSessions.begin(
+                        entry.getClientId(), entry.getSequence(), entry.getAckedSequence());
+                switch (seen.kind()) {
+                    case DUPLICATE -> {
+                        result = seen.result();
+                        metrics.clientDuplicate();
+                    }
+                    case STALE -> {
+                        result = null;
+                        refusal = new StaleClientRequestException(entry.getClientId(), entry.getSequence());
+                        metrics.clientDuplicate();
+                    }
+                    default -> {
+                        result = stateMachine.apply(index, entry.getCommand().toByteArray());
+                        clientSessions.record(entry.getClientId(), entry.getSequence(), result);
+                    }
+                }
             }
             metrics.entryApplied();
             CompletableFuture<byte[]> pending = pendingClientRequests.remove(index);
             if (pending != null) {
-                pending.complete(result);
+                if (refusal != null) {
+                    pending.completeExceptionally(refusal);
+                } else {
+                    pending.complete(result);
+                }
             }
         }
         maybeTakeSnapshotLocked();
@@ -1524,6 +1563,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         java.util.function.Supplier<byte[]> cowSnapshot = captureCowSnapshot();
         metrics.captureSnapshotTimer().record(System.nanoTime() - captureStartNanos, TimeUnit.NANOSECONDS);
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
+        // Serialised here, under the lock, and not in the background task below: the
+        // table has to be the one that belongs to `applied`, and the applier goes on
+        // changing it the moment the lock is released. It is small -- one entry per
+        // client and only the results not yet acknowledged.
+        byte[] sessionData = clientSessions.toBytes();
 
         snapshotInProgress = true;
         snapshotExecutor.execute(() -> {
@@ -1540,7 +1584,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 }
                 byte[] stateMachineData = cowSnapshot.get();
                 RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
-                        applied, includedTerm, stateMachineData, configurationData);
+                        applied, includedTerm, stateMachineData, configurationData, sessionData);
                 store.saveSnapshotAndCompact(snapshot);
                 metrics.snapshotTaken();
                 metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
@@ -1578,7 +1622,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         long startNanos = System.nanoTime();
         byte[] stateMachineData = stateMachine.takeSnapshot();
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
-        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData,
+                configurationData, clientSessions.toBytes()));
         metrics.snapshotTaken();
         metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
         log("snapshotted through index " + applied + " (term " + includedTerm
@@ -1638,9 +1683,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     // ------------------------------------------------------------------
-    // Client interaction (§8, simplified: no per-client serial-number
-    // de-duplication, so a retried command can in principle be applied
-    // twice -- see the README for what a production system would add here)
+    // Client interaction (§8). A command submitted with a client id and a
+    // sequence number is applied exactly once; one submitted without is
+    // applied on every arrival, as it always was.
     // ------------------------------------------------------------------
 
     /**
@@ -1660,6 +1705,62 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
             }
             return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(command)));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Submits a command that takes effect exactly once however often it is submitted
+     * (§8). {@code (clientId, sequence)} names the command; a caller that did not get an
+     * answer submits the same pair again -- to this node or, after a leader change, to
+     * the next one -- and receives the result of the first application.
+     *
+     * <p>Every submission is appended and committed, duplicates included: whether a
+     * command is a duplicate is only known for certain at apply time, when everything
+     * before it has been applied. Rejecting it earlier from the leader's current view
+     * would miss the copy that is still in flight in the log.
+     *
+     * @param clientId      unique per client instance; must not be empty
+     * @param sequence      this command's number, from 1, growing by one per new command
+     * @param ackedSequence the highest sequence up to which the client has received every
+     *                      response; results at or below it are dropped, and a command
+     *                      at or below it fails with {@link StaleClientRequestException}
+     */
+    public CompletableFuture<byte[]> submitCommand(byte[] command, String clientId, long sequence, long ackedSequence) {
+        if (clientId == null || clientId.isEmpty()) {
+            return failedFuture(new IllegalArgumentException("clientId must not be empty"));
+        }
+        if (sequence < 1 || ackedSequence >= sequence) {
+            return failedFuture(new IllegalArgumentException(
+                    "sequence must be >= 1 and above ackedSequence (sequence=" + sequence
+                            + ", ackedSequence=" + ackedSequence + ")"));
+        }
+        lock.lock();
+        try {
+            if (role != ServerRole.LEADER) {
+                metrics.clientRejected();
+                return failedFuture(new NotLeaderException(currentLeaderId));
+            }
+            if (leaderTransferTarget != null) {
+                metrics.clientRejected();
+                return failedFuture(new NotLeaderException(leaderTransferTarget));
+            }
+            return appendAndReplicateLocked(LogEntry.newBuilder()
+                    .setCommand(ByteString.copyFrom(command))
+                    .setClientId(clientId)
+                    .setSequence(sequence)
+                    .setAckedSequence(ackedSequence));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** How many client sessions this server currently remembers. */
+    public int clientSessionCount() {
+        lock.lock();
+        try {
+            return clientSessions.size();
         } finally {
             lock.unlock();
         }
@@ -2398,6 +2499,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * {@link #addLearner}, {@link #removeLearner}, {@link #promoteLearner},
      * {@link #setConfiguration}) for requests that are invalid regardless of who the leader is.
      */
+    /**
+     * A tagged command at or below what its client already acknowledged. The client said
+     * it has that answer, so the result is no longer held -- and applying the command
+     * again is the one thing a session exists to prevent. Only a client that reuses a
+     * sequence number sees this.
+     */
+    public static final class StaleClientRequestException extends RuntimeException {
+        public StaleClientRequestException(String clientId, long sequence) {
+            super("sequence " + sequence + " of client " + clientId
+                    + " was already acknowledged; its result is no longer held");
+        }
+    }
+
     public static final class ConfigurationChangeException extends RuntimeException {
         public ConfigurationChangeException(String message) {
             super(message);
@@ -2666,14 +2780,49 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * stream for chunked transfer: {@code [4-byte big-endian smLen][smData][cfgData]}.
      */
     static byte[] packSnapshotData(byte[] stateMachineData, byte[] configurationData) {
-        byte[] packed = new byte[4 + stateMachineData.length + configurationData.length];
-        packed[0] = (byte) (stateMachineData.length >>> 24);
-        packed[1] = (byte) (stateMachineData.length >>> 16);
-        packed[2] = (byte) (stateMachineData.length >>> 8);
-        packed[3] = (byte) (stateMachineData.length);
-        System.arraycopy(stateMachineData, 0, packed, 4, stateMachineData.length);
-        System.arraycopy(configurationData, 0, packed, 4 + stateMachineData.length, configurationData.length);
+        return packSnapshotData(stateMachineData, configurationData, new byte[0]);
+    }
+
+    /** Top bit of the leading length word: a session table follows the configuration. */
+    private static final int SNAPSHOT_HAS_SESSIONS = 0x8000_0000;
+
+    /**
+     * As above, plus the client session table. With an empty table the bytes are exactly
+     * the two-payload format, so a cluster in which nobody uses sessions keeps exchanging
+     * snapshots with nodes that predate them. With a table the layout is
+     * {@code [smLen | top bit][smData][4-byte cfgLen][cfgData][sessionData]}; the top bit
+     * is free because a length is never negative.
+     */
+    static byte[] packSnapshotData(byte[] stateMachineData, byte[] configurationData, byte[] sessionData) {
+        boolean withSessions = sessionData.length > 0;
+        int cfgPrefix = withSessions ? 4 : 0;
+        byte[] packed = new byte[4 + stateMachineData.length + cfgPrefix
+                + configurationData.length + sessionData.length];
+        int head = withSessions ? stateMachineData.length | SNAPSHOT_HAS_SESSIONS : stateMachineData.length;
+        writeInt(packed, 0, head);
+        int at = 4;
+        System.arraycopy(stateMachineData, 0, packed, at, stateMachineData.length);
+        at += stateMachineData.length;
+        if (withSessions) {
+            writeInt(packed, at, configurationData.length);
+            at += 4;
+        }
+        System.arraycopy(configurationData, 0, packed, at, configurationData.length);
+        at += configurationData.length;
+        System.arraycopy(sessionData, 0, packed, at, sessionData.length);
         return packed;
+    }
+
+    private static void writeInt(byte[] target, int at, int value) {
+        target[at] = (byte) (value >>> 24);
+        target[at + 1] = (byte) (value >>> 16);
+        target[at + 2] = (byte) (value >>> 8);
+        target[at + 3] = (byte) value;
+    }
+
+    private static int readInt(byte[] source, int at) {
+        return ((source[at] & 0xFF) << 24) | ((source[at + 1] & 0xFF) << 16)
+                | ((source[at + 2] & 0xFF) << 8) | (source[at + 3] & 0xFF);
     }
 
     /**
@@ -2681,10 +2830,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * back into the two original payloads and wraps them in a {@link RaftStorage.Snapshot}.
      */
     static RaftStorage.Snapshot unpackSnapshotData(long lastIncludedIndex, long lastIncludedTerm, byte[] packed) {
-        int smLen = ((packed[0] & 0xFF) << 24) | ((packed[1] & 0xFF) << 16)
-                  | ((packed[2] & 0xFF) << 8)  | (packed[3] & 0xFF);
+        int head = readInt(packed, 0);
+        int smLen = head & ~SNAPSHOT_HAS_SESSIONS;
         byte[] smData = Arrays.copyOfRange(packed, 4, 4 + smLen);
-        byte[] cfgData = Arrays.copyOfRange(packed, 4 + smLen, packed.length);
-        return new RaftStorage.Snapshot(lastIncludedIndex, lastIncludedTerm, smData, cfgData);
+        if ((head & SNAPSHOT_HAS_SESSIONS) == 0) {
+            byte[] cfgData = Arrays.copyOfRange(packed, 4 + smLen, packed.length);
+            return new RaftStorage.Snapshot(lastIncludedIndex, lastIncludedTerm, smData, cfgData);
+        }
+        int cfgStart = 4 + smLen + 4;
+        int cfgLen = readInt(packed, 4 + smLen);
+        byte[] cfgData = Arrays.copyOfRange(packed, cfgStart, cfgStart + cfgLen);
+        byte[] sessionData = Arrays.copyOfRange(packed, cfgStart + cfgLen, packed.length);
+        return new RaftStorage.Snapshot(lastIncludedIndex, lastIncludedTerm, smData, cfgData, sessionData);
     }
 }

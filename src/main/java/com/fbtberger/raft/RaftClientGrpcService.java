@@ -45,7 +45,14 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
     @Override
     public void submit(SubmitRequest request, StreamObserver<SubmitResponse> responseObserver) {
         Timer.Sample sample = Timer.start(metrics.registry());
-        raftNode.submitCommand(request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
+        byte[] command = request.getCommand().toByteArray();
+        // No client id is a request without a session, which is what every client older
+        // than the field sends; it is applied on every arrival as before.
+        CompletableFuture<byte[]> outcome = request.getClientId().isEmpty()
+                ? raftNode.submitCommand(command)
+                : raftNode.submitCommand(command, request.getClientId(),
+                        request.getSequence(), request.getAckedSequence());
+        outcome.whenComplete((result, throwable) -> {
             sample.stop(metrics.clientSubmitTimer());
             responseObserver.onNext(throwable == null ? success(result) : failure(unwrap(throwable)));
             responseObserver.onCompleted();

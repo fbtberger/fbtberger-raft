@@ -62,6 +62,9 @@ For a quick API reference, see the
     heartbeat round before allowing reads
   - Lease-based: `leaseRead()` serves reads immediately when the leader's lease
     is valid (majority acked within election timeout); falls back to ReadIndex
+- **Exactly-once commands** (§8): client sessions. A command tagged with a client
+  id and a sequence number is applied once however often it is retried, across
+  leader changes, restarts and log compaction; `RaftClient` tags every `submit()`
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
 - **JaCoCo** test coverage reporting
@@ -100,6 +103,7 @@ fbtberger-raft/
     │       ├── InMemoryStorage.java        # non-durable test implementation
     │       ├── StateMachine.java           # state machine interface (+ COW snapshot)
     │       ├── KeyValueStateMachine.java   # demo key-value store
+    │       ├── ClientSessions.java         # replicated session table (exactly-once, §8)
     │       ├── RaftClientGrpcService.java  # client-facing gRPC adapter
     │       ├── RaftNodeMXBean.java         # JMX management interface
     │       ├── RaftNodeMBean.java          # JMX MXBean implementation
@@ -263,10 +267,13 @@ See [docs/architecture.pdf](docs/architecture.pdf) for the full metrics table.
 open build/reports/jacoco/test/html/index.html
 ```
 
-## What is *not* implemented
+## Known limits
 
-- **Client request de-duplication** (§8): retried commands may be applied twice.
-  A production system would track per-client serial numbers.
+- **Client sessions and mixed versions**: a node older than client sessions stores
+  a command's session tag but applies a duplicate anyway. Upgrade every node
+  before any client sends tags (every `RaftClient` from this version on does).
+- **Session eviction**: at most 4096 client sessions are remembered, least recently
+  used first. See section 5.4 of the architecture document.
 
 ## License
 

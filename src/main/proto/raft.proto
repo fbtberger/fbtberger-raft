@@ -49,6 +49,44 @@ message LogEntry {
     bytes command = 3;
     ClusterConfiguration configuration = 4;
   }
+
+  // Client session tag (§8, dissertation §6.3). Empty client_id means the
+  // command was submitted without a session and is applied unconditionally,
+  // which is what every entry written before these fields existed reads as.
+  //
+  // With a client_id, (client_id, sequence) names the command: every server
+  // applies it at most once and answers a repeat from its recorded result.
+  // acked_sequence is the highest sequence up to which the client has received
+  // every response, so the servers can drop the results they still hold for it.
+  //
+  // These travel in the log, not beside it, because the decision "is this a
+  // duplicate" must come out the same on every server and survive a leader
+  // change -- the retry that matters is precisely the one that reaches the
+  // NEXT leader.
+  string client_id = 5;
+  int64 sequence = 6;
+  int64 acked_sequence = 7;
+}
+
+// The replicated session table, as it is stored in a snapshot (§7). Order is
+// significant: sessions are listed least recently used first, and eviction
+// follows that order, so two servers restoring the same snapshot must evict
+// the same session next.
+message ClientSessionTable {
+  repeated ClientSession sessions = 1;
+}
+
+message ClientSession {
+  string client_id = 1;
+  // Every sequence at or below this has been acknowledged by the client; its
+  // result is gone and a repeat of it is refused rather than re-applied.
+  int64 acked_sequence = 2;
+  repeated ClientSessionResult results = 3;
+}
+
+message ClientSessionResult {
+  int64 sequence = 1;
+  bytes result = 2;
 }
 
 // RequestVote RPC, invoked by candidates to gather votes (§5.2).

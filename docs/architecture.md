@@ -230,6 +230,65 @@ node.removeLearner("n4").get(5, SECONDS);             // or drop it without prom
 
 \newpage
 
+# 5.4 Client Sessions: Exactly-Once Commands (§8)
+
+![A retry across a leader change](sessions.png){width=85%}
+
+Raft by itself gives a client *at-least-once*: a leader can commit a command and
+fail before it answers, the client retries against the next leader, and the
+command is in the log twice. A session closes that gap.
+
+**The tag.** A client picks a random `client_id` once and numbers its commands
+from 1. `SubmitRequest` carries `client_id`, `sequence` and `acked_sequence`; the
+leader copies all three into the `LogEntry`. A retry repeats the same pair, on
+whichever node it reaches.
+
+**The table.** `ClientSessions` maps each client to the results of the sequences
+it has not acknowledged yet. `RaftNode.applyCommittedEntries()` consults it for
+every tagged entry, in log order, on every server:
+
+| Verdict | Condition | Effect |
+|---------|-----------|--------|
+| `NEW` | sequence not recorded | state machine applies; result recorded |
+| `DUPLICATE` | sequence recorded | state machine **not** called; recorded result returned |
+| `STALE` | sequence at or below `acked_sequence` | not applied; fails with `StaleClientRequestException` |
+
+A duplicate is still appended and committed. Whether a command is a duplicate
+is only certain at apply time, once everything before it has been applied; a
+leader that refused it earlier from its current view would miss a copy still in
+flight in the log.
+
+**Replicated, not cached.** The table changes only while applying committed
+entries, so all servers hold the same table at the same index. It is stored in
+every snapshot (`RaftStorage.Snapshot.sessionData`) and replaced whenever a
+snapshot is restored or installed, which is what keeps a retry recognised after
+the entry that carried the tag has been compacted away.
+
+**Bounded.** A result is dropped as soon as a later command from the same client
+acknowledges it. A client that never returns is evicted once
+`ClientSessions.MAX_SESSIONS` (4096) other clients have been active, least
+recently used first. The bound is a constant and not a setting: eviction decides
+whether a command is applied, so it must be identical on every server.
+
+**Limits, stated.**
+
+- A client whose retry is still in flight while 4096 other clients commit loses
+  the protection for that one retry.
+- A command submitted without a `client_id` is applied on every arrival, as before.
+- Do not send session tags to a cluster that still contains a node older than
+  this feature: it stores the tag but applies the duplicate, and its state
+  diverges. Upgrade every node first, then the clients.
+
+```java
+RaftClient client = new RaftClient(addresses);   // one session per instance
+client.submit(cmd);                              // tagged and retried under one sequence
+
+// in-process, with an explicit tag:
+node.submitCommand(cmd, "client-a", 7, 6).get(2, SECONDS);
+```
+
+\newpage
+
 # 6. Log Replication Pipeline
 
 ![Replication with Parallel Disk Writes and Pipelining](replication.png){width=85%}
@@ -269,6 +328,10 @@ snapshot from overwriting a more recent `InstallSnapshot`.
 **Transferring snapshots (§7, Figure 13)**: The leader packs the state machine
 data and cluster configuration into a single byte stream
 (`[4B smLen][smData][cfgData]`) and sends it in fixed-size chunks (default 1 MB).
+When the client session table (section 5.4) is not empty it travels too: the top
+bit of the length word is set and the layout becomes
+`[4B smLen|top bit][smData][4B cfgLen][cfgData][sessionData]`. With an empty table
+the bytes are exactly the two-payload format.
 One chunk is sent per heartbeat cycle. The follower buffers incoming chunks and
 applies the reassembled snapshot when the final chunk arrives (`done=true`).
 
@@ -381,6 +444,7 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.snapshot.chunk.sent` | Counter | Snapshot chunks sent |
 | `raft.snapshot.chunk.received` | Counter | Snapshot chunks received |
 | `raft.client.rejected` | Counter | Client submissions rejected (not leader) |
+| `raft.client.duplicate` | Counter | Committed commands not applied again (session had seen them) |
 | `raft.rpc.append.entries` | Timer | AppendEntries RPC handling time |
 | `raft.rpc.request.vote` | Timer | RequestVote RPC handling time |
 | `raft.rpc.install.snapshot` | Timer | InstallSnapshot RPC handling time |

@@ -63,6 +63,26 @@ service RaftClientService {
 
 message SubmitRequest {
   bytes command = 1;
+
+  // Exactly-once submission (§8). A client that sets client_id names this
+  // command (client_id, sequence) and repeats the SAME pair on every retry; the
+  // cluster then applies it once and answers a repeat with the first result,
+  // whichever node the retry reaches and whoever is leader by then.
+  //
+  // client_id is chosen by the client and must be unique per client instance (a
+  // random UUID). sequence starts at 1 and grows by one per new command.
+  // acked_sequence is the highest sequence up to which the client has seen every
+  // response; the servers keep a result only until it is acknowledged.
+  //
+  // All three unset is a request without a session: applied on every arrival,
+  // which is what a client older than these fields sends.
+  //
+  // Do not set them against a cluster that still has a node older than these
+  // fields. Such a node carries them through its log untouched and applies the
+  // duplicate anyway, so its state machine diverges from its upgraded peers.
+  string client_id = 2;
+  int64 sequence = 3;
+  int64 acked_sequence = 4;
 }
 
 message SubmitResponse {

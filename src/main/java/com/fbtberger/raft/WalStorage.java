@@ -333,6 +333,10 @@ public final class WalStorage implements RaftStorage {
             dos.write(snap.stateMachineData);
             dos.writeInt(snap.configurationData.length);
             dos.write(snap.configurationData);
+            // Appended, never inserted: a snapshot file written before the session
+            // table existed simply ends here, and recoverSnapshot reads that as empty.
+            dos.writeInt(snap.sessionData.length);
+            dos.write(snap.sessionData);
             dos.flush();
             fos.getFD().sync();
         } catch (IOException e) {
@@ -388,7 +392,11 @@ public final class WalStorage implements RaftStorage {
             byte[] smData = dis.readNBytes(smLen);
             int cfgLen = dis.readInt();
             byte[] cfgData = dis.readNBytes(cfgLen);
-            this.snapshot = new Snapshot(lastIdx, lastTerm, smData, cfgData);
+            byte[] sessionData = new byte[0];
+            if (dis.available() >= Integer.BYTES) {
+                sessionData = dis.readNBytes(dis.readInt());
+            }
+            this.snapshot = new Snapshot(lastIdx, lastTerm, smData, cfgData, sessionData);
             this.lastLogIndex = lastIdx;
             this.lastLogTerm = lastTerm;
         }

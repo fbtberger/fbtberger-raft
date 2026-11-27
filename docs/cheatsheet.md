@@ -102,6 +102,15 @@ RaftClient client = new RaftClient(
 byte[] result = client.submit(cmd);
 ```
 
+**Exactly once (§8):** `RaftClient` tags every command with its own
+`clientId` and a sequence number and keeps the tag across retries, so a
+retried command is applied once. In-process, pass the tag yourself:
+
+```java
+node.submitCommand(cmd, "client-a",
+    /*sequence*/ 7, /*acked*/ 6);
+```
+
 ## Leadership Transfer (new)
 
 ```java

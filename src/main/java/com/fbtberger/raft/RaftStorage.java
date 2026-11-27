@@ -93,12 +93,26 @@ public interface RaftStorage extends AutoCloseable {
         public final long lastIncludedTerm;
         public final byte[] stateMachineData;
         public final byte[] configurationData;
+        /**
+         * The client session table as of this index ({@code ClientSessions#toBytes}),
+         * which is replicated state just as the state machine's data is: without it a
+         * server restored from this snapshot would apply a retried command a second
+         * time. Never null; empty when no client has used a session, and empty for
+         * every snapshot stored before this field existed.
+         */
+        public final byte[] sessionData;
 
         public Snapshot(long lastIncludedIndex, long lastIncludedTerm, byte[] stateMachineData, byte[] configurationData) {
+            this(lastIncludedIndex, lastIncludedTerm, stateMachineData, configurationData, new byte[0]);
+        }
+
+        public Snapshot(long lastIncludedIndex, long lastIncludedTerm, byte[] stateMachineData,
+                        byte[] configurationData, byte[] sessionData) {
             this.lastIncludedIndex = lastIncludedIndex;
             this.lastIncludedTerm = lastIncludedTerm;
             this.stateMachineData = stateMachineData;
             this.configurationData = configurationData;
+            this.sessionData = sessionData == null ? new byte[0] : sessionData;
         }
     }
 

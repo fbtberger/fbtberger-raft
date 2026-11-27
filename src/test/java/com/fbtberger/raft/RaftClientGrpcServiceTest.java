@@ -89,6 +89,38 @@ class RaftClientGrpcServiceTest {
     }
 
     @Test
+    void aSubmitRepeatedUnderTheSameSessionTagIsCommittedTwiceAndAppliedOnce() {
+        SubmitRequest tagged = SubmitRequest.newBuilder()
+                .setCommand(ByteString.copyFromUtf8("SET x 42"))
+                .setClientId("client-a").setSequence(1).build();
+        double before = node.metrics().registry().get("raft.client.duplicate").counter().count();
+
+        SubmitResponse first = clientStub.submit(tagged);
+        SubmitResponse retry = clientStub.submit(tagged);
+
+        assertTrue(first.getSuccess());
+        assertTrue(retry.getSuccess());
+        assertEquals(first.getResult(), retry.getResult());
+        assertEquals(1, node.clientSessionCount());
+        assertEquals(before + 1, node.metrics().registry().get("raft.client.duplicate").counter().count());
+    }
+
+    @Test
+    void aSubmitWithAnAcknowledgedSequenceFailsWithAReason() {
+        clientStub.submit(SubmitRequest.newBuilder().setCommand(ByteString.copyFromUtf8("SET x 1"))
+                .setClientId("client-a").setSequence(1).build());
+        clientStub.submit(SubmitRequest.newBuilder().setCommand(ByteString.copyFromUtf8("SET x 2"))
+                .setClientId("client-a").setSequence(2).setAckedSequence(1).build());
+
+        SubmitResponse stale = clientStub.submit(SubmitRequest.newBuilder()
+                .setCommand(ByteString.copyFromUtf8("SET x 1"))
+                .setClientId("client-a").setSequence(1).build());
+
+        assertFalse(stale.getSuccess());
+        assertTrue(stale.getError().contains("already acknowledged"), stale.getError());
+    }
+
+    @Test
     void queryReadsBackWhatWasJustCommitted() {
         clientStub.submit(SubmitRequest.newBuilder()
                 .setCommand(ByteString.copyFromUtf8("SET x 42")).build());

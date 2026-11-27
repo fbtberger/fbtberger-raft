@@ -31,7 +31,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -80,6 +83,21 @@ public final class RaftClient implements AutoCloseable {
     private final TlsConfig tlsConfig;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile String knownLeaderId; // best guess; null means "unknown, try everyone"
+
+    /**
+     * This client's session (§8). Every command gets the next sequence number and keeps it
+     * across every retry, so the cluster can tell a retry from a new command and apply it
+     * once. A fresh random id per instance: two instances are two clients, and a process
+     * that restarts starts a new session rather than guessing where the old one stopped.
+     */
+    private final String clientId = UUID.randomUUID().toString();
+    private final AtomicLong nextSequence = new AtomicLong(1);
+    /**
+     * Sequences submitted and not yet answered or given up. Everything below the lowest is
+     * acknowledged -- the lowest, not the newest, so that sharing an instance between threads
+     * cannot acknowledge a command another thread is still retrying.
+     */
+    private final ConcurrentSkipListSet<Long> outstanding = new ConcurrentSkipListSet<>();
 
     /**
      * A plaintext client, which is what this class used to be able to be and nothing else.
@@ -137,7 +155,35 @@ public final class RaftClient implements AutoCloseable {
      * @throws RaftClientException if no node in the cluster accepted the command
      */
     public byte[] submit(byte[] command, Duration perAttemptTimeout) throws RaftClientException {
-        SubmitRequest request = SubmitRequest.newBuilder().setCommand(ByteString.copyFrom(command)).build();
+        // One sequence number for the whole walk below. That is the point of it: the
+        // attempt that times out against a leader which committed the command and the
+        // attempt that then reaches its successor are the same command to the cluster.
+        long sequence;
+        long acked;
+        // Numbered, registered and acknowledged-up-to in one step. Apart, a second
+        // thread could compute its acknowledgement between this thread taking a number
+        // and registering it, and acknowledge a command that has not been sent yet.
+        synchronized (outstanding) {
+            sequence = nextSequence.getAndIncrement();
+            outstanding.add(sequence);
+            acked = outstanding.first() - 1;
+        }
+        try {
+            return submitTagged(command, sequence, acked, perAttemptTimeout);
+        } finally {
+            // Answered or given up: either way this client never asks for it again, so
+            // the servers may drop its result once a later command carries the news.
+            outstanding.remove(sequence);
+        }
+    }
+
+    private byte[] submitTagged(byte[] command, long sequence, long acked, Duration perAttemptTimeout) throws RaftClientException {
+        SubmitRequest request = SubmitRequest.newBuilder()
+                .setCommand(ByteString.copyFrom(command))
+                .setClientId(clientId)
+                .setSequence(sequence)
+                .setAckedSequence(acked)
+                .build();
         RaftClientException lastError = null;
 
         for (String nodeId : candidateOrder()) {
@@ -349,6 +395,11 @@ public final class RaftClient implements AutoCloseable {
             throw reasoned;
         }
         throw lastError != null ? lastError : new RaftClientException("no nodes configured");
+    }
+
+    /** The id this client tags its commands with (§8). */
+    public String clientId() {
+        return clientId;
     }
 
     /** This client's current best guess at who the leader is, or null if unknown. */
