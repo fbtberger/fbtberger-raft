@@ -4,6 +4,9 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.auth.ClientAuthInterceptor;
+import com.fbtberger.raft.auth.KeycloakTokenVerifier;
+import com.fbtberger.raft.auth.TokenVerifier;
 import com.fbtberger.raft.transport.GrpcTransportFactory;
 import com.fbtberger.raft.transport.GrpcTransportServer;
 import com.fbtberger.raft.transport.RaftTransportFactory;
@@ -15,7 +18,7 @@ import io.micrometer.jmx.JmxMeterRegistry;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
-import io.grpc.ServerBuilder;
+import io.grpc.ServerInterceptors;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,6 +31,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * Spring IoC configuration for a single Raft node.
@@ -156,20 +160,44 @@ public class RaftNodeConfiguration {
         return new RaftClientGrpcService(raftNode);
     }
 
+    /**
+     * How a bearer token becomes a caller. Keycloak by default; a deployment with another
+     * identity provider declares its own {@link TokenVerifier} bean and this one steps aside.
+     * With authorisation switched off nothing ever asks it, and it refuses if something does.
+     */
+    @Bean
+    @ConditionalOnMissingBean(TokenVerifier.class)
+    public TokenVerifier tokenVerifier(RaftConfig config) {
+        if (!config.clientAuthConfig().enabled()) {
+            return token -> {
+                throw new TokenVerifier.InvalidTokenException("client authorisation is not configured");
+            };
+        }
+        return new KeycloakTokenVerifier(config.clientAuthConfig());
+    }
+
+    @Bean
+    public ClientAuthInterceptor clientAuthInterceptor(TokenVerifier verifier, RaftConfig config,
+                                                       RaftMetrics metrics) {
+        return new ClientAuthInterceptor(verifier, config.clientAuthConfig(), metrics);
+    }
+
     @Bean(destroyMethod = "close")
     public RaftTransportServer raftTransportServer(RaftConfig config,
                                                     RaftNode raftNode,
-                                                    RaftClientGrpcService clientService) throws Exception {
-        GrpcTransportServer server;
-        if (config.tlsConfig().enabled()) {
-            server = new GrpcTransportServer(config.selfPort(), raftNode, config.tlsConfig());
-            // Client-facing service added via separate gRPC server or same port
-        } else {
-            server = new GrpcTransportServer(
-                    ServerBuilder.forPort(config.selfPort()).addService(clientService),
-                    raftNode);
-        }
+                                                    RaftClientGrpcService clientService,
+                                                    ClientAuthInterceptor clientAuth) throws Exception {
+        // The interceptor wraps the client service only. The peer service on the same port
+        // authenticates by certificate and must not be asked for a Keycloak token.
+        //
+        // One constructor for plaintext and TLS alike. The TLS branch used to build the
+        // server without the client service, so a node with tls.enabled=true answered its
+        // peers and no client.
+        GrpcTransportServer server = new GrpcTransportServer(
+                config.selfPort(), raftNode, config.tlsConfig(),
+                List.of(ServerInterceptors.intercept(clientService, clientAuth)));
         server.start();
+        ClientAuthInterceptor.logStartup(config.clientAuthConfig(), config.tlsConfig().enabled());
         return server;
     }
 

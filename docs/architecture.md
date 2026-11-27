@@ -383,6 +383,84 @@ this; a peer that predates the field is refused on an mTLS cluster, so
 leadership transfers from a not-yet-upgraded leader fail during a rolling
 upgrade. Each server logs its mode and node certificate at startup.
 
+# 8.1 Client Channel Authorisation (Keycloak)
+
+![Client channel authorisation](auth.png){width=90%}
+
+The peer transport authenticates by certificate. The client channel shares the
+port and, until this section existed, checked nothing: anyone who could reach it
+could submit commands, add or remove servers and move the leader. A client
+certificate under mTLS narrows that to holders of a cluster certificate; it does
+not say what a holder may do.
+
+With `auth.keycloak.enabled=true`, `ClientAuthInterceptor` sits in front of
+`RaftClientGrpcService` (and only there; the peer service is not asked for a
+token). Every client RPC must carry `authorization: Bearer <access token>`.
+
+**Verification is offline.** `KeycloakTokenVerifier` checks the RS256 signature
+against the realm's published keys, then issuer, expiry and, if configured,
+audience. The keys are fetched when first needed and when the realm rotates
+them; between those moments the node decides alone, so Keycloak is not on the
+path of a command and its availability does not multiply into the cluster's.
+The price: a token revoked in Keycloak stays valid here until it expires. Keep
+access tokens short-lived.
+
+**One role per RPC.** Roles come from `realm_access.roles`, plus
+`resource_access.<client>.roles` when `auth.keycloak.client.id` is set.
+
+| RPC | Required role (default name) |
+|-----|------------------------------|
+| `Query` | `raft-read` |
+| `Submit` | `raft-write` |
+| `AddServer`, `RemoveServer`, `AddLearner`, `PromoteLearner`, `RemoveLearner`, `TransferLeadership`, any RPC added later | `raft-admin` |
+
+Roles do not imply each other. A hierarchy belongs in Keycloak as composite
+roles, where those who grant roles can see it.
+
+**Refusals.** No token or one that does not verify: `UNAUTHENTICATED`. A valid
+token without the role: `PERMISSION_DENIED`, naming the role. Both are logged
+on the node and counted. `RaftClient` stops its leader walk at the first such
+answer and reports it as a refusal rather than as an unreachable node.
+
+**Configuration** (node `.properties`):
+
+```properties
+auth.keycloak.enabled=true
+auth.keycloak.issuer=https://keycloak.example/realms/raft
+# auth.keycloak.jwks.uri=   default: <issuer>/protocol/openid-connect/certs
+# auth.keycloak.audience=   optional: required "aud" of the token
+# auth.keycloak.client.id=  optional: also accept this client's resource roles
+# auth.role.read=raft-read  auth.role.write=raft-write  auth.role.admin=raft-admin
+```
+
+Authorisation is off by default so that an upgraded node keeps answering its
+existing clients; the node logs a warning at startup while it is off, and
+another if tokens are required but `tls.enabled=false`, because a token sent in
+the clear can be replayed until it expires.
+
+**Inversion of control.** `TokenVerifier` is an interface and a Spring bean
+declared `@ConditionalOnMissingBean`: a deployment with a different identity
+provider supplies its own and the Keycloak one steps aside.
+
+**Client side.**
+
+```java
+Supplier<String> token = new KeycloakTokenSupplier(
+        "https://keycloak.example/realms/raft", "raft-web", clientSecret);
+RaftClient client = new RaftClient(addresses, tlsConfig, token);
+```
+
+`KeycloakTokenSupplier` performs the client credentials grant and reuses the
+token until 30 seconds before it expires. An application acting for a logged-in
+user passes that user's token instead.
+
+**Also fixed here.** The Spring wiring registered the client service only on a
+plaintext node; with `tls.enabled=true` the node answered its peers and no
+client. Both cases now use one `GrpcTransportServer` constructor that takes the
+additional services.
+
+\newpage
+
 # 9. Storage Layer
 
 Three `RaftStorage` implementations are available:
@@ -445,6 +523,8 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.snapshot.chunk.received` | Counter | Snapshot chunks received |
 | `raft.client.rejected` | Counter | Client submissions rejected (not leader) |
 | `raft.client.duplicate` | Counter | Committed commands not applied again (session had seen them) |
+| `raft.client.auth.accepted` | Counter | Client RPCs admitted by token and role |
+| `raft.client.auth.rejected` | Counter | Client RPCs refused; tag `reason` = `unauthenticated` or `forbidden` |
 | `raft.rpc.append.entries` | Timer | AppendEntries RPC handling time |
 | `raft.rpc.request.vote` | Timer | RequestVote RPC handling time |
 | `raft.rpc.install.snapshot` | Timer | InstallSnapshot RPC handling time |

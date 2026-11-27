@@ -36,6 +36,9 @@ public final class RaftMetrics {
         private final Counter stepDowns;
         private final Counter clientRejected;
         private final Counter clientDuplicates;
+        private final Counter clientAuthAccepted;
+        private final Counter clientAuthUnauthenticated;
+        private final Counter clientAuthForbidden;
         private final Counter replicationSent;
         private final Counter snapshotChunksSent;
         private final Counter snapshotChunksReceived;
@@ -71,6 +74,14 @@ public final class RaftMetrics {
                                 .tags(tags).description("Client submissions rejected (not leader)").register(registry);
                 this.clientDuplicates = Counter.builder("raft.client.duplicate")
                                 .tags(tags).description("Committed commands not applied again because their client session had seen them").register(registry);
+                this.clientAuthAccepted = Counter.builder("raft.client.auth.accepted")
+                                .tags(tags).description("Client RPCs admitted by token and role").register(registry);
+                this.clientAuthUnauthenticated = Counter.builder("raft.client.auth.rejected")
+                                .tags(tags.and("reason", "unauthenticated"))
+                                .description("Client RPCs refused: no token, or one that did not verify").register(registry);
+                this.clientAuthForbidden = Counter.builder("raft.client.auth.rejected")
+                                .tags(tags.and("reason", "forbidden"))
+                                .description("Client RPCs refused: valid token without the required role").register(registry);
                 this.replicationSent = Counter.builder("raft.replication.sent")
                                 .tags(tags).description("Log entries sent to followers").register(registry);
                 this.snapshotChunksSent = Counter.builder("raft.snapshot.chunk.sent")
@@ -244,6 +255,15 @@ public final class RaftMetrics {
 
         public void clientRejected() {
                 clientRejected.increment();
+        }
+
+        public void clientAuthAccepted() {
+                clientAuthAccepted.increment();
+        }
+
+        /** @param reason {@code "forbidden"} for a missing role, anything else counts as unauthenticated */
+        public void clientAuthRejected(String reason) {
+                ("forbidden".equals(reason) ? clientAuthForbidden : clientAuthUnauthenticated).increment();
         }
 
         public void clientDuplicate() {

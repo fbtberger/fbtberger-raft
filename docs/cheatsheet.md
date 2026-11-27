@@ -111,6 +111,26 @@ node.submitCommand(cmd, "client-a",
     /*sequence*/ 7, /*acked*/ 6);
 ```
 
+## Client Authorisation (Keycloak)
+
+Node `.properties`:
+
+```properties
+auth.keycloak.enabled=true
+auth.keycloak.issuer=https://kc/realms/raft
+```
+
+Roles: `Query` needs `raft-read`, `Submit` needs `raft-write`,
+everything else `raft-admin`. Client:
+
+```java
+var token = new KeycloakTokenSupplier(
+    "https://kc/realms/raft",
+    "raft-web", clientSecret);
+var client = new RaftClient(
+    addresses, tlsConfig, token);
+```
+
 ## Leadership Transfer (new)
 
 ```java

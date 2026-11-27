@@ -17,11 +17,13 @@ import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.google.protobuf.ByteString;
+import com.fbtberger.raft.auth.BearerTokenInterceptor;
 import com.fbtberger.raft.transport.TlsConfig;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 
 import javax.net.ssl.SSLException;
@@ -37,6 +39,7 @@ import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * A generic, reusable client for talking to a Raft cluster over the
@@ -81,6 +84,8 @@ public final class RaftClient implements AutoCloseable {
 
     private final Map<String, String> clusterAddresses; // nodeId -> host:port
     private final TlsConfig tlsConfig;
+    /** Supplies the caller's current Keycloak access token, or null if the cluster asks for none. */
+    private final Supplier<String> bearerToken;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile String knownLeaderId; // best guess; null means "unknown, try everyone"
 
@@ -132,11 +137,29 @@ public final class RaftClient implements AutoCloseable {
      * certificate; it is not authorisation.
      */
     public RaftClient(Map<String, String> clusterAddresses, TlsConfig tlsConfig) {
+        this(clusterAddresses, tlsConfig, null);
+    }
+
+    /**
+     * A client that also says who it is: every RPC carries the token {@code bearerToken}
+     * returns at that moment, which is what a cluster with {@code auth.keycloak.enabled=true}
+     * checks before it lets the RPC through. This is the authorisation the constructor
+     * above says mTLS is not.
+     *
+     * <p>The supplier is asked per call, so it can hand out a refreshed token without the
+     * client being rebuilt -- {@code KeycloakTokenSupplier} for a service account, or the
+     * token of the user on whose behalf the caller acts.
+     *
+     * @param bearerToken supplies the access token without the {@code Bearer } prefix;
+     *                    null for a cluster that requires none
+     */
+    public RaftClient(Map<String, String> clusterAddresses, TlsConfig tlsConfig, Supplier<String> bearerToken) {
         if (clusterAddresses.isEmpty()) {
             throw new IllegalArgumentException("clusterAddresses must not be empty");
         }
         this.clusterAddresses = new LinkedHashMap<>(clusterAddresses);
         this.tlsConfig = tlsConfig;
+        this.bearerToken = bearerToken;
     }
 
     /** Submits a command with the default timeout per attempted node. */
@@ -200,6 +223,7 @@ public final class RaftClient implements AutoCloseable {
                 lastError = new RaftClientException(
                         nodeId + " rejected the command (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null; // an unreachable node is not a useful guess anymore
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -251,6 +275,7 @@ public final class RaftClient implements AutoCloseable {
                 lastError = new RaftClientException(
                         nodeId + " rejected the query (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -387,6 +412,7 @@ public final class RaftClient implements AutoCloseable {
                 }
                 lastError = rejection;
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -423,7 +449,24 @@ public final class RaftClient implements AutoCloseable {
 
     private RaftClientServiceGrpc.RaftClientServiceBlockingStub stubFor(String nodeId) {
         ManagedChannel channel = channels.computeIfAbsent(nodeId, this::openChannel);
-        return RaftClientServiceGrpc.newBlockingStub(channel);
+        RaftClientServiceGrpc.RaftClientServiceBlockingStub stub = RaftClientServiceGrpc.newBlockingStub(channel);
+        return bearerToken == null ? stub : stub.withInterceptors(new BearerTokenInterceptor(bearerToken));
+    }
+
+    /**
+     * A refusal for lack of a token or a role ends the walk at once. Every node applies
+     * the same rule to the same token, so asking the others cannot succeed -- and letting
+     * the loop run on would report "could not reach node3", which sends the reader after
+     * a network fault that is not there.
+     */
+    private static void throwIfNotAuthorised(String nodeId, StatusRuntimeException e) throws RaftClientException {
+        Status.Code code = e.getStatus().getCode();
+        if (code == Status.Code.UNAUTHENTICATED || code == Status.Code.PERMISSION_DENIED) {
+            String detail = e.getStatus().getDescription();
+            throw new RaftClientException(nodeId + " refused the request: "
+                    + (code == Status.Code.UNAUTHENTICATED ? "not authenticated" : "not authorised")
+                    + (detail == null ? "" : " (" + detail + ")"), e);
+        }
     }
 
     /** Same shape as {@code GrpcTransportFactory.connect}, so both ends read alike. */

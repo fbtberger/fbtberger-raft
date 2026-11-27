@@ -117,6 +117,11 @@ dependencies {
         exclude(group = "javax.servlet")
     }
 
+    // Keycloak access tokens on the client channel: JWT signature and claim checks.
+    // Named explicitly although hadoop-common already brings it in, so that removing
+    // the Hadoop transport one day cannot silently remove authorisation.
+    implementation("com.nimbusds:nimbus-jose-jwt:9.37.3")
+
     // Logging
     implementation("org.slf4j:slf4j-api:2.0.12")
     runtimeOnly("ch.qos.logback:logback-classic:1.5.6")

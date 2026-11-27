@@ -4,6 +4,7 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.auth.ClientAuthConfig;
 import com.fbtberger.raft.transport.RpcTimeouts;
 import com.fbtberger.raft.transport.TlsConfig;
 
@@ -55,10 +56,12 @@ public final class RaftConfig {
     private final boolean learner;
     private final RpcTimeouts rpcTimeouts;
     private final TlsConfig tlsConfig;
+    private final ClientAuthConfig clientAuthConfig;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
                        int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
-                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ClientAuthConfig clientAuthConfig) {
+        this.clientAuthConfig = clientAuthConfig;
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
@@ -105,7 +108,8 @@ public final class RaftConfig {
         }
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
         TlsConfig tlsConfig = TlsConfig.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
+        ClientAuthConfig clientAuthConfig = ClientAuthConfig.fromProperties(props);
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, clientAuthConfig);
     }
 
     /**
@@ -139,7 +143,14 @@ public final class RaftConfig {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
         return new RaftConfig(selfId, selfPort, dataDir, copy,
-                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                ClientAuthConfig.disabled());
+    }
+
+    /** This configuration with client-channel authorisation set as given; everything else unchanged. */
+    public RaftConfig withClientAuth(ClientAuthConfig auth) {
+        return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, auth);
     }
 
     private static String require(Properties props, String key) {
@@ -194,5 +205,8 @@ public final class RaftConfig {
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 
     public TlsConfig tlsConfig() { return tlsConfig; }
+
+    /** Who may use the client channel ({@code auth.*} properties); disabled unless configured. */
+    public ClientAuthConfig clientAuthConfig() { return clientAuthConfig; }
 
 }

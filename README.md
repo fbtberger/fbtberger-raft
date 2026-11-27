@@ -65,6 +65,10 @@ For a quick API reference, see the
 - **Exactly-once commands** (§8): client sessions. A command tagged with a client
   id and a sequence number is applied once however often it is retried, across
   leader changes, restarts and log compaction; `RaftClient` tags every `submit()`
+- **Client channel authorisation with Keycloak**: with `auth.keycloak.enabled=true`
+  every client RPC needs a Keycloak access token, verified offline against the
+  realm's keys, and one role per RPC (`raft-read` for Query, `raft-write` for
+  Submit, `raft-admin` for membership changes and leadership transfer)
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
 - **Docker** deployment configuration
 - **JaCoCo** test coverage reporting
@@ -110,6 +114,13 @@ fbtberger-raft/
     │       ├── HealthCheck.java            # liveness + readiness checks
     │       ├── RaftNodeConfiguration.java  # Spring IoC wiring
     │       ├── RaftServer.java             # main() + interactive CLI
+    │       ├── auth/                       # Keycloak authorisation of the client channel
+    │       │   ├── ClientAuthConfig.java         # auth.* properties
+    │       │   ├── ClientAuthInterceptor.java    # token + role check per client RPC
+    │       │   ├── TokenVerifier.java            # verifier interface (injectable)
+    │       │   ├── KeycloakTokenVerifier.java    # offline JWT verification (JWKS)
+    │       │   ├── KeycloakTokenSupplier.java    # client credentials grant, cached
+    │       │   └── BearerTokenInterceptor.java   # client side: attaches the token
     │       ├── transport/
     │       │   ├── RaftTransport.java           # outbound peer interface
     │       │   ├── RaftTransportFactory.java     # connection factory interface
@@ -178,6 +189,15 @@ rpc.timeout.request.vote.ms=1000
 rpc.timeout.append.entries.ms=2000
 rpc.timeout.install.snapshot.ms=30000
 rpc.timeout.pre.vote.ms=1000
+
+# Client channel authorisation (optional, off by default)
+auth.keycloak.enabled=false
+auth.keycloak.issuer=https://keycloak.example/realms/raft
+auth.keycloak.audience=          # optional: required "aud" of the token
+auth.keycloak.client.id=         # optional: also accept this client's resource roles
+auth.role.read=raft-read
+auth.role.write=raft-write
+auth.role.admin=raft-admin
 
 # TLS (optional)
 tls.enabled=false
@@ -268,6 +288,12 @@ open build/reports/jacoco/test/html/index.html
 ```
 
 ## Known limits
+
+- **Token revocation**: tokens are verified offline, so one revoked in Keycloak
+  stays valid on the cluster until it expires. Keep access tokens short-lived.
+- **Local operator interfaces are not covered by Keycloak**: the interactive CLI
+  on the node's stdin and the JMX MBean act in-process and bypass the client
+  channel. Protect them with host access and JMX authentication.
 
 - **Client sessions and mixed versions**: a node older than client sessions stores
   a command's session tag but applies a duplicate anyway. Upgrade every node

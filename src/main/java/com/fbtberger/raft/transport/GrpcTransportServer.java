@@ -17,6 +17,7 @@ import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.ServerServiceDefinition;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.netty.shaded.io.netty.handler.ssl.ClientAuth;
@@ -25,6 +26,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import javax.net.ssl.SSLException;
 
 public final class GrpcTransportServer implements RaftTransportServer {
@@ -40,11 +42,27 @@ public final class GrpcTransportServer implements RaftTransportServer {
     }
 
     public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) throws SSLException {
+        this(port, handler, tlsConfig, List.of());
+    }
+
+    /**
+     * As above, serving {@code additionalServices} on the same port and under the same
+     * transport security as the peer service.
+     *
+     * <p>This is how the client service gets onto a TLS node. Before it existed the only
+     * way to add a service was the {@link #GrpcTransportServer(ServerBuilder, RaftRpcHandler)}
+     * constructor, which is plaintext by construction -- so the Spring wiring registered the
+     * client service on a plaintext node and, with {@code tls.enabled=true}, on no node at
+     * all.
+     */
+    public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig,
+                               List<ServerServiceDefinition> additionalServices) throws SSLException {
         this.tlsConfig = tlsConfig;
         if (!tlsConfig.enabled()) {
-            this.server = ServerBuilder.forPort(port)
-                    .addService(new RaftServiceAdapter(handler, false))
-                    .build();
+            ServerBuilder<?> builder = ServerBuilder.forPort(port)
+                    .addService(new RaftServiceAdapter(handler, false));
+            additionalServices.forEach(builder::addService);
+            this.server = builder.build();
         } else {
             var sslBuilder = GrpcSslContexts.forServer(tlsConfig.certFile(), tlsConfig.keyFile())
                     .trustManager(tlsConfig.caFile());
@@ -54,11 +72,12 @@ public final class GrpcTransportServer implements RaftTransportServer {
             // The sender-id binding rides on mTLS and only on mTLS: without a client certificate
             // there is no authenticated identity to compare against, and demanding one would
             // reject every peer on a one-way-TLS cluster.
-            this.server = NettyServerBuilder.forPort(port)
+            NettyServerBuilder builder = NettyServerBuilder.forPort(port)
                     .sslContext(sslBuilder.build())
                     .intercept(new PeerIdentityInterceptor())
-                    .addService(new RaftServiceAdapter(handler, tlsConfig.mtlsEnabled()))
-                    .build();
+                    .addService(new RaftServiceAdapter(handler, tlsConfig.mtlsEnabled()));
+            additionalServices.forEach(builder::addService);
+            this.server = builder.build();
         }
     }
 
