@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
@@ -56,6 +58,14 @@ public final class TimeoutTransport implements RaftTransport {
     public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
         return delegate.timeoutNow(request)
                 .orTimeout(timeouts.requestVoteMs(), TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(ReadIndexRequest request) {
+        // The answer costs the leader one heartbeat round, which is an AppendEntries
+        // exchange, so that RPC's budget is the honest one to hold it to.
+        return delegate.readIndex(request)
+                .orTimeout(timeouts.appendEntriesMs(), TimeUnit.MILLISECONDS);
     }
 
     @Override

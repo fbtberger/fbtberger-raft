@@ -175,6 +175,52 @@ node.leaseRead().thenRun(() -> {
 Lease reads assume bounded clock skew. Use `readIndex()` if clocks may diverge
 significantly. Single-node clusters complete immediately for both methods.
 
+# 5.1.1 Follower Reads (§6.4)
+
+![A linearizable read served by a follower](followerread.png){width=85%}
+
+ReadIndex and lease reads are answered by the leader, so read load lands on the
+one node that also orders every write. A follower or learner can answer instead
+without giving up linearizability:
+
+1. The node asks the leader for a read index (`ReadIndex` peer RPC, carried by
+   all three transports).
+2. The leader confirms its leadership with a heartbeat round, exactly as for a
+   read of its own, and answers with the index.
+3. The node waits until its own `lastApplied` has reached that index.
+4. It reads from its own state machine.
+
+The leader does the part only a leader can do; the follower does the read. Each
+follower read still costs the leader one confirmation round, so this is for
+read-heavy load and large reads, not for lower latency.
+
+**What cannot happen.** A follower that cannot reach the leader, or whose leader
+has been deposed, obtains no index and fails the read (`NotLeaderException`); it
+never answers from its own possibly stale state. A follower that does not catch
+up to the index within 2 s fails the read (`FollowerReadException`) and the
+client tries the next node.
+
+**The read index of a new leader.** A leader's read index is
+`max(commitIndex, index of its own no-op)`. A freshly elected leader holds every
+committed entry but does not yet know which are committed; without the floor a
+read could run before a write its predecessor had already acknowledged. This
+applies to leader reads as well and was corrected together with this feature.
+
+**API.**
+
+```java
+node.queryAnyRole(query);                                // any role, linearizable
+client.query(query, timeout, ReadMode.FOLLOWER);         // non-leaders first, in rotation
+```
+
+`QueryRequest.allow_follower` selects it on the wire. The leader answers a
+`ReadIndex` only to members and learners of its configuration; under mTLS the
+requester id is bound to the certificate like every other sender id.
+
+**Mixed versions.** A follower read needs a leader that knows the `ReadIndex`
+RPC. Against an older leader it fails and the client falls back to the leader,
+so reads stay correct and are merely not offloaded.
+
 # 5.2 Joint Consensus (§6)
 
 In addition to single-step changes (`addServer`/`removeServer`), the system
@@ -523,6 +569,8 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.snapshot.chunk.received` | Counter | Snapshot chunks received |
 | `raft.client.rejected` | Counter | Client submissions rejected (not leader) |
 | `raft.client.duplicate` | Counter | Committed commands not applied again (session had seen them) |
+| `raft.read.follower` | Counter | Linearizable reads answered by this node while not leader |
+| `raft.read.index.served` | Counter | ReadIndex requests from followers this leader took on |
 | `raft.client.auth.accepted` | Counter | Client RPCs admitted by token and role |
 | `raft.client.auth.rejected` | Counter | Client RPCs refused; tag `reason` = `unauthenticated` or `forbidden` |
 | `raft.rpc.append.entries` | Timer | AppendEntries RPC handling time |

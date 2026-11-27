@@ -28,6 +28,8 @@ final class NettyProtocol {
     static final byte PRE_VOTE_RESP          = 8;
     static final byte TIMEOUT_NOW_REQ        = 9;
     static final byte TIMEOUT_NOW_RESP       = 10;
+    static final byte READ_INDEX_REQ         = 11;
+    static final byte READ_INDEX_RESP        = 12;
 
     static final int HEADER_BYTES = 1 + 4; // type + reqId
 

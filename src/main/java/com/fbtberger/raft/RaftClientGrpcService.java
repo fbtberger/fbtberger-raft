@@ -65,8 +65,15 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         // to be able to serve both during the same run, or the two cannot be compared
         // without a restart in between -- and a restart is a different experiment.
         byte[] q = request.getQuery().toByteArray();
-        CompletableFuture<byte[]> answer =
-                request.getLease() ? raftNode.queryWithLease(q) : raftNode.query(q);
+        CompletableFuture<byte[]> answer;
+        if (request.getAllowFollower() && raftNode.role() != ServerRole.LEADER) {
+            // Not the leader and allowed to answer anyway: the leader supplies the read
+            // index, this node the read. On the leader the flag changes nothing, so the
+            // lease choice below still applies there.
+            answer = raftNode.queryAnyRole(q);
+        } else {
+            answer = request.getLease() ? raftNode.queryWithLease(q) : raftNode.query(q);
+        }
         answer.whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
             responseObserver.onCompleted();

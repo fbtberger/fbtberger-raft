@@ -183,7 +183,35 @@ message TimeoutNowRequest {
 message TimeoutNowResponse {
 }
 
+// ReadIndex RPC (dissertation §6.4, "followers can also help offload the
+// processing of read-only queries"). A follower or learner that wants to answer
+// a read itself asks the leader for the index the read must see. The leader
+// confirms its leadership with a heartbeat round exactly as it does for its own
+// reads and answers with that index; the requester waits until it has applied
+// that far and then reads from its own state machine.
+//
+// The leader does the part only a leader can do and the follower does the part
+// that costs: the read itself.
+message ReadIndexRequest {
+  // Who is asking. Bound to the certificate under mTLS like every sender id, and
+  // refused unless it is a member or learner of the leader's configuration.
+  string requester_id = 1;
+}
+
+message ReadIndexResponse {
+  // False if this server is not the leader, lost the leadership while
+  // confirming it, or does not know the requester.
+  bool success = 1;
+  // Set iff success: every command committed before the request arrived is at or
+  // below this index.
+  int64 read_index = 2;
+  int64 term = 3;
+  // Set iff not success and this server knows who the leader is.
+  string leader_hint = 4;
+}
+
 service RaftService {
+  rpc ReadIndex (ReadIndexRequest) returns (ReadIndexResponse);
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);

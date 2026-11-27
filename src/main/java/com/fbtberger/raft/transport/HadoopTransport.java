@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
@@ -57,6 +59,12 @@ public final class HadoopTransport implements RaftTransport {
     public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
         return call(() -> TimeoutNowResponse.parseFrom(
                 unwrap(proxy.timeoutNow(wrap(request)))));
+    }
+
+    @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(ReadIndexRequest request) {
+        return call(() -> ReadIndexResponse.parseFrom(
+                unwrap(proxy.readIndex(wrap(request)))));
     }
 
     @Override

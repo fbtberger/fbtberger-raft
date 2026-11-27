@@ -17,4 +17,5 @@ public interface HadoopRaftProtocol extends VersionedProtocol {
     BytesWritable installSnapshot(BytesWritable request) throws IOException;
     BytesWritable preVote(BytesWritable request) throws IOException;
     BytesWritable timeoutNow(BytesWritable request) throws IOException;
+    BytesWritable readIndex(BytesWritable request) throws IOException;
 }

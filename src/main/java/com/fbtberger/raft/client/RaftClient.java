@@ -97,6 +97,7 @@ public final class RaftClient implements AutoCloseable {
      */
     private final String clientId = UUID.randomUUID().toString();
     private final AtomicLong nextSequence = new AtomicLong(1);
+    private final AtomicLong followerReadRotation = new AtomicLong();
     /**
      * Sequences submitted and not yet answered or given up. Everything below the lowest is
      * acknowledged -- the lowest, not the newest, so that sharing an instance between threads
@@ -258,20 +259,30 @@ public final class RaftClient implements AutoCloseable {
         QueryRequest request = QueryRequest.newBuilder()
                 .setQuery(ByteString.copyFrom(query))
                 .setLease(mode == ReadMode.LEASE)
+                .setAllowFollower(mode == ReadMode.FOLLOWER)
                 .build();
         RaftClientException lastError = null;
+        boolean followerRead = mode == ReadMode.FOLLOWER;
 
-        for (String nodeId : candidateOrder()) {
+        for (String nodeId : followerRead ? followerFirstOrder() : candidateOrder()) {
             try {
                 QueryResponse response = stubFor(nodeId)
                         .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
                         .query(request);
 
                 if (response.getSuccess()) {
-                    knownLeaderId = nodeId;
+                    // Whoever answered a follower read need not be the leader, and must
+                    // not be remembered as one: the next submit would start its walk there.
+                    if (!followerRead) {
+                        knownLeaderId = nodeId;
+                    }
                     return response.getResult().toByteArray();
                 }
-                knownLeaderId = response.getLeaderHint().isEmpty() ? null : response.getLeaderHint();
+                if (!response.getLeaderHint().isEmpty()) {
+                    knownLeaderId = response.getLeaderHint();
+                } else if (!followerRead) {
+                    knownLeaderId = null;
+                }
                 lastError = new RaftClientException(
                         nodeId + " rejected the query (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
@@ -445,6 +456,28 @@ public final class RaftClient implements AutoCloseable {
             }
         }
         return order;
+    }
+
+    /**
+     * For a follower read: every node that is not the known leader, starting one further
+     * along on each call so the reads spread, and the leader last as the fallback that
+     * can always answer.
+     */
+    private List<String> followerFirstOrder() {
+        String leader = knownLeaderId;
+        List<String> others = new ArrayList<>(clusterAddresses.size());
+        for (String nodeId : clusterAddresses.keySet()) {
+            if (!nodeId.equals(leader)) {
+                others.add(nodeId);
+            }
+        }
+        if (!others.isEmpty()) {
+            java.util.Collections.rotate(others, -(int) (followerReadRotation.getAndIncrement() % others.size()));
+        }
+        if (leader != null && clusterAddresses.containsKey(leader)) {
+            others.add(leader);
+        }
+        return others;
     }
 
     private RaftClientServiceGrpc.RaftClientServiceBlockingStub stubFor(String nodeId) {

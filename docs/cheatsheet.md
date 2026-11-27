@@ -158,6 +158,14 @@ String v = stateMachine.get("key");
 
 `leaseRead()` serves instantly if majority acked within election timeout; falls back to `readIndex()` otherwise. Assumes bounded clock skew.
 
+**Follower reads** (linearizable, served off the leader):
+
+```java
+client.query(q, timeout,
+    ReadMode.FOLLOWER);
+node.queryAnyRole(q);   // in-process
+```
+
 ## Cluster Reconfiguration
 
 **Single-step** (one server at a time):

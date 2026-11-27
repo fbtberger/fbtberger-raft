@@ -8,6 +8,8 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteRequest;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.BytesWritable;
@@ -15,6 +17,9 @@ import org.apache.hadoop.ipc.ProtocolSignature;
 import org.apache.hadoop.ipc.RPC;
 
 import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public final class HadoopTransportServer implements RaftTransportServer {
 
@@ -45,6 +50,9 @@ public final class HadoopTransportServer implements RaftTransportServer {
     }
 
     private static final class ProtocolImpl implements HadoopRaftProtocol {
+
+        /** Longest a handler thread waits for the leader to confirm itself: a few heartbeat rounds. */
+        private static final long READ_INDEX_WAIT_MS = 2_000;
         private final RaftRpcHandler handler;
 
         ProtocolImpl(RaftRpcHandler handler) { this.handler = handler; }
@@ -77,6 +85,26 @@ public final class HadoopTransportServer implements RaftTransportServer {
         public BytesWritable timeoutNow(BytesWritable request) throws IOException {
             return new BytesWritable(handler.handleTimeoutNow(
                     TimeoutNowRequest.parseFrom(unwrap(request))).toByteArray());
+        }
+
+        /**
+         * Hadoop RPC answers on the calling handler thread, so this one waits -- bounded,
+         * and answering "no" when the bound passes, which the follower treats like any
+         * other refusal and its client like any other reason to try the next node.
+         */
+        @Override
+        public BytesWritable readIndex(BytesWritable request) throws IOException {
+            ReadIndexRequest parsed = ReadIndexRequest.parseFrom(unwrap(request));
+            ReadIndexResponse response;
+            try {
+                response = handler.handleReadIndex(parsed).get(READ_INDEX_WAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                response = ReadIndexResponse.getDefaultInstance();
+            } catch (ExecutionException | TimeoutException e) {
+                response = ReadIndexResponse.getDefaultInstance();
+            }
+            return new BytesWritable(response.toByteArray());
         }
 
         @Override

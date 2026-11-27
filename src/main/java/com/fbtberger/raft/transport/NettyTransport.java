@@ -12,6 +12,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -122,6 +124,11 @@ public final class NettyTransport implements RaftTransport {
     }
 
     @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(ReadIndexRequest request) {
+        return send(NettyProtocol.READ_INDEX_REQ, request);
+    }
+
+    @Override
     public void close() {
         failAll(new IOException("transport to peer " + peer + " closed"));
         channel.close();
@@ -216,6 +223,7 @@ public final class NettyTransport implements RaftTransport {
                 case NettyProtocol.INSTALL_SNAPSHOT_RESP -> InstallSnapshotResponse.parseFrom(payload);
                 case NettyProtocol.PRE_VOTE_RESP -> PreVoteResponse.parseFrom(payload);
                 case NettyProtocol.TIMEOUT_NOW_RESP -> TimeoutNowResponse.parseFrom(payload);
+                case NettyProtocol.READ_INDEX_RESP -> ReadIndexResponse.parseFrom(payload);
                 default -> throw new IllegalStateException("unknown response type: " + type);
             };
         }

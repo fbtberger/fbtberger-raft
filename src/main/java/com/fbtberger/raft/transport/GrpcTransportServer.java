@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RaftServiceGrpc;
@@ -218,6 +220,26 @@ public final class GrpcTransportServer implements RaftTransportServer {
          * hand over the lead is the receiver's question, answered in
          * {@code RaftNode.handleTimeoutNow}.
          */
+        /**
+         * Bound to the certificate like the rest: the requester id decides whether the
+         * leader answers at all, and an answer costs it a heartbeat round.
+         */
+        @Override
+        public void readIndex(ReadIndexRequest request, StreamObserver<ReadIndexResponse> observer) {
+            if (!senderIsWhoItClaims("ReadIndex", request.getRequesterId(), observer)) return;
+            try {
+                handler.handleReadIndex(request).whenComplete((response, failure) -> {
+                    if (failure != null) {
+                        fail("ReadIndex", failure instanceof RuntimeException r ? r : new RuntimeException(failure),
+                                observer, "requester " + request.getRequesterId());
+                    } else {
+                        observer.onNext(response);
+                        observer.onCompleted();
+                    }
+                });
+            } catch (RuntimeException e) { fail("ReadIndex", e, observer, ""); }
+        }
+
         @Override
         public void timeoutNow(TimeoutNowRequest request, StreamObserver<TimeoutNowResponse> observer) {
             if (!senderIsWhoItClaims("TimeoutNow", request.getLeaderId(), observer)) return;

@@ -36,6 +36,8 @@ public final class RaftMetrics {
         private final Counter stepDowns;
         private final Counter clientRejected;
         private final Counter clientDuplicates;
+        private final Counter followerReads;
+        private final Counter readIndexServed;
         private final Counter clientAuthAccepted;
         private final Counter clientAuthUnauthenticated;
         private final Counter clientAuthForbidden;
@@ -74,6 +76,10 @@ public final class RaftMetrics {
                                 .tags(tags).description("Client submissions rejected (not leader)").register(registry);
                 this.clientDuplicates = Counter.builder("raft.client.duplicate")
                                 .tags(tags).description("Committed commands not applied again because their client session had seen them").register(registry);
+                this.followerReads = Counter.builder("raft.read.follower")
+                                .tags(tags).description("Linearizable reads answered by this node while not leader").register(registry);
+                this.readIndexServed = Counter.builder("raft.read.index.served")
+                                .tags(tags).description("ReadIndex requests from followers this leader took on").register(registry);
                 this.clientAuthAccepted = Counter.builder("raft.client.auth.accepted")
                                 .tags(tags).description("Client RPCs admitted by token and role").register(registry);
                 this.clientAuthUnauthenticated = Counter.builder("raft.client.auth.rejected")
@@ -264,6 +270,14 @@ public final class RaftMetrics {
         /** @param reason {@code "forbidden"} for a missing role, anything else counts as unauthenticated */
         public void clientAuthRejected(String reason) {
                 ("forbidden".equals(reason) ? clientAuthForbidden : clientAuthUnauthenticated).increment();
+        }
+
+        public void followerReadServed() {
+                followerReads.increment();
+        }
+
+        public void readIndexServed() {
+                readIndexServed.increment();
         }
 
         public void clientDuplicate() {

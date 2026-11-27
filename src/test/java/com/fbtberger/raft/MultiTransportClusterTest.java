@@ -98,6 +98,34 @@ class MultiTransportClusterTest {
         Await.until("the follower has refused the command", 5_000, f::isCompletedExceptionally);
     }
 
+    /**
+     * §6.4 follower reads, over each wire. The loop is the assertion: a follower learns the
+     * new commit index one heartbeat after the leader does, so a follower that simply read
+     * its own state would trail the write it is asked about. Every read here follows a
+     * write the leader has already acknowledged and must see it.
+     */
+    @ParameterizedTest
+    @EnumSource(Transport.class)
+    void aFollowerAnswersALinearizableRead(Transport transport) throws Exception {
+        startCluster(transport, 3);
+        awaitReplicatingCluster(5_000);
+        RaftNode leader = leader();
+        RaftNode follower = nodes.values().stream()
+                .filter(n -> n != leader).findFirst().orElseThrow();
+        Await.until("the follower to know its leader", 5_000, () -> follower.currentLeaderId() != null);
+
+        for (int i = 1; i <= 20; i++) {
+            leader.submitCommand(("SET k " + i).getBytes(StandardCharsets.UTF_8)).get(5, TimeUnit.SECONDS);
+
+            byte[] answer = follower.queryAnyRole("GET k".getBytes(StandardCharsets.UTF_8))
+                    .get(5, TimeUnit.SECONDS);
+
+            assertEquals(String.valueOf(i), new String(answer, StandardCharsets.UTF_8),
+                    "the follower answered from before a write that had already been acknowledged");
+        }
+        assertEquals(ServerRole.FOLLOWER, follower.role());
+    }
+
     // ---- setup helpers --------------------------------------------------
 
     private void startCluster(Transport transport, int size) throws Exception {
@@ -208,6 +236,10 @@ class MultiTransportClusterTest {
         }
         @Override public TimeoutNowResponse handleTimeoutNow(TimeoutNowRequest r) {
             return delegate.handleTimeoutNow(r);
+        }
+        @Override public java.util.concurrent.CompletableFuture<com.fbtberger.raft.proto.ReadIndexResponse>
+                handleReadIndex(com.fbtberger.raft.proto.ReadIndexRequest r) {
+            return delegate.handleReadIndex(r);
         }
     }
 

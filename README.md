@@ -62,6 +62,9 @@ For a quick API reference, see the
     heartbeat round before allowing reads
   - Lease-based: `leaseRead()` serves reads immediately when the leader's lease
     is valid (majority acked within election timeout); falls back to ReadIndex
+  - Follower reads: `queryAnyRole()` / `ReadMode.FOLLOWER` let a follower or
+    learner answer a linearizable read; the leader only supplies the read index
+    (`ReadIndex` peer RPC), the follower waits until it has applied that far
 - **Exactly-once commands** (§8): client sessions. A command tagged with a client
   id and a sequence number is applied once however often it is retried, across
   leader changes, restarts and log compaction; `RaftClient` tags every `submit()`
@@ -92,7 +95,7 @@ fbtberger-raft/
     ├── main/
     │   ├── proto/
     │   │   ├── raft.proto              # RequestVote, AppendEntries, InstallSnapshot,
-    │   │   │                           # PreVote, TimeoutNow
+    │   │   │                           # PreVote, TimeoutNow, ReadIndex
     │   │   └── client.proto            # Submit, AddServer, RemoveServer
     │   ├── resources/
     │   │   └── logback-raftserver.xml  # logging for the standalone server only

@@ -90,7 +90,27 @@ class HadoopTransportTest {
         assertNotNull(resp);
     }
 
+    @Test
+    void readIndexRoundTrip() throws Exception {
+        com.fbtberger.raft.proto.ReadIndexResponse resp = client.readIndex(
+                com.fbtberger.raft.proto.ReadIndexRequest.newBuilder().setRequesterId("n2").build())
+                .get(5, TimeUnit.SECONDS);
+        assertTrue(resp.getSuccess());
+        assertEquals(42, resp.getReadIndex());
+    }
+
     private static final class StubHandler implements RaftRpcHandler {
+        @Override
+        public java.util.concurrent.CompletableFuture<com.fbtberger.raft.proto.ReadIndexResponse> handleReadIndex(
+                com.fbtberger.raft.proto.ReadIndexRequest req) {
+            // Completed later and on another thread, as the real one is: the leader answers
+            // after a heartbeat round, not on the thread that received the request.
+            return java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                    com.fbtberger.raft.proto.ReadIndexResponse.newBuilder()
+                            .setSuccess("n2".equals(req.getRequesterId())).setReadIndex(42).build(),
+                    java.util.concurrent.CompletableFuture.delayedExecutor(20, TimeUnit.MILLISECONDS));
+        }
+
         @Override
         public RequestVoteResponse handleRequestVote(RequestVoteRequest req) {
             return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build();

@@ -113,6 +113,17 @@ message QueryRequest {
   // successfully. Nothing in the response says which path ran, so a lease
   // measurement against a stale node silently measures ReadIndex.
   bool lease = 2;
+
+  // Let whichever node receives this answer it, follower or learner included. The
+  // read is still linearizable: a non-leader asks the leader for a read index
+  // (ReadIndex RPC), waits until it has applied that far, and reads locally. What
+  // moves off the leader is the read itself, which is the expensive part.
+  //
+  // Unset keeps reads leader-only. A server older than this field ignores it, so
+  // a follower answers "not leader" and the client's walk ends at the leader: the
+  // read is correct and merely not offloaded. `lease` is ignored when this is set
+  // and the receiving node is not the leader.
+  bool allow_follower = 3;
 }
 
 message QueryResponse {

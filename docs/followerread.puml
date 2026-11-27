@@ -1,0 +1,28 @@
+@startuml
+title Follower Read (§6.4): the leader names the index, the follower reads
+skinparam defaultFontSize 10
+
+participant "RaftClient\n(ReadMode.FOLLOWER)" as C
+participant "Follower F" as F
+participant "Leader L" as L
+participant "Other voter" as V
+
+C -> F: Query(q, allow_follower=true)
+F -> L: ReadIndex(requester_id=F)
+note over L: readIndex = max(commitIndex,\n  own no-op index)
+L -> V: AppendEntries (heartbeat)
+L -> F: AppendEntries (heartbeat)
+V --> L: success
+note over L: majority confirmed:\nstill the leader
+L --> F: ReadIndexResponse(\n  success, read_index=R)
+note over F: wait until lastApplied >= R\n(gives up after 2 s)
+F -> F: stateMachine.read(q)
+F --> C: QueryResponse(result)
+
+== Follower cannot prove it is current ==
+C -> F: Query(q, allow_follower=true)
+F -x L: ReadIndex (partitioned)
+F --> C: failure (no stale answer)
+C -> L: Query(q, allow_follower=true)\n(next node, leader last)
+L --> C: QueryResponse(result)
+@enduml

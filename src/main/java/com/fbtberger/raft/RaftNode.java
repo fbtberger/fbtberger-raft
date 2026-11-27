@@ -14,6 +14,8 @@ import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.transport.RaftTransport;
@@ -1787,7 +1789,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 f.completeExceptionally(new NotLeaderException(currentLeaderId));
                 return f;
             }
-            long ri = commitIndex.get();
+            long ri = readIndexLocked();
             if (majority() == 1) {
                 return lastApplied.get() >= ri
                         ? CompletableFuture.completedFuture(ri)
@@ -1867,7 +1869,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return f;
             }
             if (majority() == 1 || hasValidLease()) {
-                long ri = commitIndex.get();
+                long ri = readIndexLocked();
                 return lastApplied.get() >= ri
                         ? CompletableFuture.completedFuture(null)
                         : awaitApplied(ri);
@@ -1875,6 +1877,165 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return readIndex().thenApply(ignored -> null);
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * The index a read arriving now must see. Caller must hold {@code lock} and be leader.
+     *
+     * <p>Not simply {@code commitIndex}. A leader that has just been elected holds every
+     * committed entry (Leader Completeness) but does not yet know which of them are
+     * committed: its commit index is whatever it had heard as a follower, and can lie
+     * behind a write its predecessor already acknowledged to a client. §6.4 step 1
+     * therefore requires an entry of the leader's own term to commit first. Taking the
+     * no-op's index as the floor does that without a special case: the read cannot be
+     * served until the no-op, and so everything before it, has been applied.
+     */
+    private long readIndexLocked() {
+        return Math.max(commitIndex.get(), leaderNoOpIndex);
+    }
+
+    // ------------------------------------------------------------------
+    // Follower reads (§6.4): the leader names the index, the follower reads
+    // ------------------------------------------------------------------
+
+    /** How long a follower waits to apply up to the read index before it gives the read up. */
+    private static final long FOLLOWER_READ_APPLY_TIMEOUT_MS = 2_000;
+
+    /**
+     * Leader side of a follower read: confirms leadership exactly as for a read of its
+     * own and hands the requester the index. The requester must be a member or learner
+     * of the current configuration; a heartbeat round is not owed to anyone else.
+     */
+    @Override
+    public CompletableFuture<ReadIndexResponse> handleReadIndex(ReadIndexRequest request) {
+        String requester = request.getRequesterId();
+        long term;
+        lock.lock();
+        try {
+            term = store.getCurrentTerm();
+            if (role != ServerRole.LEADER) {
+                ReadIndexResponse.Builder refusal = ReadIndexResponse.newBuilder().setTerm(term);
+                if (currentLeaderId != null) refusal.setLeaderHint(currentLeaderId);
+                return CompletableFuture.completedFuture(refusal.build());
+            }
+            if (!votingMembers().contains(requester) && !currentLearners.containsKey(requester)) {
+                logWarn("refusing ReadIndex from " + requester + ": not a member or learner");
+                return CompletableFuture.completedFuture(ReadIndexResponse.newBuilder().setTerm(term).build());
+            }
+        } finally {
+            lock.unlock();
+        }
+        metrics.readIndexServed();
+        return readIndex().handle((index, failure) -> {
+            ReadIndexResponse.Builder response = ReadIndexResponse.newBuilder().setTerm(term);
+            if (failure == null) {
+                return response.setSuccess(true).setReadIndex(index).build();
+            }
+            // Lost the leadership while confirming it: that is the case the round exists
+            // to catch, and the answer is "not me", with whoever it is now if known.
+            String hint = currentLeaderId;
+            if (hint != null && !hint.equals(config.selfId())) response.setLeaderHint(hint);
+            return response.build();
+        });
+    }
+
+    /**
+     * A read index this server may read at, whatever its role (§6.4).
+     *
+     * <p>On the leader this is {@link #readIndex()}. On a follower or learner it asks the
+     * leader for the index with the ReadIndex RPC and completes once this server has
+     * applied that far -- so a state machine read after it sees every command committed
+     * before the call was made, which is linearizability, on a server that is not the
+     * leader.
+     *
+     * <p>Fails with {@link NotLeaderException} if no leader is known or the server asked
+     * turned out not to be it, and with {@link FollowerReadException} if this server does
+     * not catch up to the index in time. A partitioned follower therefore fails the read;
+     * it cannot serve a stale one, because it cannot obtain an index.
+     */
+    public CompletableFuture<Long> readIndexAnyRole() {
+        String leaderId;
+        RaftTransport toLeader;
+        lock.lock();
+        try {
+            if (role == ServerRole.LEADER) {
+                return readIndex();
+            }
+            leaderId = currentLeaderId;
+            toLeader = leaderId == null ? null : peerTransports.get(leaderId);
+        } finally {
+            lock.unlock();
+        }
+        if (toLeader == null) {
+            return CompletableFuture.failedFuture(new NotLeaderException(leaderId));
+        }
+        // Sent without the lock: the answer arrives on a transport thread, and the leader
+        // will be sending this server a heartbeat in the meantime that needs the lock.
+        return toLeader.readIndex(ReadIndexRequest.newBuilder().setRequesterId(config.selfId()).build())
+                .thenCompose(response -> {
+                    if (!response.getSuccess()) {
+                        String hint = response.getLeaderHint().isEmpty() ? null : response.getLeaderHint();
+                        return CompletableFuture.<Long>failedFuture(new NotLeaderException(hint));
+                    }
+                    long index = response.getReadIndex();
+                    long deadline = System.nanoTime()
+                            + TimeUnit.MILLISECONDS.toNanos(FOLLOWER_READ_APPLY_TIMEOUT_MS);
+                    return awaitAppliedBy(index, deadline).thenApply(ignored -> index);
+                });
+    }
+
+    /**
+     * A linearizable read answered by this server whatever its role: the leader names the
+     * index ({@link #readIndexAnyRole()}), this server's own state machine answers.
+     */
+    public CompletableFuture<byte[]> queryAnyRole(byte[] query) {
+        boolean follower = role != ServerRole.LEADER;
+        return readIndexAnyRole().thenApply(index -> {
+            if (follower) metrics.followerReadServed();
+            return stateMachine.read(query);
+        });
+    }
+
+    /** As {@link #awaitApplied}, but gives up at {@code deadlineNanos} instead of polling forever. */
+    private CompletableFuture<Void> awaitAppliedBy(long targetIndex, long deadlineNanos) {
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        pollApplied(targetIndex, deadlineNanos, done);
+        return done;
+    }
+
+    /**
+     * Whether the state machine holds the effect of every entry up to {@code targetIndex}.
+     *
+     * <p>Under the lock, and that is the whole point. {@code applyCommittedEntries} advances
+     * {@code lastApplied} first and calls the state machine second, so the counter alone is
+     * ahead of the state for the duration of one {@code apply}. A read that trusted the
+     * bare counter could be let through in that gap and answer from before the very entry
+     * it had waited for -- seen as a follower read returning the previous value once in a
+     * few hundred, over the slowest transport. Applying happens under the lock, so holding
+     * it here means no apply is half done.
+     */
+    private boolean hasApplied(long targetIndex) {
+        lock.lock();
+        try {
+            return lastApplied.get() >= targetIndex;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void pollApplied(long targetIndex, long deadlineNanos, CompletableFuture<Void> done) {
+        if (hasApplied(targetIndex)) {
+            done.complete(null);
+        } else if (System.nanoTime() >= deadlineNanos) {
+            done.completeExceptionally(new FollowerReadException("this server has applied "
+                    + lastApplied.get() + " and the read needs " + targetIndex + "; it is too far behind"));
+        } else {
+            try {
+                scheduler.schedule(() -> pollApplied(targetIndex, deadlineNanos, done), 2, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException shuttingDown) {
+                done.completeExceptionally(new FollowerReadException("this server is shutting down"));
+            }
         }
     }
 
@@ -1915,7 +2076,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private CompletableFuture<Void> awaitApplied(long targetIndex) {
         CompletableFuture<Void> f = new CompletableFuture<>();
         scheduler.schedule(() -> {
-            if (lastApplied.get() >= targetIndex) {
+            if (hasApplied(targetIndex)) {
                 f.complete(null);
             } else {
                 awaitApplied(targetIndex).whenComplete((v, t) -> {
@@ -2509,6 +2670,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         public StaleClientRequestException(String clientId, long sequence) {
             super("sequence " + sequence + " of client " + clientId
                     + " was already acknowledged; its result is no longer held");
+        }
+    }
+
+    /** A follower read this server could not serve in time; another node can. */
+    public static final class FollowerReadException extends RuntimeException {
+        public FollowerReadException(String message) {
+            super(message);
         }
     }
 
