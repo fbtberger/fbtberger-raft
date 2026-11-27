@@ -137,7 +137,30 @@ public final class RaftClient implements AutoCloseable {
      * @throws RaftClientException if no node in the cluster accepted the command
      */
     public byte[] submit(byte[] command, Duration perAttemptTimeout) throws RaftClientException {
-        SubmitRequest request = SubmitRequest.newBuilder().setCommand(ByteString.copyFrom(command)).build();
+        return submit("", command, perAttemptTimeout);
+    }
+
+    /**
+     * Submits a command to the state machine the servers registered under
+     * {@code stateMachine}, with the default timeout per attempted node. The empty
+     * name is the application state machine.
+     */
+    public byte[] submit(String stateMachine, byte[] command) throws RaftClientException {
+        return submit(stateMachine, command, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * Like {@link #submit(byte[], Duration)}, for a named state machine.
+     *
+     * <p>A server that predates named state machines ignores the name and hands the
+     * command to its application state machine: upgrade the servers first.
+     */
+    public byte[] submit(String stateMachine, byte[] command, Duration perAttemptTimeout)
+            throws RaftClientException {
+        SubmitRequest request = SubmitRequest.newBuilder()
+                .setStateMachine(stateMachine)
+                .setCommand(ByteString.copyFrom(command))
+                .build();
         RaftClientException lastError = null;
 
         for (String nodeId : candidateOrder()) {
@@ -181,6 +204,12 @@ public final class RaftClient implements AutoCloseable {
      */
     public byte[] query(byte[] query, Duration perAttemptTimeout, ReadMode mode)
             throws RaftClientException {
+        return query("", query, perAttemptTimeout, mode);
+    }
+
+    /** Like {@link #query(byte[], Duration, ReadMode)}, answered by a named state machine. */
+    public byte[] query(String stateMachine, byte[] query, Duration perAttemptTimeout, ReadMode mode)
+            throws RaftClientException {
         // An old server ignores the lease field and answers a ReadIndex read successfully,
         // and the response carries no record of which path ran. A lease measurement against
         // a cluster that predates the field therefore measures ReadIndex and says so
@@ -188,6 +217,7 @@ public final class RaftClient implements AutoCloseable {
         QueryRequest request = QueryRequest.newBuilder()
                 .setQuery(ByteString.copyFrom(query))
                 .setLease(mode == ReadMode.LEASE)
+                .setStateMachine(stateMachine)
                 .build();
         RaftClientException lastError = null;
 

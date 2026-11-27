@@ -63,6 +63,13 @@ service RaftClientService {
 
 message SubmitRequest {
   bytes command = 1;
+
+  // The state machine this command is for. Unset means the application state
+  // machine, which is what every caller that predates this field gets.
+  //
+  // A server that predates the field ignores it and hands the command to its
+  // application state machine. Upgrade the servers before a client uses it.
+  string state_machine = 5;
 }
 
 message SubmitResponse {
@@ -93,6 +100,9 @@ message QueryRequest {
   // successfully. Nothing in the response says which path ran, so a lease
   // measurement against a stale node silently measures ReadIndex.
   bool lease = 2;
+
+  // The state machine that answers. Unset means the application state machine.
+  string state_machine = 4;
 }
 
 message QueryResponse {

@@ -67,6 +67,35 @@ class RaftNodeConfigurationTest {
     }
 
     /**
+     * A named state machine comes in as a StateMachineRegistration bean, not as a second
+     * StateMachine bean: the application's stays the only one, so nothing has to be marked
+     * primary and the default KeyValueStateMachine is still created.
+     */
+    @Test
+    @DisplayName("A StateMachineRegistration bean becomes a named state machine of the node")
+    void aRegistrationBeanIsRegisteredWithTheNode() throws Exception {
+        Path cfg = writeConfig("cfg-named", freePort());
+        System.setProperty("raft.config.path", cfg.toString());
+
+        try (var ctx = new AnnotationConfigApplicationContext(
+                RaftNodeConfiguration.class, NamedStateMachineConfiguration.class)) {
+            assertEquals(java.util.Set.of("fbt.test"), ctx.getBean(RaftNode.class).stateMachineNames());
+            assertNotNull(ctx.getBean(KeyValueStateMachine.class));
+            assertEquals(1, ctx.getBeansOfType(StateMachine.class).size());
+        } finally {
+            System.clearProperty("raft.config.path");
+        }
+    }
+
+    @org.springframework.context.annotation.Configuration
+    static class NamedStateMachineConfiguration {
+        @org.springframework.context.annotation.Bean
+        StateMachineRegistration testRegistration() {
+            return new StateMachineRegistration("fbt.test", new KeyValueStateMachine());
+        }
+    }
+
+    /**
      * The transport every peer call goes through is wrapped in a timeout. Without the wrapper a
      * peer that accepts a connection and then says nothing blocks a replication thread for good,
      * which is the failure that does not look like a failure.

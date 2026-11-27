@@ -19,21 +19,21 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@link StateMachine#prepare} is the leader's one chance to fix a
- * non-deterministic value into a command. These tests pin down the four things a
+ * {@link LeaderPreparation#prepare} is the leader's one chance to fix a
+ * non-deterministic value into a command. These tests pin down the things a
  * state machine relying on it has to be able to trust: it runs on the leader, its
  * result is what the log holds and what apply sees, a failure appends nothing,
- * and a server that is not the leader never runs it.
+ * a server that is not the leader never runs it, and a state machine that does
+ * not implement the interface is not involved at all.
  */
-class StateMachinePrepareTest {
+class LeaderPreparationTest {
 
     private RaftNode node;
 
@@ -119,10 +119,16 @@ class StateMachinePrepareTest {
     }
 
     @Test
-    void theDefaultLeavesTheCommandAlone() {
-        byte[] command = utf8("SET x 1");
-        assertSame(command, new KeyValueStateMachine().prepare(command));
-        assertArrayEquals(utf8("SET x 1"), command);
+    void aStateMachineWithoutLeaderPreparationGetsItsCommandUnchanged() throws Exception {
+        KeyValueStateMachine sm = new KeyValueStateMachine();
+        InMemoryStorage store = new InMemoryStorage();
+        startLeader(store, sm);
+
+        node.submitCommand(utf8("SET x 1")).get(2, TimeUnit.SECONDS);
+
+        assertFalse(LeaderPreparation.class.isInstance(sm));
+        assertEquals("SET x 1", store.getLogEntry(store.getLastLogIndex()).getCommand().toStringUtf8());
+        assertEquals("1", sm.get("x"));
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -163,7 +169,7 @@ class StateMachinePrepareTest {
     }
 
     /** Records what it was asked to prepare and to apply; echoes the applied command. */
-    private static final class RecordingStateMachine implements StateMachine {
+    private static final class RecordingStateMachine implements StateMachine, LeaderPreparation {
         final List<String> prepared = new CopyOnWriteArrayList<>();
         final List<String> applied = new CopyOnWriteArrayList<>();
         private final UnaryOperator<byte[]> onPrepare;

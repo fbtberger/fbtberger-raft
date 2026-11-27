@@ -10,6 +10,7 @@ import com.fbtberger.raft.proto.ClusterConfiguration;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.LogEntry;
+import com.fbtberger.raft.proto.NamedCommand;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
 import com.fbtberger.raft.proto.RequestVoteRequest;
@@ -85,7 +86,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     private final RaftConfig config;
     private final RaftStorage store;
-    private final StateMachine stateMachine;
+    private final StateMachineRegistry stateMachines;
     private final RaftTransportFactory transportFactory;
     private final RaftMetrics metrics;
     private final Map<String, RaftTransport> peerTransports = new ConcurrentHashMap<>(); // excludes self
@@ -249,9 +250,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                      StateMachine stateMachine,
                      RaftTransportFactory transportFactory,
                      RaftMetrics metrics) {
+        this(config, store, StateMachineRegistry.of(stateMachine), transportFactory, metrics);
+    }
+
+    /**
+     * A node that drives the application state machine and the named ones beside
+     * it (see {@link StateMachineRegistry}). Every server of a cluster must be
+     * given the same names.
+     */
+    public RaftNode(RaftConfig config,
+                     RaftStorage store,
+                     StateMachineRegistry stateMachines,
+                     RaftTransportFactory transportFactory,
+                     RaftMetrics metrics) {
         this.config = config;
         this.store = store;
-        this.stateMachine = stateMachine;
+        this.stateMachines = stateMachines;
         this.transportFactory = transportFactory;
         this.metrics = metrics;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
@@ -291,7 +305,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // for has since been compacted away.
         RaftStorage.Snapshot existingSnapshot = store.getSnapshot();
         if (existingSnapshot != null) {
-            stateMachine.restoreSnapshot(existingSnapshot.stateMachineData);
+            stateMachines.restoreSnapshot(existingSnapshot.stateMachineData);
             lastApplied.set(existingSnapshot.lastIncludedIndex);
             commitIndex.set(Math.max(commitIndex.get(), existingSnapshot.lastIncludedIndex));
         }
@@ -1083,7 +1097,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                         pendingSnapshotIndex, pendingSnapshotTerm, packed);
 
                 store.saveSnapshotAndCompact(snapshot);
-                stateMachine.restoreSnapshot(snapshot.stateMachineData);
+                stateMachines.restoreSnapshot(snapshot.stateMachineData);
 
                 if (snapshot.lastIncludedIndex > commitIndex.get()) {
                     commitIndex.set(snapshot.lastIncludedIndex);
@@ -1462,10 +1476,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     log("stepping down: committed configuration no longer includes us");
                     becomeFollowerLocked(store.getCurrentTerm());
                 }
+            } else if (entry.hasNamedCommand()) {
+                // For exactly one named state machine, and no other ever sees it. A name
+                // this server does not have fails here on purpose: skipping a committed
+                // entry would let this server's state diverge without a word.
+                NamedCommand namedCommand = entry.getNamedCommand();
+                result = stateMachines.require(namedCommand.getStateMachine())
+                        .apply(index, namedCommand.getCommand().toByteArray());
             } else {
                 // With the index: a state machine with durable storage cannot tell a
                 // first application from a replay without it (see StateMachine#apply).
-                result = stateMachine.apply(index, entry.getCommand().toByteArray());
+                result = stateMachines.application().apply(index, entry.getCommand().toByteArray());
             }
             metrics.entryApplied();
             CompletableFuture<byte[]> pending = pendingClientRequests.remove(index);
@@ -1562,7 +1583,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * fast {@code new HashMap<>(data)} here instead of serializing.
      */
     private java.util.function.Supplier<byte[]> captureCowSnapshot() {
-        return stateMachine.prepareCowSnapshot();
+        return stateMachines.prepareCowSnapshot();
     }
 
     /** Synchronous snapshot for {@link #snapshotNow()} — blocks until complete. */
@@ -1576,7 +1597,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // Raft lock throughout. A measurement that only covered the background path would
         // report the cheaper case.
         long startNanos = System.nanoTime();
-        byte[] stateMachineData = stateMachine.takeSnapshot();
+        byte[] stateMachineData = stateMachines.takeSnapshot();
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
         store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData, configurationData));
         metrics.snapshotTaken();
@@ -1649,6 +1670,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * leader is, mirroring how §8 describes clients being redirected.
      */
     public CompletableFuture<byte[]> submitCommand(byte[] command) {
+        return submitCommand(StateMachineRegistry.APPLICATION, command);
+    }
+
+    /**
+     * Like {@link #submitCommand(byte[])}, for the state machine registered under
+     * {@code stateMachine}; the empty name is the application state machine. The
+     * command is applied by that state machine alone, on every server.
+     *
+     * <p>Fails with {@link UnknownStateMachineException} and appends nothing if this
+     * server has no state machine of that name.
+     */
+    public CompletableFuture<byte[]> submitCommand(String stateMachine, byte[] command) {
         lock.lock();
         try {
             if (role != ServerRole.LEADER) {
@@ -1659,22 +1692,40 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
             }
-            // Leader only, and before the append: the one point at which a state
-            // machine may fix a non-deterministic value into the command (see
-            // StateMachine#prepare). What it returns is what every server applies.
-            byte[] prepared;
+            StateMachine target;
             try {
-                prepared = stateMachine.prepare(command);
-            } catch (RuntimeException e) {
+                target = stateMachines.require(stateMachine);
+            } catch (UnknownStateMachineException e) {
                 metrics.clientRejected();
                 return failedFuture(e);
             }
-            if (prepared == null) {
-                metrics.clientRejected();
-                return failedFuture(new IllegalStateException(
-                        stateMachine.getClass().getSimpleName() + ".prepare returned null"));
+            byte[] prepared = command;
+            // Leader only, and before the append: the one point at which a state
+            // machine that asks for it may fix a non-deterministic value into the
+            // command (see LeaderPreparation). What it returns is what every server
+            // applies.
+            if (target instanceof LeaderPreparation preparation) {
+                try {
+                    prepared = preparation.prepare(command);
+                } catch (RuntimeException e) {
+                    metrics.clientRejected();
+                    return failedFuture(e);
+                }
+                if (prepared == null) {
+                    metrics.clientRejected();
+                    return failedFuture(new IllegalStateException(
+                            target.getClass().getSimpleName() + ".prepare returned null"));
+                }
             }
-            return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(prepared)));
+            LogEntry.Builder entry = LogEntry.newBuilder();
+            if (target == stateMachines.application()) {
+                entry.setCommand(ByteString.copyFrom(prepared));
+            } else {
+                entry.setNamedCommand(NamedCommand.newBuilder()
+                        .setStateMachine(stateMachine)
+                        .setCommand(ByteString.copyFrom(prepared)));
+            }
+            return appendAndReplicateLocked(entry);
         } finally {
             lock.unlock();
         }
@@ -1733,7 +1784,21 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * leader for writes needs no second mechanism for reads.
      */
     public CompletableFuture<byte[]> query(byte[] query) {
-        return readIndex().thenApply(readIndex -> stateMachine.read(query));
+        return query(StateMachineRegistry.APPLICATION, query);
+    }
+
+    /**
+     * Like {@link #query(byte[])}, answered by the state machine registered under
+     * {@code stateMachine}; the empty name is the application state machine.
+     */
+    public CompletableFuture<byte[]> query(String stateMachine, byte[] query) {
+        StateMachine target;
+        try {
+            target = stateMachines.require(stateMachine);
+        } catch (UnknownStateMachineException e) {
+            return failedFuture(e);
+        }
+        return readIndex().thenApply(readIndex -> target.read(query));
     }
 
     /**
@@ -1758,7 +1823,23 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * clocks, not about cables.
      */
     public CompletableFuture<byte[]> queryWithLease(byte[] query) {
-        return leaseRead().thenApply(ignored -> stateMachine.read(query));
+        return queryWithLease(StateMachineRegistry.APPLICATION, query);
+    }
+
+    /** Like {@link #queryWithLease(byte[])}, answered by the named state machine. */
+    public CompletableFuture<byte[]> queryWithLease(String stateMachine, byte[] query) {
+        StateMachine target;
+        try {
+            target = stateMachines.require(stateMachine);
+        } catch (UnknownStateMachineException e) {
+            return failedFuture(e);
+        }
+        return leaseRead().thenApply(ignored -> target.read(query));
+    }
+
+    /** The names of the state machines registered beside the application's. */
+    public java.util.Set<String> stateMachineNames() {
+        return stateMachines.names();
     }
 
     /**
