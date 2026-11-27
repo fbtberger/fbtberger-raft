@@ -46,6 +46,11 @@ For a quick API reference, see the
     lightweight reference under the lock; serialization and disk I/O run on a
     background thread without blocking the Raft lock
   - Independent per-server compaction with configurable threshold
+- **Leader-side command preparation**: `StateMachine.prepare()` is called on the
+  leader only, before a client command is appended, and what it returns is what
+  every server applies. It is the one place a state machine may fix a
+  non-deterministic value (clock, randomness) into a command; `fbtberger-common`
+  builds its value issuer on it
 - **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
   implementations, with per-RPC configurable timeouts and TLS/mTLS support
 - **Prometheus metrics + JMX**: counters, timers, and gauges published to both
