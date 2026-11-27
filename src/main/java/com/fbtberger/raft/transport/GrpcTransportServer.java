@@ -30,14 +30,17 @@ import javax.net.ssl.SSLException;
 public final class GrpcTransportServer implements RaftTransportServer {
 
     private final Server server;
+    private final TlsConfig tlsConfig;
 
     public GrpcTransportServer(int port, RaftRpcHandler handler) {
+        this.tlsConfig = TlsConfig.disabled();
         this.server = ServerBuilder.forPort(port)
                 .addService(new RaftServiceAdapter(handler, false))
                 .build();
     }
 
     public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) throws SSLException {
+        this.tlsConfig = tlsConfig;
         if (!tlsConfig.enabled()) {
             this.server = ServerBuilder.forPort(port)
                     .addService(new RaftServiceAdapter(handler, false))
@@ -60,12 +63,14 @@ public final class GrpcTransportServer implements RaftTransportServer {
     }
 
     public GrpcTransportServer(ServerBuilder<?> builder, RaftRpcHandler handler) {
+        this.tlsConfig = TlsConfig.disabled();
         this.server = builder.addService(new RaftServiceAdapter(handler, false)).build();
     }
 
     @Override
     public void start() throws IOException {
         server.start();
+        tlsConfig.logStartup("gRPC", server.getPort(), tlsConfig.mtlsEnabled());
     }
 
     @Override

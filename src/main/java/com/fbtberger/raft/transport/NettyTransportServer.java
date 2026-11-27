@@ -32,6 +32,7 @@ public final class NettyTransportServer implements RaftTransportServer {
     private final int port;
     private final RaftRpcHandler handler;
     private final SslContext sslContext;
+    private final TlsConfig tlsConfig;
     private final NioEventLoopGroup bossGroup;
     private final NioEventLoopGroup workerGroup;
     private Channel serverChannel;
@@ -43,6 +44,7 @@ public final class NettyTransportServer implements RaftTransportServer {
     public NettyTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) {
         this.port = port;
         this.handler = handler;
+        this.tlsConfig = tlsConfig != null ? tlsConfig : TlsConfig.disabled();
         try {
             this.sslContext = tlsConfig != null && tlsConfig.enabled()
                     ? tlsConfig.buildServerSslContext() : null;
@@ -82,6 +84,8 @@ public final class NettyTransportServer implements RaftTransportServer {
                     .bind(port)
                     .sync()
                     .channel();
+            int bound = ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort();
+            tlsConfig.logStartup("Netty", bound, false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("bind interrupted", e);
