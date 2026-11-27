@@ -576,7 +576,39 @@ additional services.
 
 \newpage
 
-# 8.2 Overload Protection
+# 8.2 Certificate Reload Without Restart
+
+Every TLS context of a node (gRPC and Netty peer transport, client channel, metrics
+endpoint) is built from one `TlsMaterial`. It hands out a key manager and a trust
+manager that stay the same objects for the life of the node and whose content is
+replaced when the files change. A context is consulted at every handshake, so the
+next connection in or out uses the renewed certificate. Connections that are open
+keep their session; nothing is dropped and no node restarts.
+
+The three files (`tls.cert.path`, `tls.key.path`, `tls.ca.path`) are compared with
+what is in use every `tls.reload.interval.seconds` (default 30, 0 = read once at
+start). A change takes effect only if everything parses and the key belongs to the
+certificate, which is checked by signing with the one and verifying with the other.
+Renewal tools write certificate and key one after the other, and a poll can land in
+between: that state is logged as an error once, counted, and the pair in use stays
+in use. At start there is nothing to fall back on, so unreadable material stops the
+node.
+
+A CA rollover works the same way: put both authorities into the CA file, let every
+node reload, renew the node certificates from the new authority, then remove the old
+one. For this the gRPC server uses the JDK TLS engine, as the Netty transport already
+did. The native engine fixes the list of authorities it names to clients when the
+context is built, so after a rollover it would trust the new CA and still ask clients
+for a certificate of the old one.
+
+Metrics: `raft.tls.certificate.expiry.seconds` (alarm on a value that keeps falling),
+`raft.tls.reload{result=success|refused}`.
+
+Not covered: a private key in the traditional `BEGIN RSA PRIVATE KEY` form is not
+read; use PKCS#8 (`BEGIN PRIVATE KEY`), RSA or EC. A `RaftClient` reloads its client
+certificate the same way; its CA file is read when a channel is opened.
+
+# 8.3 Overload Protection
 
 A command the leader accepts occupies memory and log until a majority has stored
 it. When followers or the disk are slower than the clients, accepting everything
@@ -686,5 +718,7 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.node.snapshot.index` | Gauge | Snapshot boundary (last compacted index) |
 | `raft.node.witness` | Gauge | 1 on a witness, 0 on a data node |
 | `raft.client.overloaded` | Counter | Requests refused for load, tag `kind` |
+| `raft.tls.certificate.expiry.seconds` | Gauge | Seconds until the node certificate expires |
+| `raft.tls.reload` | Counter | Renewed TLS material found on disk, tag `result` |
 | `raft.client.pending` | Gauge | Requests waiting on this node, tag `kind` |
 | `raft.cluster.size` | Gauge | Number of nodes in configuration |

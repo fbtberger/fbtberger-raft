@@ -159,6 +159,26 @@ public final class RaftMetrics {
                                 .description("Snapshot boundary (last compacted index)").register(registry);
         }
 
+        /**
+         * The node certificate's remaining life and what became of renewals found on disk.
+         * The first is the alarm worth having: it falls steadily and jumps up at every
+         * renewal, and a line that keeps falling says the renewal is not arriving.
+         */
+        public void registerTlsGauges(com.fbtberger.raft.transport.TlsMaterial material) {
+                Gauge.builder("raft.tls.certificate.expiry.seconds", () ->
+                                (material.certificate().getNotAfter().getTime() - System.currentTimeMillis()) / 1000.0)
+                                .tags(tags).description("Seconds until the node certificate in use expires")
+                                .register(registry);
+                io.micrometer.core.instrument.FunctionCounter
+                                .builder("raft.tls.reload", material, m -> m.reloadCount())
+                                .tags(tags).tag("result", "success")
+                                .description("Renewed TLS material found on disk").register(registry);
+                io.micrometer.core.instrument.FunctionCounter
+                                .builder("raft.tls.reload", material, m -> m.failedReloadCount())
+                                .tags(tags).tag("result", "refused")
+                                .description("Renewed TLS material found on disk").register(registry);
+        }
+
         /** 1 on a witness, 0 on a data node: which members of a cluster hold no state. */
         public void registerWitnessGauge(Supplier<Number> witness) {
                 Gauge.builder("raft.node.witness", witness).tags(tags)

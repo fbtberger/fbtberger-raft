@@ -561,7 +561,7 @@ public final class RaftClient implements AutoCloseable {
             // server, offering one is harmless; requiring the operator to have one when the
             // server never checks would be a configuration people work around.
             if (tlsConfig.mtlsEnabled()) {
-                ssl.keyManager(tlsConfig.certFile(), tlsConfig.keyFile());
+                ssl.keyManager(tlsConfig.material().keyManager());
             }
             return NettyChannelBuilder.forTarget(address)
                     .sslContext(ssl.trustManager(tlsConfig.caFile()).build())

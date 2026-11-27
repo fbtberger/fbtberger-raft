@@ -121,7 +121,15 @@ public class RaftNodeConfiguration {
         CompositeMeterRegistry composite = new CompositeMeterRegistry();
         composite.add(promRegistry);
         composite.add(jmxRegistry);
-        return new RaftMetrics(composite, config.selfId());
+        RaftMetrics metrics = new RaftMetrics(composite, config.selfId());
+        if (config.tlsConfig().enabled()) {
+            try {
+                metrics.registerTlsGauges(config.tlsConfig().material());
+            } catch (javax.net.ssl.SSLException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+        }
+        return metrics;
     }
 
     @Bean(destroyMethod = "shutdown")

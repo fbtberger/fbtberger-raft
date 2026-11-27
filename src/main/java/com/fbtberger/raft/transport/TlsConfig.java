@@ -33,8 +33,27 @@ public final class TlsConfig {
     private final File keyFile;
     private final File caFile;
     private final boolean mtlsEnabled;
+    private final long reloadIntervalSeconds;
+    private TlsMaterial material;
+
+    /** Default for {@code tls.reload.interval.seconds}. */
+    public static final long DEFAULT_RELOAD_INTERVAL_SECONDS = 30;
 
     public TlsConfig(boolean enabled, File certFile, File keyFile, File caFile, boolean mtlsEnabled) {
+        this(enabled, certFile, keyFile, caFile, mtlsEnabled, DEFAULT_RELOAD_INTERVAL_SECONDS);
+    }
+
+    /**
+     * @param reloadIntervalSeconds how often the three files are checked for a renewed
+     *                              certificate; 0 = read once at start, as before
+     */
+    public TlsConfig(boolean enabled, File certFile, File keyFile, File caFile, boolean mtlsEnabled,
+                     long reloadIntervalSeconds) {
+        if (reloadIntervalSeconds < 0) {
+            throw new IllegalArgumentException("tls.reload.interval.seconds must not be negative: "
+                    + reloadIntervalSeconds);
+        }
+        this.reloadIntervalSeconds = reloadIntervalSeconds;
         this.enabled = enabled;
         this.certFile = certFile;
         this.keyFile = keyFile;
@@ -64,7 +83,33 @@ public final class TlsConfig {
         File key = new File(require(props, "tls.key.path"));
         File ca = new File(require(props, "tls.ca.path"));
         boolean mtls = Boolean.parseBoolean(props.getProperty("tls.mtls.enabled", "false"));
-        return new TlsConfig(true, cert, key, ca, mtls);
+        long reload = Long.parseLong(props.getProperty("tls.reload.interval.seconds",
+                Long.toString(DEFAULT_RELOAD_INTERVAL_SECONDS)));
+        return new TlsConfig(true, cert, key, ca, mtls, reload);
+    }
+
+    public long reloadIntervalSeconds() { return reloadIntervalSeconds; }
+
+    /**
+     * The certificate, key and CA every TLS context of this node is built from, loaded on
+     * first use and from then on re-read when the files change (see {@link TlsMaterial}).
+     * One instance per configuration, so the peer transport, the client channel and the
+     * metrics endpoint all switch to a renewed certificate together.
+     */
+    public synchronized TlsMaterial material() throws SSLException {
+        if (!enabled) {
+            throw new IllegalStateException("TLS is disabled: there is no material");
+        }
+        if (material == null) {
+            try {
+                material = new TlsMaterial(certFile, keyFile, caFile);
+            } catch (java.io.IOException | java.security.GeneralSecurityException e) {
+                throw new SSLException("could not load TLS material (cert=" + certFile + ", key=" + keyFile
+                        + ", ca=" + caFile + "): " + e.getMessage(), e);
+            }
+            material.watch(reloadIntervalSeconds);
+        }
+        return material;
     }
 
     private static String require(Properties props, String key) {
@@ -160,9 +205,9 @@ public final class TlsConfig {
      * here than the native engine's modest throughput edge.
      */
     public SslContext buildServerSslContext() throws SSLException {
-        SslContextBuilder builder = SslContextBuilder.forServer(certFile, keyFile)
+        SslContextBuilder builder = SslContextBuilder.forServer(material().keyManager())
                 .sslProvider(SslProvider.JDK)
-                .trustManager(caFile);
+                .trustManager(material().trustManager());
         if (mtlsEnabled) {
             builder.clientAuth(ClientAuth.REQUIRE);
         }
@@ -172,8 +217,8 @@ public final class TlsConfig {
     public SslContext buildClientSslContext() throws SSLException {
         SslContextBuilder builder = SslContextBuilder.forClient()
                 .sslProvider(SslProvider.JDK)
-                .keyManager(certFile, keyFile)
-                .trustManager(caFile);
+                .keyManager(material().keyManager())
+                .trustManager(material().trustManager());
         return builder.build();
     }
 
@@ -186,33 +231,12 @@ public final class TlsConfig {
      *
      * <p>Expects the private key in PKCS#8 PEM form ({@code BEGIN PRIVATE KEY}, not
      * {@code BEGIN RSA PRIVATE KEY}) — the default output of {@code openssl req -newkey rsa}
-     * on OpenSSL 1.1.1+/3.x without {@code -traditional}.
+     * on OpenSSL 1.1.1+/3.x without {@code -traditional}. Built on {@link #material()}, so
+     * the metrics endpoint follows a renewed certificate like the peer transport does.
      */
     public javax.net.ssl.SSLContext buildJdkSslContext() throws Exception {
-        java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
-        java.security.cert.X509Certificate cert;
-        try (java.io.InputStream in = new java.io.FileInputStream(certFile)) {
-            cert = (java.security.cert.X509Certificate) cf.generateCertificate(in);
-        }
-
-        String keyPem = new String(java.nio.file.Files.readAllBytes(keyFile.toPath()), java.nio.charset.StandardCharsets.US_ASCII)
-                .replace("-----BEGIN PRIVATE KEY-----", "")
-                .replace("-----END PRIVATE KEY-----", "")
-                .replaceAll("\\s", "");
-        byte[] keyBytes = java.util.Base64.getDecoder().decode(keyPem);
-        java.security.PrivateKey privateKey = java.security.KeyFactory.getInstance("RSA")
-                .generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
-
-        java.security.KeyStore keyStore = java.security.KeyStore.getInstance("PKCS12");
-        keyStore.load(null, null);
-        keyStore.setKeyEntry("node", privateKey, new char[0], new java.security.cert.Certificate[]{cert});
-
-        javax.net.ssl.KeyManagerFactory kmf =
-                javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(keyStore, new char[0]);
-
         javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
-        sslContext.init(kmf.getKeyManagers(), null, null);
+        sslContext.init(new javax.net.ssl.KeyManager[] {material().keyManager()}, null, null);
         return sslContext;
     }
 }

@@ -66,8 +66,21 @@ public final class GrpcTransportServer implements RaftTransportServer {
             additionalServices.forEach(builder::addService);
             this.server = builder.build();
         } else {
-            var sslBuilder = GrpcSslContexts.forServer(tlsConfig.certFile(), tlsConfig.keyFile())
-                    .trustManager(tlsConfig.caFile());
+            // The managers, not the files: a renewed certificate is then used by the next
+            // handshake without this server being rebuilt. See TlsMaterial.
+            //
+            // The JDK engine, explicitly. gRPC would pick its bundled native one, and that
+            // engine fixes the list of certificate authorities it names to a client when
+            // the context is built. After a CA rollover the server would trust the new CA
+            // and still ask clients for a certificate of the old one; a client holding
+            // only the new one then sends none and is turned away with
+            // CERTIFICATE_REQUIRED. The JDK engine asks the trust manager at every
+            // handshake. TlsConfig makes the same choice for the Netty transport.
+            var sslBuilder = GrpcSslContexts.configure(
+                    io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder
+                            .forServer(tlsConfig.material().keyManager()),
+                    io.grpc.netty.shaded.io.netty.handler.ssl.SslProvider.JDK)
+                    .trustManager(tlsConfig.material().trustManager());
             if (tlsConfig.mtlsEnabled()) {
                 sslBuilder.clientAuth(ClientAuth.REQUIRE);
             }

@@ -40,6 +40,9 @@ For a quick API reference, see the
     excluded from every majority) and is promoted to a voter only once caught up,
     so adding capacity never opens an availability gap
   - §4 errata fix (config changes rejected until leader's no-op commits)
+- **Certificate reload without restart**: a renewed certificate, key or CA on
+  disk is picked up within `tls.reload.interval.seconds` and used for every new
+  connection; open connections stay up
 - **Overload protection**: the leader refuses commands and reads beyond a
   configurable number waiting, and `RaftClient` backs off and retries the same
   node instead of timing out
@@ -226,6 +229,7 @@ tls.cert.path=/path/to/cert.pem
 tls.key.path=/path/to/key.pem
 tls.ca.path=/path/to/ca.pem
 tls.mtls.enabled=false
+tls.reload.interval.seconds=30  # check the three files for a renewed certificate (0 = never)
 
 ```
 
