@@ -518,7 +518,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     .setLastLogTerm(store.getLastLogTerm())
                     .build();
 
-            AtomicLong preVotesGranted = new AtomicLong(1); // count self
+            // Who granted, not how many: during a configuration change the question is
+            // whether a majority of C_old AND a majority of C_new did (see Quorum), and no
+            // count over the union can answer that.
+            java.util.Set<String> preVotesGranted = ConcurrentHashMap.newKeySet();
+            preVotesGranted.add(config.selfId());
             // Issue #3: one latch per round, so the quorum threshold converts into an election
             // exactly once no matter how many grants cross it. Scoped to the round rather than
             // to the node -- a later round must be free to decide again.
@@ -531,7 +535,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     if (peer == null) continue;
                     peer.preVote(preVoteRequest).whenComplete((response, t) -> {
                         if (t == null) {
-                            handlePreVoteResponse(proposedTerm, response, preVotesGranted, roundDecided);
+                            handlePreVoteResponse(proposedTerm, peerId, response, preVotesGranted, roundDecided);
                         } else {
                             log("PreVote RPC failed", t);
                         }
@@ -569,14 +573,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * atomic transition, where every grant that crossed the threshold campaigned for whatever
      * term was next when it happened to arrive.
      */
-    private void handlePreVoteResponse(long proposedTerm, PreVoteResponse response,
-                                       AtomicLong preVotesGranted, AtomicBoolean roundDecided) {
+    private void handlePreVoteResponse(long proposedTerm, String peerId, PreVoteResponse response,
+                                       java.util.Set<String> preVotesGranted, AtomicBoolean roundDecided) {
         lock.lock();
         try {
             if (store.getCurrentTerm() + 1 != proposedTerm) {
                 return;
             }
-            if (!response.getVoteGranted() || preVotesGranted.incrementAndGet() < majority()) {
+            if (!response.getVoteGranted()) {
+                return;
+            }
+            preVotesGranted.add(peerId);
+            if (!Quorum.reached(preVotesGranted, currentConfiguration, oldConfiguration)) {
                 return;
             }
             // The round is consumed here, not by whatever startRealElection does with it.
@@ -625,18 +633,20 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 .setLeadershipTransfer(leadershipTransfer)
                 .build();
 
-        AtomicLong votesGranted = new AtomicLong(1);
+        java.util.Set<String> votesGranted = ConcurrentHashMap.newKeySet();
+        votesGranted.add(config.selfId());
         // §4.2.1: request votes only from voting members, never from learners.
         for (String peerId : votingPeerIdsExcludingSelf()) {
             RaftTransport peer = peerTransports.get(peerId);
             if (peer == null) continue;
             peer.requestVote(request).whenComplete((response, t) -> {
-                if (t == null) handleRequestVoteResponse(newTerm, response, votesGranted);
+                if (t == null) handleRequestVoteResponse(newTerm, peerId, response, votesGranted);
             });
         }
     }
 
-    private void handleRequestVoteResponse(long electionTerm, RequestVoteResponse response, AtomicLong votesGranted) {
+    private void handleRequestVoteResponse(long electionTerm, String peerId, RequestVoteResponse response,
+                                           java.util.Set<String> votesGranted) {
         lock.lock();
         try {
             if (response.getTerm() > store.getCurrentTerm()) {
@@ -647,7 +657,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return; // stale response from an election we've since left
             }
             if (response.getVoteGranted()) {
-                if (votesGranted.incrementAndGet() >= majority()) {
+                votesGranted.add(peerId);
+                // §6: a majority of C_new and, while a change is in flight, of C_old as well.
+                // This compared a count over the union against the larger of the two
+                // majorities, which three servers of C_new satisfy with no vote from C_old.
+                if (Quorum.reached(votesGranted, currentConfiguration, oldConfiguration)) {
                     becomeLeaderLocked();
                 }
             }
@@ -833,7 +847,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             rb.future.completeExceptionally(new NotLeaderException(null));
         }
         pendingReadBarriers.clear();
-        oldConfiguration = null;
+        failUncommittedClientRequestsLocked();
+        // oldConfiguration is NOT cleared here. It mirrors the latest configuration entry in the
+        // log, and stepping down does not change the log: a server that is in C_old,new stays in
+        // it, as a follower and as a candidate, until an entry says otherwise. Clearing it here
+        // let a node that had merely seen a higher term campaign on a majority of C_new alone.
         metrics.stepDown();
         // v119: this used to be entirely silent -- only metrics.stepDown() recorded it.
         // A step-down is the single most load-bearing event when reading an election
@@ -845,6 +863,31 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         role = ServerRole.FOLLOWER;
         resetElectionTimer();
+    }
+
+    /**
+     * Fails every client request whose entry has not committed. Called when this node stops
+     * leading. Caller must hold {@code lock}.
+     *
+     * <p>The requests are keyed by log index, and after a step-down the index no longer
+     * identifies the entry: the next leader may overwrite ours with one of its own, and when
+     * that one is applied here the waiting client would be handed its result -- told that a
+     * write succeeded which no longer exists. So the answer from here is the honest one, "not
+     * the leader any more, outcome unknown": the entry may still commit under the next leader,
+     * and a client that needs to know resubmits with its session (§8), which tells a repeat
+     * from a first application.
+     *
+     * <p>Entries at or below commitIndex are left alone. They are committed, they are ours,
+     * and the apply loop that may be running further up this very call stack answers them.
+     */
+    private void failUncommittedClientRequestsLocked() {
+        if (pendingClientRequests.isEmpty()) return;
+        long committed = commitIndex.get();
+        pendingClientRequests.entrySet().removeIf(pending -> {
+            if (pending.getKey() <= committed) return false;
+            pending.getValue().completeExceptionally(new NotLeaderException(null));
+            return true;
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1099,8 +1142,14 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             // batch and the gate would be blind. This assignment is monotonic (max), so recording
             // it a few statements earlier changes nothing an outside observer can see.
             leaderCommitSeen = Math.max(leaderCommitSeen, request.getLeaderCommit());
-            if (request.getLeaderCommit() > commitIndex.get()) {
-                commitIndex.set(Math.min(request.getLeaderCommit(), lastNewIndex));
+            //
+            // Only ever forwards. lastNewIndex is where THIS request ends, and a request can
+            // end below what we have already committed: a leader that lost track of us starts
+            // again from the beginning of its log, and its first batch then stops short of our
+            // commitIndex while its leaderCommit lies beyond it.
+            long newCommitIndex = Math.min(request.getLeaderCommit(), lastNewIndex);
+            if (newCommitIndex > commitIndex.get()) {
+                commitIndex.set(newCommitIndex);
                 applyCommittedEntries();
             }
 
@@ -1140,6 +1189,20 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             resetElectionTimer();
 
             if (request.getLastIncludedIndex() <= store.getSnapshotIndex()) {
+                return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+            }
+            // A snapshot that ends at or below what we have applied has nothing for us, and
+            // installing it would be worse than useless: the state machine would be replaced by
+            // the state as of lastIncludedIndex while lastApplied stayed where it is, so the
+            // entries in between would be gone from the state and never applied again. Being
+            // behind our own snapshot (the check above) is not the only way to be covered --
+            // a leader sends a snapshot whenever its nextIndex for us falls to its snapshot
+            // boundary, which one failed AppendEntries right after its election is enough for
+            // (matchIndex is still 0 then), however current we are. Everything up to
+            // lastApplied is committed, so by Log Matching we hold what the snapshot holds;
+            // acknowledging lets the leader move on to the entries after it.
+            if (request.getLastIncludedIndex() <= lastApplied.get()) {
+                discardSnapshotReceiverLocked();
                 return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
             }
 
@@ -1301,7 +1364,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             } else {
                 peerConsecutiveFailures.put(peerId, 0);   // the transport is healthy again
                 peerLastRebuildMs.remove(peerId);
-                handleAppendEntriesResponse(peerId, currentTerm, lastSentIndex, response);
+                handleAppendEntriesResponse(peerId, currentTerm, prevLogIndex, lastSentIndex, response);
             }
         });
     }
@@ -1455,7 +1518,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
     }
 
-    private void handleAppendEntriesResponse(String peerId, long sentTerm, long lastSentIndex, AppendEntriesResponse response) {
+    private void handleAppendEntriesResponse(String peerId, long sentTerm, long prevLogIndex, long lastSentIndex,
+                                             AppendEntriesResponse response) {
         lock.lock();
         try {
             peerInflight.merge(peerId, -1, Integer::sum);
@@ -1501,11 +1565,41 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 // pins it above snapshotIndex forever and replicateTo never switches to InstallSnapshot
                 // (the "learner stuck at 0, leader silent" tail that outlives the v117 transport fix).
                 // Use the follower's reported last index to pull BOTH pointers down — monotonically,
-                // since a rejection can only ever reveal the follower has less than we assumed. Capped
-                // at lastSentIndex so nextIndex always drops strictly below the index that just failed.
+                // since a rejection can only ever reveal the follower has less than we assumed.
+                //
+                // Capped at prevLogIndex, the index the follower actually refused, so nextIndex
+                // always ends up below the one that just failed. The cap used to be lastSentIndex,
+                // which is the same thing only for an empty heartbeat. With entries in the request
+                // it lies at or above the old nextIndex, and a follower whose log is LONGER than
+                // ours and differs at prevLogIndex -- a deposed leader with a tail nobody else has
+                // -- reports a hint above it: nextIndex then never moved again and that follower
+                // was never repaired.
                 long hint = response.getConflictLastLogIndex();
                 matchIndex.merge(peerId, hint, (cur, h) -> Math.min(cur, h));
-                nextIndex.put(peerId, Math.max(1, Math.min(hint + 1, lastSentIndex)));
+                nextIndex.put(peerId, Math.max(1, Math.min(hint + 1, prevLogIndex)));
+                // Try the next index now rather than at the next heartbeat: each refusal moves
+                // one entry back, and at one step per heartbeat a long tail takes seconds. Handed
+                // to the scheduler so that a transport which answers on the calling thread cannot
+                // turn the walk back into recursion.
+                if (prevLogIndex > 0) {
+                    try {
+                        scheduler.execute(() -> retryReplicationTo(peerId, sentTerm));
+                    } catch (java.util.concurrent.RejectedExecutionException shuttingDown) {
+                        // nothing left to replicate to
+                    }
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Replicates to {@code peerId} again, if this node still leads the term it was leading. */
+    private void retryReplicationTo(String peerId, long term) {
+        lock.lock();
+        try {
+            if (role == ServerRole.LEADER && store.getCurrentTerm() == term) {
+                replicateTo(peerId);
             }
         } finally {
             lock.unlock();
@@ -1581,17 +1675,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 boolean isJoint = cfg.getOldMembersCount() > 0;
                 boolean stillAMember = cfg.getMembersList().stream()
                         .anyMatch(member -> member.getId().equals(config.selfId()));
-                if (role == ServerRole.LEADER && isJoint) {
-                    log("joint config C_old,new committed; proposing final C_new");
-                    appendAndReplicateLocked(LogEntry.newBuilder()
-                            .setConfiguration(configProto(currentConfiguration, currentLearners)));
-                }
+                proposeFinalConfigurationLocked(index);
                 if (role == ServerRole.LEADER && !stillAMember && !isJoint) {
                     log("stepping down: committed configuration no longer includes us");
                     becomeFollowerLocked(store.getCurrentTerm());
                 }
             } else if (entry.getClientId().isEmpty()) {
                 result = applyToItsStateMachine(index, entry);
+                if (index == leaderNoOpIndex) {
+                    // A leader that inherited C_old,new from its predecessor: with its no-op
+                    // committed, the joint entry before it is committed too.
+                    proposeFinalConfigurationLocked(index);
+                }
             } else {
                 // §8: a tagged command reaches its state machine once. The entry itself
                 // stays in the log either way -- it was committed, and every server has to
@@ -1627,6 +1722,27 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
         }
         maybeTakeSnapshotLocked();
+    }
+
+    /**
+     * Second phase of joint consensus (§6): once C_old,new is committed, the leader proposes
+     * C_new. Called while applying the entry at {@code appliedIndex}; does nothing unless this
+     * node leads, the configuration in effect is a joint one, and that entry has been reached.
+     * Caller must hold {@code lock}.
+     *
+     * <p>Asked from two places, because C_old,new can commit under two leaders: the one that
+     * proposed it, when the joint entry itself is applied, and a successor that found it in its
+     * log, when its own no-op is applied. Without the second the cluster stays in the joint
+     * configuration for good -- still correct, and dependent on a majority of servers that were
+     * on their way out.
+     */
+    private void proposeFinalConfigurationLocked(long appliedIndex) {
+        if (role != ServerRole.LEADER || oldConfiguration == null || currentConfigurationIndex > appliedIndex) {
+            return;
+        }
+        log("joint config C_old,new committed; proposing final C_new");
+        appendAndReplicateLocked(LogEntry.newBuilder()
+                .setConfiguration(configProto(currentConfiguration, currentLearners)));
     }
 
     // ------------------------------------------------------------------
