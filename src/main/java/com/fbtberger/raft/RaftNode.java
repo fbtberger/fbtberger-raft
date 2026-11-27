@@ -66,6 +66,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private static final int HEARTBEAT_INTERVAL_MS = 50;
     private static final int ELECTION_TIMEOUT_MIN_MS = 150;
     private static final int ELECTION_TIMEOUT_MAX_MS = 300;
+    /** How much longer than a data node a witness waits before it stands for election. */
+    static final int WITNESS_ELECTION_FACTOR = 3;
     /**
      * How many ordinary election timeouts a node waits before its <em>first</em> campaign after
      * {@link #start()}. Only the first timer is scaled; once anything resets the timer -- which
@@ -90,6 +92,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final RaftConfig config;
     private final RaftStorage store;
     private final StateMachine stateMachine;
+    /**
+     * A witness: a voting member with a log and no state machine. See {@link #isWitness()}.
+     * Fixed for the life of the node; it comes from {@code node.witness}.
+     */
+    private final boolean witness;
+    /**
+     * Peers that answered a TimeoutNow with "I am a witness". Learned, not configured: the
+     * cluster configuration does not say who is one. Only used to choose whom to hand the
+     * lead to, so a wrong or missing entry costs one refused transfer and nothing else.
+     */
+    private final java.util.Set<String> knownWitnesses = ConcurrentHashMap.newKeySet();
     private final RaftTransportFactory transportFactory;
     private final RaftMetrics metrics;
     private final Map<String, RaftTransport> peerTransports = new ConcurrentHashMap<>(); // excludes self
@@ -260,7 +273,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                      RaftMetrics metrics) {
         this.config = config;
         this.store = store;
-        this.stateMachine = stateMachine;
+        this.witness = config.isWitness();
+        // A witness is handed a state machine like any node -- the wiring does not know
+        // the difference -- and does not use it.
+        this.stateMachine = witness ? new WitnessStateMachine() : stateMachine;
         this.transportFactory = transportFactory;
         this.metrics = metrics;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
@@ -300,6 +316,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // for has since been compacted away.
         RaftStorage.SnapshotMeta existingSnapshot = store.getSnapshotMeta();
         if (existingSnapshot != null) {
+            refuseToStartFromAWitnessSnapshot(existingSnapshot);
             restoreStateMachineFromStoredSnapshot();
             clientSessions.restore(existingSnapshot.sessionData);
             lastApplied.set(existingSnapshot.lastIncludedIndex);
@@ -314,6 +331,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 () -> currentConfiguration.size(),
                 store::getLastLogIndex,
                 store::getSnapshotIndex);
+        metrics.registerWitnessGauge(() -> witness ? 1 : 0);
     }
 
     /** Every server starts out as a follower (§5.1). */
@@ -376,6 +394,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // an ordinary timeout expired long before the first heartbeat arrived. Scaling only this
         // one timer buys that window back without slowing down a real failover: from the first
         // reset onwards -- which any heartbeat performs -- the node is on the normal schedule.
+        if (witness) {
+            // A witness that wins has to hand the lead straight on, which costs a second
+            // election. Waiting longer lets a data node that can win do so first; the
+            // witness only gets there when none can -- the case it stands for election for.
+            timeoutMs *= WITNESS_ELECTION_FACTOR;
+        }
         if (bootGracePending) {
             bootGracePending = false;
             timeoutMs *= BOOT_DELAY_FACTOR;
@@ -633,6 +657,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             for (String peerId : peerTransports.keySet()) {
                 replicateTo(peerId);
             }
+            handWitnessLeadershipOnLocked();
             logReplicationStatus();
         } finally {
             lock.unlock();
@@ -1264,6 +1289,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * as each chunk is acknowledged by the follower.
      */
     private void sendInstallSnapshot(String peerId, RaftTransport transport) {
+        if (witness) {
+            // What a witness stores under the name of a snapshot is a compaction marker
+            // with no state in it. Installed on a data node it would replace that node's
+            // state with nothing. The peer needs a data node to catch up from.
+            logThrottled(peerId, peerId + " is behind this witness's log (next index "
+                    + nextIndex.getOrDefault(peerId, 1L) + ", log starts after "
+                    + store.getSnapshotIndex() + "): a witness has no snapshot to send, "
+                    + "the peer must catch up from a data node");
+            return;
+        }
         SnapshotTransfer transfer = snapshotTransfers.get(peerId);
 
         if (transfer != null && transfer.lastIncludedIndex < store.getSnapshotIndex()) {
@@ -1403,6 +1438,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (peerId.equals(leaderTransferTarget)) {
                     checkTransferReadyLocked();
                 }
+                handWitnessLeadershipOnLocked();
             } else {
                 metrics.replicationFailure();
                 // §10.2.2 + v118: a rejection proves the follower does NOT hold the entry at the
@@ -1546,6 +1582,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     /** Takes a new snapshot if enough newly applied entries have piled up since the last one. Caller must hold {@code lock}. */
     private void maybeTakeSnapshotLocked() {
+        if (witness) {
+            compactWitnessLogLocked(false);
+            return;
+        }
         if (snapshotInProgress) return;
         if (lastApplied.get() - store.getSnapshotIndex() < config.snapshotThreshold()) {
             return;
@@ -1673,6 +1713,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     public void snapshotNow() {
         lock.lock();
         try {
+            if (witness) {
+                compactWitnessLogLocked(true);
+                return;
+            }
             takeSnapshotSync();
         } finally {
             lock.unlock();
@@ -1730,6 +1774,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     public CompletableFuture<byte[]> submitCommand(byte[] command) {
         lock.lock();
         try {
+            if (witness) {
+                metrics.clientRejected();
+                return failedFuture(witnessRefusalLocked());
+            }
             if (role != ServerRole.LEADER) {
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(currentLeaderId));
@@ -1787,6 +1835,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         lock.lock();
         try {
+            if (witness) {
+                metrics.clientRejected();
+                return failedFuture(witnessRefusalLocked());
+            }
             if (role != ServerRole.LEADER) {
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(currentLeaderId));
@@ -1846,6 +1898,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     public CompletableFuture<Long> readIndex() {
         lock.lock();
         try {
+            if (witness) {
+                // Covers reads asked of this node and ReadIndex asked by a follower: a
+                // witness leads for the moment it takes to hand the lead on, and there
+                // is nothing to gain from serving a read barrier in that moment.
+                return CompletableFuture.failedFuture(witnessRefusalLocked());
+            }
             if (role != ServerRole.LEADER) {
                 CompletableFuture<Long> f = new CompletableFuture<>();
                 f.completeExceptionally(new NotLeaderException(currentLeaderId));
@@ -1925,6 +1983,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     public CompletableFuture<Void> leaseRead() {
         lock.lock();
         try {
+            if (witness) {
+                return CompletableFuture.failedFuture(witnessRefusalLocked());
+            }
             if (role != ServerRole.LEADER) {
                 CompletableFuture<Void> f = new CompletableFuture<>();
                 f.completeExceptionally(new NotLeaderException(currentLeaderId));
@@ -2021,6 +2082,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         RaftTransport toLeader;
         lock.lock();
         try {
+            if (witness) {
+                return CompletableFuture.failedFuture(witnessRefusalLocked());
+            }
             if (role == ServerRole.LEADER) {
                 return readIndex();
             }
@@ -2203,6 +2267,19 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * timeout, the leader aborts and resumes normal operation.
      */
     public CompletableFuture<Void> transferLeadership(String targetId) {
+        lock.lock();
+        try {
+            if (witness) {
+                // A witness hands the lead on by itself, to whoever can take it first.
+                return CompletableFuture.failedFuture(witnessRefusalLocked());
+            }
+            return startLeadershipTransferLocked(targetId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private CompletableFuture<Void> startLeadershipTransferLocked(String targetId) {
         CompletableFuture<Void> result = new CompletableFuture<>();
         lock.lock();
         try {
@@ -2329,7 +2406,15 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 // whether this node is still the leader. If it is not, the transfer did what
                 // it was asked to do, whatever became of the response. If it still is,
                 // nothing happened and the error stands.
-                if (t != null && role == ServerRole.LEADER) {
+                if (t == null && resp != null && resp.getWitness()) {
+                    // The one answer that settles it at once: the target will not campaign.
+                    knownWitnesses.add(targetId);
+                    if (targetId.equals(leaderTransferTarget)) {
+                        clearTransferLocked();
+                    }
+                    result.completeExceptionally(new IllegalStateException(
+                            targetId + " is a witness and cannot lead; choose a data node"));
+                } else if (t != null && role == ServerRole.LEADER) {
                     // Nothing happened: release the block and let writes through again.
                     clearTransferLocked();
                     result.completeExceptionally(t);
@@ -2359,6 +2444,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 log("ignoring TimeoutNow from " + claimed + ": it is not the leader this node "
                         + "follows (" + currentLeaderId + ")");
                 return TimeoutNowResponse.getDefaultInstance();
+            }
+            if (witness) {
+                log("declining TimeoutNow" + (claimed.isEmpty() ? "" : " from " + claimed)
+                        + ": this node is a witness and does not take the lead on request");
+                return TimeoutNowResponse.newBuilder().setWitness(true).build();
             }
             log("received TimeoutNow" + (claimed.isEmpty() ? "" : " from " + claimed)
                     + ", starting immediate election");
@@ -2598,6 +2688,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
 
     /** Returns a failed future if a config change isn't safe right now, or null if it's fine to proceed. */
     private CompletableFuture<byte[]> rejectIfConfigurationChangePending() {
+        if (witness) {
+            // Reached only while a witness leads. It is on its way out; the change
+            // belongs to the data node it hands the lead to.
+            return failedFuture(witnessRefusalLocked());
+        }
         // §4 errata: a leader must commit an entry from its own term
         // before accepting config changes, so it knows the latest
         // committed configuration. The no-op serves this purpose.
@@ -2706,6 +2801,127 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     /** True if this node is itself currently a non-voting learner (§4.2.1). */
     public boolean isLearner() {
         return currentLearners.containsKey(config.selfId());
+    }
+
+    /**
+     * True if this node is a witness: it votes, stores the log and counts toward every
+     * majority like any member, and it has no state machine. It answers no client, takes
+     * no snapshot of anything and is not a place to read from.
+     *
+     * <p>What it is for: two data nodes and a witness tolerate the loss of any one of the
+     * three, as three data nodes do, with the state stored twice instead of three times.
+     *
+     * <p>It does stand for election, later than a data node would
+     * ({@link #WITNESS_ELECTION_FACTOR}), and that is not an oversight. An entry is
+     * committed when two of three hold it, and those two are as often the leader and the
+     * witness as the leader and the other data node. If the leader then fails, the
+     * surviving data node lacks an entry the witness has, the witness rightly refuses it
+     * its vote, and without a leader nothing would ever bring that entry across. So the
+     * witness wins, replicates its log to the data node, and hands the lead over the
+     * moment that node has caught up ({@link #handWitnessLeadershipOnLocked()}). While it
+     * leads it refuses every client request.
+     */
+    public boolean isWitness() {
+        return witness;
+    }
+
+    /** The refusal a witness gives every client-facing call: not here, and where instead if known. */
+    private NotLeaderException witnessRefusalLocked() {
+        String leader = currentLeaderId;
+        return new NotLeaderException(config.selfId().equals(leader) ? leaderTransferTarget : leader);
+    }
+
+    /**
+     * A leading witness passes the lead to the first data node that holds its whole log.
+     * Called on every heartbeat and every acknowledged append; does nothing on any other
+     * node. Caller must hold {@code lock}.
+     */
+    private void handWitnessLeadershipOnLocked() {
+        if (!witness || role != ServerRole.LEADER || leaderTransferTarget != null) {
+            return;
+        }
+        long lastLogIndex = store.getLastLogIndex();
+        for (String peerId : currentConfiguration.keySet()) {
+            if (peerId.equals(config.selfId()) || knownWitnesses.contains(peerId)) {
+                continue;
+            }
+            if (matchIndex.getOrDefault(peerId, 0L) >= lastLogIndex && peerTransports.containsKey(peerId)) {
+                log("witness: " + peerId + " holds the whole log, handing the lead to it");
+                // The outcome needs no handling here: success ends this leadership, and
+                // after a failure or a timeout the next heartbeat tries again.
+                startLeadershipTransferLocked(peerId).exceptionally(failure -> null);
+                return;
+            }
+        }
+    }
+
+    /** What a witness stores in place of a session table: the mark that its snapshots hold no state. */
+    private static final byte[] WITNESS_SNAPSHOT_MARK =
+            com.fbtberger.raft.proto.ClientSessionTable.newBuilder().setWitness(true).build().toByteArray();
+
+    /**
+     * A data directory that a witness has compacted holds the tail of the log and no
+     * state for what came before. A node with a state machine that started from it would
+     * come up with part of the state and report itself healthy.
+     */
+    private void refuseToStartFromAWitnessSnapshot(RaftStorage.SnapshotMeta snapshot) {
+        if (witness || snapshot.sessionData.length == 0) {
+            return;
+        }
+        boolean writtenByWitness;
+        try {
+            writtenByWitness = com.fbtberger.raft.proto.ClientSessionTable.parseFrom(snapshot.sessionData).getWitness();
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalStateException("corrupt client session table in snapshot", e);
+        }
+        if (writtenByWitness) {
+            throw new IllegalStateException("the data directory of " + config.selfId()
+                    + " was written by a witness: its log is compacted through index "
+                    + snapshot.lastIncludedIndex + " and there is no state for those entries. "
+                    + "Start this node as a witness (node.witness=true), or empty the directory "
+                    + "and let it rejoin and catch up from the leader.");
+        }
+    }
+
+    /**
+     * Log compaction on a witness. There is no state to snapshot, so this only moves the
+     * point the log starts at -- and it keeps {@link RaftConfig#witnessLogRetain()}
+     * committed entries behind, because those entries are everything a witness can give a
+     * data node that has fallen behind.
+     *
+     * @param force compact as far as the retained tail allows, whatever the threshold
+     */
+    private void compactWitnessLogLocked(boolean force) {
+        long snapshotIndex = store.getSnapshotIndex();
+        long target = lastApplied.get() - config.witnessLogRetain();
+        if (target <= snapshotIndex || (!force && target - snapshotIndex < config.snapshotThreshold())) {
+            return;
+        }
+        long targetTerm = store.getTermAt(target);
+        // The configuration as of `target`, not the current one: entries after it stay in
+        // the log, and one of them may be a configuration change that has yet to commit.
+        byte[] configurationData = null;
+        for (long i = target; i > snapshotIndex; i--) {
+            LogEntry entry = store.getLogEntry(i);
+            if (entry != null && entry.hasConfiguration()) {
+                configurationData = entry.getConfiguration().toByteArray();
+                break;
+            }
+        }
+        if (configurationData == null) {
+            RaftStorage.SnapshotMeta previous = store.getSnapshotMeta();
+            configurationData = previous != null && previous.configurationData.length > 0
+                    ? previous.configurationData
+                    : toProto(config.peerAddresses()).toByteArray();
+        }
+        try (RaftStorage.SnapshotSink sink = store.beginSnapshot(target, targetTerm)) {
+            sink.commit(configurationData, WITNESS_SNAPSHOT_MARK);
+        } catch (IOException e) {
+            logWarn("witness: could not compact the log through index " + target + ": " + e);
+            return;
+        }
+        log("witness: log compacted through index " + target + "; "
+                + config.witnessLogRetain() + " committed entries kept");
     }
 
     public static final class NotLeaderException extends RuntimeException {
@@ -3092,7 +3308,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             if (sink != null && position < size) {
                 int toPayload = (int) Math.min(size - position, payloadLength - payloadWritten);
-                if (toPayload > 0) {
+                if (toPayload > 0 && witness) {
+                    // Counted and dropped. A witness keeps the boundary the snapshot
+                    // sets -- index, term, configuration -- and none of the state.
+                    payloadWritten += toPayload;
+                    position += toPayload;
+                } else if (toPayload > 0) {
                     data.substring(position, position + toPayload).writeTo(sink.stream());
                     payloadWritten += toPayload;
                     position += toPayload;
@@ -3122,9 +3343,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 sessionData = new byte[0];
             }
             try (RaftStorage.SnapshotSink committing = sink) {
-                committing.commit(configurationData, sessionData);
+                committing.commit(configurationData, witness ? WITNESS_SNAPSHOT_MARK : sessionData);
             }
-            return sessionData;
+            return witness ? new byte[0] : sessionData;
         }
 
         @Override

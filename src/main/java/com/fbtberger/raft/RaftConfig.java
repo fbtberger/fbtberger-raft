@@ -45,6 +45,8 @@ public final class RaftConfig {
 
     private static final int DEFAULT_SNAPSHOT_THRESHOLD = 100;
     private static final int DEFAULT_SNAPSHOT_CHUNK_SIZE = 1_048_576; // 1 MB
+    /** Committed entries a witness keeps behind its commit index. See {@link #witnessLogRetain()}. */
+    public static final int DEFAULT_WITNESS_LOG_RETAIN = 10_000;
 
     private final String selfId;
     private final int selfPort;
@@ -57,10 +59,29 @@ public final class RaftConfig {
     private final RpcTimeouts rpcTimeouts;
     private final TlsConfig tlsConfig;
     private final ClientAuthConfig clientAuthConfig;
+    private final boolean witness;
+    private final int witnessLogRetain;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
                        int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
                        RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ClientAuthConfig clientAuthConfig) {
+        this(selfId, selfPort, dataDir, peerAddresses, snapshotThreshold, snapshotChunkSize, metricsPort,
+                learner, rpcTimeouts, tlsConfig, clientAuthConfig, false, DEFAULT_WITNESS_LOG_RETAIN);
+    }
+
+    private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ClientAuthConfig clientAuthConfig,
+                       boolean witness, int witnessLogRetain) {
+        if (witness && learner) {
+            throw new IllegalArgumentException("node.witness and node.learner exclude each other: "
+                    + "a witness exists to vote, a learner does not vote");
+        }
+        if (witnessLogRetain < 0) {
+            throw new IllegalArgumentException("witness.log.retain must not be negative: " + witnessLogRetain);
+        }
+        this.witness = witness;
+        this.witnessLogRetain = witnessLogRetain;
         this.clientAuthConfig = clientAuthConfig;
         this.selfId = selfId;
         this.selfPort = selfPort;
@@ -109,7 +130,12 @@ public final class RaftConfig {
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
         TlsConfig tlsConfig = TlsConfig.fromProperties(props);
         ClientAuthConfig clientAuthConfig = ClientAuthConfig.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, clientAuthConfig);
+        // A witness votes and stores the log and holds no state: see RaftNode#isWitness.
+        boolean witness = Boolean.parseBoolean(props.getProperty("node.witness", "false"));
+        int witnessLogRetain = Integer.parseInt(
+                props.getProperty("witness.log.retain", Integer.toString(DEFAULT_WITNESS_LOG_RETAIN)));
+        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort,
+                learner, rpcTimeouts, tlsConfig, clientAuthConfig, witness, witnessLogRetain);
     }
 
     /**
@@ -150,7 +176,15 @@ public final class RaftConfig {
     /** This configuration with client-channel authorisation set as given; everything else unchanged. */
     public RaftConfig withClientAuth(ClientAuthConfig auth) {
         return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
-                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, auth);
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, auth,
+                witness, witnessLogRetain);
+    }
+
+    /** This configuration as a witness that keeps {@code logRetain} committed entries; everything else unchanged. */
+    public RaftConfig asWitness(int logRetain) {
+        return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                clientAuthConfig, true, logRetain);
     }
 
     private static String require(Properties props, String key) {
@@ -201,6 +235,22 @@ public final class RaftConfig {
      * node, {@link RaftNode}'s live membership governs instead.
      */
     public boolean isLearner() { return learner; }
+
+    /**
+     * Whether this node is a witness: a voting member that stores the log and has no
+     * state machine. Set via {@code node.witness=true}. Unlike {@code node.learner}
+     * this is a property of the node, not of the cluster configuration, and holds for
+     * as long as the node runs with it.
+     */
+    public boolean isWitness() { return witness; }
+
+    /**
+     * How many committed entries a witness keeps behind its commit index when it
+     * compacts ({@code witness.log.retain}, default {@value #DEFAULT_WITNESS_LOG_RETAIN}).
+     * This tail is all a witness can give a data node that fell behind: it has no
+     * snapshot to send. A data node further behind than this needs another data node.
+     */
+    public int witnessLogRetain() { return witnessLogRetain; }
 
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 

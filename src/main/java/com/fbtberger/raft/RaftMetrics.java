@@ -151,6 +151,13 @@ public final class RaftMetrics {
                                 .description("Snapshot boundary (last compacted index)").register(registry);
         }
 
+        /** 1 on a witness, 0 on a data node: which members of a cluster hold no state. */
+        public void registerWitnessGauge(Supplier<Number> witness) {
+                Gauge.builder("raft.node.witness", witness).tags(tags)
+                                .description("1 if this node is a witness (votes, stores the log, holds no state)")
+                                .register(registry);
+        }
+
         /**
          * How far each peer has got, as the leader sees it.
          *

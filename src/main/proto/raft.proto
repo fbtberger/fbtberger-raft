@@ -74,6 +74,9 @@ message LogEntry {
 // the same session next.
 message ClientSessionTable {
   repeated ClientSession sessions = 1;
+  // Set in the snapshots a witness writes when it compacts its log. Such a snapshot
+  // has no state in it, and a node that is not a witness must never start from one.
+  bool witness = 2;
 }
 
 message ClientSession {
@@ -181,6 +184,9 @@ message TimeoutNowRequest {
 }
 
 message TimeoutNowResponse {
+  // Set by a witness: it has no state machine, so it does not take the lead on
+  // request. The leader fails the transfer at once instead of waiting it out.
+  bool witness = 1;
 }
 
 // ReadIndex RPC (dissertation §6.4, "followers can also help offload the

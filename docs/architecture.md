@@ -335,6 +335,52 @@ node.submitCommand(cmd, "client-a", 7, 6).get(2, SECONDS);
 
 \newpage
 
+# 5.5 Witness Nodes
+
+![A witness carries a committed entry across](witness.png){width=85%}
+
+A witness is a voting member that stores the log and has no state machine
+(`node.witness=true`). It votes, acknowledges entries and counts toward every
+majority like any member. Two data nodes and a witness tolerate the loss of any one
+of the three, as three data nodes do, with the state stored twice instead of three
+times.
+
+**What a witness does not do.** It answers no client: writes, reads, follower reads
+and configuration changes are refused with the leader hint, so a client moves on.
+It does not take the lead on request (`TimeoutNow` is answered with `witness=true`,
+and the leader fails that transfer at once). `HealthCheck.serving()` is always DOWN
+on a witness; readiness is the question to ask it.
+
+**Why it still stands for election.** An entry is committed when two of three nodes
+hold it, and those two are as often the leader and the witness as the leader and
+the other data node. If the leader then fails, the surviving data node lacks an
+entry that the witness has. The witness rightly refuses it its vote (§5.4.1), and
+without a leader nothing would bring the entry across: two of three nodes up, and
+the cluster standing still. So a witness does campaign, three times later than a
+data node would, so that a data node that can win does so first. If it wins, it
+replicates its log to the data nodes and hands the lead to the first one that holds
+all of it. While it leads it serves nobody.
+
+**Log compaction.** There is no state to snapshot, so a witness only moves the point
+its log starts at, and it keeps `witness.log.retain` committed entries behind
+(default 10000): that tail is all it can give a data node that fell behind. A
+witness never sends `InstallSnapshot`, because what it stores as a snapshot is empty
+and would erase the receiver's state. A data node further behind than the retained
+tail needs another data node to catch up from. A witness that receives a snapshot
+keeps the boundary (index, term, configuration) and drops the payload.
+
+**Safeguard.** A directory a witness has compacted holds the tail of the log and no
+state for the rest. A node started on it without `node.witness=true` refuses to
+start and says so, instead of coming up with part of the state.
+
+**Limits.** Being a witness is a property of the node, not of the cluster
+configuration: other nodes learn it only from a refused `TimeoutNow`. With one
+data node left, that node has the only copy of the state until the other returns.
+Use at most as many witnesses as keep two data nodes in every majority you want to
+survive; the usual shape is two data nodes and one witness.
+
+\newpage
+
 # 6. Log Replication Pipeline
 
 ![Replication with Parallel Disk Writes and Pipelining](replication.png){width=85%}
@@ -607,4 +653,5 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.node.role` | Gauge | Current role (0=follower, 1=candidate, 2=leader) |
 | `raft.node.log.last.index` | Gauge | Index of the last log entry |
 | `raft.node.snapshot.index` | Gauge | Snapshot boundary (last compacted index) |
+| `raft.node.witness` | Gauge | 1 on a witness, 0 on a data node |
 | `raft.cluster.size` | Gauge | Number of nodes in configuration |

@@ -40,6 +40,10 @@ For a quick API reference, see the
     excluded from every majority) and is promoted to a voter only once caught up,
     so adding capacity never opens an availability gap
   - §4 errata fix (config changes rejected until leader's no-op commits)
+- **Witness nodes**: a voting member with a log and no state machine
+  (`node.witness=true`). Two data nodes and a witness survive the loss of any one
+  node with the state stored twice. A witness leads only to carry committed
+  entries to a data node and hands the lead over at once
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
   - Copy-on-write async snapshotting (§5.1): `prepareSnapshotWriter()` captures a
@@ -193,6 +197,8 @@ peer.node3=host3:9093
 snapshot.threshold=100          # entries before auto-snapshot
 snapshot.chunk.size=1048576     # InstallSnapshot chunk size (bytes)
 metrics.port=0                  # Prometheus endpoint (0 = disabled)
+node.witness=false              # true: vote and store the log, hold no state
+witness.log.retain=10000        # committed entries a witness keeps when it compacts
 
 # Per-RPC timeouts (ms)
 rpc.timeout.request.vote.ms=1000
@@ -299,6 +305,10 @@ open build/reports/jacoco/test/html/index.html
 
 ## Known limits
 
+- **Witness nodes**: a witness has no snapshot to send. A data node that is further
+  behind than `witness.log.retain` entries can only catch up from another data
+  node. Never start a data node on a directory a witness has used; the node
+  refuses to start in that case.
 - **Snapshot size**: one snapshot payload is at most 2 GiB (31-bit length word in
   the transfer format). State machines that only implement the array methods
   (`takeSnapshot`, `restoreSnapshot(byte[])`) still build their state as one array;

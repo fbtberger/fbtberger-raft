@@ -81,7 +81,9 @@ public final class RaftServer {
             if (line.equalsIgnoreCase("quit")) return;
             try {
                 if (line.equalsIgnoreCase("STATUS")) {
-                    System.out.println("role=" + raftNode.role() + " leader=" + raftNode.currentLeaderId()
+                    System.out.println("role=" + raftNode.role()
+                            + (raftNode.isWitness() ? " (witness)" : "")
+                            + " leader=" + raftNode.currentLeaderId()
                             + " configuration=" + raftNode.currentConfiguration().keySet()
                             + " learners=" + raftNode.currentLearners().keySet()
                             + " snapshotIndex=" + raftNode.snapshotIndex());
