@@ -122,8 +122,8 @@ public final class RaftMetrics {
                                 .tags(tags).description("Time to serialise a snapshot and compact the log").register(registry);
                 // The half nobody was measuring. StateMachine#prepareCowSnapshot runs under
                 // the Raft lock, and an implementation is free to serialise there rather
-                // than hand back a lazy supplier -- SqlCrudStateMachine does exactly that,
-                // deliberately, because deferring a read of a mutating table is worse. Under
+                // than hand back a lazy supplier -- one backed by a database table may do
+                // exactly that, because deferring a read of a mutating table is worse. Under
                 // the lock means heartbeats wait too, so this is the one part of taking a
                 // snapshot that can cost a node its leadership without touching a disk.
                 this.captureSnapshotTimer = Timer.builder("raft.snapshot.capture")

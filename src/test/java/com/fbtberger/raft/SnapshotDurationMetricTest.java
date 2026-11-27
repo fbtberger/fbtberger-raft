@@ -75,9 +75,9 @@ class SnapshotDurationMetricTest {
      * dangerous one.
      *
      * <p>{@code StateMachine#prepareCowSnapshot} is called with the lock held. The SPI asks
-     * implementations to be cheap there and permits them not to be:
-     * {@code SqlCrudStateMachine} reads its whole table, deliberately, because deferring a
-     * read of a mutating table is the worse mistake. Whatever it costs, heartbeats and votes
+     * implementations to be cheap there and permits them not to be: a state machine backed
+     * by a database table may read it whole, because deferring a read of a mutating table is
+     * the worse mistake. Whatever it costs, heartbeats and votes
      * wait for it -- so this is the only part of taking a snapshot that can depose a leader
      * without touching a disk, and until this timer it was the only part nobody measured.
      * {@code raft.snapshot.duration} starts after it, inside the executor.
