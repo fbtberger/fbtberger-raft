@@ -639,6 +639,27 @@ snapshot chunk per heartbeat (section 7).
 Metrics: `raft.client.overloaded{kind=write|read}` counts refusals,
 `raft.client.pending{kind=write|read}` shows what the limits are measured against.
 
+# 8.4 Deployment with Docker Compose
+
+![Three-node deployment](deploy.png){width=90%}
+
+`deploy/compose` describes the smallest complete deployment: three nodes and a
+Keycloak. It is the configuration the features of this section are meant to be run
+with, and each line of it is checked against the code by `ComposeDeploymentTest`.
+
+| Part | Choice | Why |
+|---|---|---|
+| Peers | mutual TLS, certificate CN = node id | the sender of every Raft message is checked against it |
+| Certificates | `certs.sh`, reload every 10 s | a renewal needs no restart (section 8.2) |
+| Clients | client certificate and Keycloak token | the client channel shares the peer port (section 8.1) |
+| Issuer | `KC_HOSTNAME` fixed, keys fetched in the cluster network | a token's `iss` must be the same for every caller |
+| Health | `/ready` per node as container health check | readiness is quorum-aware (section 11) |
+| Stdin | `-Draft.cli.enabled=false` | a container has no terminal; the end of stdin must not stop the node |
+| Data | one named volume per node | a restarted node catches up from its own log |
+
+The image is built from `config/Dockerfile` and the fat jar. The JVM is PID 1, so
+`docker stop` reaches it as SIGTERM and the node closes its storage.
+
 # 9. Storage Layer
 
 Three `RaftStorage` implementations are available:

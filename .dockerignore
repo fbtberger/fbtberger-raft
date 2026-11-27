@@ -1,0 +1,5 @@
+# The image needs the fat jar and config/ and nothing else. Without this file the whole
+# repository, .git and every build output included, is sent to the Docker daemon.
+*
+!config/
+!build/libs/*-all.jar

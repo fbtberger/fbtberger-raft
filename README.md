@@ -90,7 +90,8 @@ For a quick API reference, see the
   realm's keys, and one role per RPC (`raft-read` for Query, `raft-write` for
   Submit, `raft-admin` for membership changes and leadership transfer)
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
-- **Docker** deployment configuration
+- **Docker** deployment configuration, and a Compose file for a three-node cluster
+  with Keycloak and mutual TLS (`deploy/compose`)
 - **JaCoCo** test coverage reporting
 
 ## Project layout
@@ -287,6 +288,24 @@ quit             # shut down
 ./gradlew shadowJar
 docker build -f config/Dockerfile -t fbtberger-raft .
 ```
+
+Without a terminal attached (`docker run -d`, Compose, a service unit) start the node
+with `JAVA_OPTS=-Draft.cli.enabled=false`. Otherwise it stops when its stdin ends.
+
+### Three nodes with Docker Compose
+
+`deploy/compose` starts three nodes and a Keycloak: mutual TLS between peers, Keycloak
+tokens on the client channel, a health check and a Prometheus endpoint per node.
+
+```
+./gradlew shadowJar
+cd deploy/compose
+./certs.sh
+docker compose up --build -d
+```
+
+See `deploy/compose/README.md` for the client call, the accounts in the realm,
+certificate renewal without a restart and the witness variant.
 
 ## Metrics & JMX
 

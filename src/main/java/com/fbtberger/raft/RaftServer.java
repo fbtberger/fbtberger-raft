@@ -56,10 +56,29 @@ public final class RaftServer {
 
         Runtime.getRuntime().addShutdownHook(new Thread(ctx::close));
 
+        if (!cliEnabled()) {
+            // A container has no terminal: stdin is closed, the command loop below would
+            // read end-of-file at once and take the node down with it. Run until told to
+            // stop; the shutdown hook above does the closing.
+            LOG.info("[{}] command line disabled (raft.cli.enabled=false); running until terminated",
+                    config.selfId());
+            new java.util.concurrent.CountDownLatch(1).await();
+            return;
+        }
+
         runCli(raftNode, stateMachine,
                 new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)));
 
         ctx.close();
+    }
+
+    /**
+     * Whether the node reads commands from stdin. On unless {@code -Draft.cli.enabled=false}.
+     * Off is for anything that runs without a terminal -- a container, a service unit --
+     * where the end of stdin must not be the end of the node.
+     */
+    static boolean cliEnabled() {
+        return !"false".equalsIgnoreCase(System.getProperty("raft.cli.enabled", "true").trim());
     }
 
     /**

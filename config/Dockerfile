@@ -14,4 +14,10 @@ VOLUME /var/raft
 # through RAFT_CONFIG_PATH; the default here is only what a bare `docker run` gets.
 ENV RAFT_CONFIG_PATH=/app/config/node1.properties
 
-ENTRYPOINT ["sh", "-c", "java -jar /app/app.jar ${RAFT_CONFIG_PATH}"]
+# Extra JVM options, e.g. -Draft.cli.enabled=false for a container without a terminal
+# (docker run -d, docker compose): without it the node stops when stdin ends.
+ENV JAVA_OPTS=""
+
+# exec, so the JVM is PID 1 and receives SIGTERM: the node then closes its storage
+# before the container stops instead of being killed after the grace period.
+ENTRYPOINT ["sh", "-c", "exec java ${JAVA_OPTS} -jar /app/app.jar ${RAFT_CONFIG_PATH}"]

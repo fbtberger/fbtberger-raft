@@ -1,0 +1,47 @@
+@startuml
+!pragma layout smetana
+title Three-node deployment (deploy/compose)
+skinparam defaultFontSize 10
+
+actor "Client\n(RaftClient)" as C
+
+node "Docker host" {
+  node "keycloak" as KC {
+    component "Realm raft\nroles raft-read,\nraft-write, raft-admin" as REALM
+  }
+  node "raft-1" as N1 {
+    component "RaftNode node1" as R1
+    database "volume\nraft-1-data" as V1
+  }
+  node "raft-2" as N2 {
+    component "RaftNode node2" as R2
+    database "volume\nraft-2-data" as V2
+  }
+  node "raft-3" as N3 {
+    component "RaftNode node3\n(optionally a witness)" as R3
+    database "volume\nraft-3-data" as V3
+  }
+  folder "certs/ (read-only mount)\nca.crt, nodeN.crt, nodeN.key" as CERTS
+}
+
+C --> REALM : 1. token (8080)
+C --> R1 : 2. gRPC, mTLS + Bearer token\n(9091-9093)
+R1 <--> R2 : Raft RPCs, mTLS
+R2 <--> R3 : Raft RPCs, mTLS
+R1 <--> R3 : Raft RPCs, mTLS
+R1 ..> REALM : realm keys (JWKS)
+R2 ..> REALM
+R3 ..> REALM
+R1 --> V1
+R2 --> V2
+R3 --> V3
+CERTS ..> R1 : re-read every 10 s
+CERTS ..> R2
+CERTS ..> R3
+
+note bottom of N1
+  /ready, /health, /metrics
+  on 10091 (HTTPS)
+  container health check: /ready
+end note
+@enduml
