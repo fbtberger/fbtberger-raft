@@ -208,7 +208,26 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // §4.2.3 PreVote: timestamp of the last valid leader contact (heartbeat
     // or AppendEntries). A server only grants a PreVote if it hasn't heard
     // from a leader within the election timeout window.
-    private volatile long lastLeaderContactMs = 0;
+    //
+    // On the monotonic clock ({@link #nowMs()}), like every interval this class measures for
+    // an election or a lease: the wall clock can be set, and a step backwards would stretch
+    // "recently" by the size of the step. NEVER stands for "no contact yet".
+    private volatile long lastLeaderContactMs = NEVER;
+
+    /** Far enough in the past for any window, and far enough from the edge not to overflow. */
+    private static final long NEVER = Long.MIN_VALUE / 2;
+
+    /** Milliseconds on the monotonic clock. Good for differences only; it is not a time of day. */
+    private static long nowMs() {
+        return System.nanoTime() / 1_000_000;
+    }
+
+    /**
+     * Counts the AppendEntries requests this node has sent. A ReadIndex barrier notes the
+     * count when it is created and is confirmed only by answers to requests sent after it.
+     * Guarded by {@code lock}.
+     */
+    private long appendEntriesSent = 0;
 
     // §3.10: ongoing leadership transfer target, or null if none.
     private volatile String leaderTransferTarget = null;
@@ -233,7 +252,10 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // Linearizable reads (ReadIndex / Lease): pending read barriers awaiting
     // leadership confirmation from a majority of peers.
     private final List<ReadBarrier> pendingReadBarriers = new ArrayList<>();
-    // Lease-based reads: per-peer timestamp of last successful AppendEntries ack.
+    // Lease-based reads: per peer, when the latest AppendEntries it acknowledged was SENT
+    // (monotonic clock). Not when the answer arrived: the follower restarted its election
+    // timer no later than it answered, and nothing bounds how long the answer then travelled.
+    // Counting from the send is the one instant that is certainly not after the follower's.
     private final Map<String, Long> peerLastAckMs = new ConcurrentHashMap<>();
 
     // Joint consensus (§6): the old configuration during a C_old,new
@@ -365,12 +387,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 + ", snapshotIndex=" + store.getSnapshotIndex()
                 + ", configuration=" + currentConfiguration.keySet());
         // v122: treat startup as leader contact for stickiness purposes. The field initialises to
-        // 0, i.e. "last heard from a leader in 1970", so a node that had only just come up granted
+        // NEVER, i.e. "never heard from a leader", so a node that had only just come up granted
         // (pre-)votes to anyone before it had any chance to hear from the incumbent. During a
         // rolling restart that is the second grant. This does NOT delay our own campaign -- the
         // election timer is driven by resetElectionTimer() below, not by this field -- it only
         // stops us from unseating a leader we have not even listened for yet.
-        lastLeaderContactMs = System.currentTimeMillis();
+        lastLeaderContactMs = nowMs();
         resetElectionTimer();
     }
 
@@ -687,6 +709,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         electionEpoch.incrementAndGet();
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTask != null) heartbeatTask.cancel(false);
+        // Acknowledgements from an earlier term of ours say nothing about this one.
+        peerLastAckMs.clear();
 
         // §10.2.1: everything already in our log was written durably as a
         // follower/candidate, so our own disk match starts there.
@@ -789,7 +813,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         Long lastAck = peerLastAckMs.get(peerId);
         metrics.peerReplication(peerId, role,
                 matchIndex.getOrDefault(peerId, 0L),
-                lastAck == null ? -1L : System.currentTimeMillis() - lastAck);
+                lastAck == null ? -1L : nowMs() - lastAck);
     }
 
     private void appendPeerStatus(StringBuilder sb, String id, long lastLogIndex, String role) {
@@ -806,7 +830,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
           .append(" next=").append(next)
           .append(" inflight=").append(inflight)
           .append(" lastAck=").append(lastAck == null ? "never"
-                  : (System.currentTimeMillis() - lastAck) + "ms");
+                  : (nowMs() - lastAck) + "ms");
         if (match < lastLogIndex) sb.append(" LAGGING");
         String failure = peerLastFailure.get(id);
         if (failure != null) sb.append(" lastError=").append(failure);
@@ -918,7 +942,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 log("denied vote to " + request.getCandidateId() + " for term " + request.getTerm()
                         + " (stickiness: leader " + currentLeaderId + " still active"
                         + ", sinceLeaderContact=" + (role == ServerRole.LEADER
-                                ? "self" : (System.currentTimeMillis() - lastLeaderContactMs) + "ms")
+                                ? "self" : (nowMs() - lastLeaderContactMs) + "ms")
                         + "), term not adopted");
                 return RequestVoteResponse.newBuilder()
                         .setTerm(currentTerm).setVoteGranted(false).build();
@@ -996,7 +1020,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // 1970" and the incumbent granted the vote that unseated it. That was issue #2, and it
         // was the half of the defect that decided whether the restarting node won.
         if (role == ServerRole.LEADER) return true;
-        return System.currentTimeMillis() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
+        return nowMs() - lastLeaderContactMs < ELECTION_TIMEOUT_MIN_MS;
     }
 
     @Override
@@ -1020,7 +1044,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     + " (logOk=" + logOk + ", stickiness=" + sticky
                     + ", role=" + role
                     + ", sinceLeaderContact=" + (role == ServerRole.LEADER
-                            ? "self" : (System.currentTimeMillis() - lastLeaderContactMs) + "ms")
+                            ? "self" : (nowMs() - lastLeaderContactMs) + "ms")
                     + ")");
             return PreVoteResponse.newBuilder().setTerm(currentTerm).setVoteGranted(grant).build();
         } finally {
@@ -1075,7 +1099,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (prevTerm < 0 || prevTerm != request.getPrevLogTerm()) {
                     // A rejection IS healthy contact: we answered, and the leader will back off
                     // and retry from further back (§5.3).
-                    lastLeaderContactMs = System.currentTimeMillis();
+                    lastLeaderContactMs = nowMs();
                     // v118: tell the leader how far our log actually reaches. A wiped peer reports 0,
                     // so the leader can drop nextIndex to 1 (<= snapshotIndex) and switch to
                     // InstallSnapshot in a single round instead of pinning at a stale matchIndex.
@@ -1153,7 +1177,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 applyCommittedEntries();
             }
 
-            lastLeaderContactMs = System.currentTimeMillis();
+            lastLeaderContactMs = nowMs();
             return AppendEntriesResponse.newBuilder().setTerm(currentTerm).setSuccess(true).build();
         } finally {
             lock.unlock();
@@ -1185,7 +1209,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             }
             currentTerm = store.getCurrentTerm();
             currentLeaderId = request.getLeaderId();
-            lastLeaderContactMs = System.currentTimeMillis();
+            lastLeaderContactMs = nowMs();
             resetElectionTimer();
 
             if (request.getLastIncludedIndex() <= store.getSnapshotIndex()) {
@@ -1295,6 +1319,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
 
         long currentTerm = store.getCurrentTerm();
+        long sentAtMs = nowMs();
+        long sequence = ++appendEntriesSent;
         long prevLogIndex = peerNextIndex - 1;
         long prevLogTerm = Math.max(0, store.getTermAt(prevLogIndex));
 
@@ -1364,7 +1390,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             } else {
                 peerConsecutiveFailures.put(peerId, 0);   // the transport is healthy again
                 peerLastRebuildMs.remove(peerId);
-                handleAppendEntriesResponse(peerId, currentTerm, prevLogIndex, lastSentIndex, response);
+                handleAppendEntriesResponse(peerId, currentTerm, prevLogIndex, lastSentIndex,
+                        sentAtMs, sequence, response);
             }
         });
     }
@@ -1519,7 +1546,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     }
 
     private void handleAppendEntriesResponse(String peerId, long sentTerm, long prevLogIndex, long lastSentIndex,
-                                             AppendEntriesResponse response) {
+                                             long sentAtMs, long sequence, AppendEntriesResponse response) {
         lock.lock();
         try {
             peerInflight.merge(peerId, -1, Integer::sum);
@@ -1544,12 +1571,18 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     matchIndex.put(peerId, lastSentIndex);
                 }
                 advanceCommitIndex();
-                peerLastAckMs.put(peerId, System.currentTimeMillis());
+                peerLastAckMs.merge(peerId, sentAtMs, Math::max);
                 // §4.2.1: only a voting member's acknowledgement counts toward
                 // the leadership-confirmation majority behind a ReadIndex; a
                 // learner's ack must never help satisfy a read barrier.
                 if (isVotingMember(peerId)) {
-                    for (ReadBarrier rb : pendingReadBarriers) rb.confirm(peerId);
+                    // And only an answer to a request sent after the read arrived. An answer
+                    // to an earlier heartbeat shows we led when the follower handled it, which
+                    // was before the read; a successor may have been elected and committed a
+                    // write in between, and the read would miss it (§6.4).
+                    for (ReadBarrier rb : pendingReadBarriers) {
+                        if (sequence > rb.sentBefore) rb.confirm(peerId);
+                    }
                 }
                 checkReadBarriers();
                 if (peerId.equals(leaderTransferTarget)) {
@@ -2150,7 +2183,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientOverloaded(false);
                 return CompletableFuture.failedFuture(new OverloadedException("reads", pendingReadBarriers.size()));
             }
-            ReadBarrier barrier = new ReadBarrier(ri);
+            ReadBarrier barrier = new ReadBarrier(ri, appendEntriesSent);
             pendingReadBarriers.add(barrier);
             for (String peerId : peerTransports.keySet()) {
                 replicateTo(peerId);
@@ -2452,7 +2485,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * {@code isReadyToServe()}, a {@code leaseRead()}, and an UP health check.
      */
     private boolean hasValidLease() {
-        long now = System.currentTimeMillis();
+        long now = nowMs();
         long window = ELECTION_TIMEOUT_MIN_MS;
 
         java.util.Set<String> fresh = new java.util.HashSet<>();
@@ -2521,11 +2554,14 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      */
     private static final class ReadBarrier {
         final long readIndex;
+        /** How many AppendEntries had been sent when the read arrived; their answers do not count. */
+        final long sentBefore;
         final CompletableFuture<Long> future = new CompletableFuture<>();
         final java.util.Set<String> confirmed = ConcurrentHashMap.newKeySet();
 
-        ReadBarrier(long readIndex) {
+        ReadBarrier(long readIndex, long sentBefore) {
             this.readIndex = readIndex;
+            this.sentBefore = sentBefore;
         }
 
         void confirm(String peerId) { confirmed.add(peerId); }
@@ -2690,6 +2726,16 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                     }
                     result.completeExceptionally(new IllegalStateException(
                             targetId + " is a witness and cannot lead; choose a data node"));
+                } else if (t == null && resp != null && resp.getDeclined()) {
+                    // The target will not campaign: it does not follow this node. Without this
+                    // the answer looked like any other and the caller was told the target had
+                    // been asked to stand, while this node went on leading.
+                    if (targetId.equals(leaderTransferTarget)) {
+                        clearTransferLocked();
+                    }
+                    result.completeExceptionally(new IllegalStateException(
+                            targetId + " declined the transfer: it does not follow this node as its "
+                                    + "leader yet; retry"));
                 } else if (t != null && role == ServerRole.LEADER) {
                     // Nothing happened: release the block and let writes through again.
                     clearTransferLocked();
@@ -2719,7 +2765,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (!claimed.isEmpty() && !claimed.equals(currentLeaderId)) {
                 log("ignoring TimeoutNow from " + claimed + ": it is not the leader this node "
                         + "follows (" + currentLeaderId + ")");
-                return TimeoutNowResponse.getDefaultInstance();
+                return TimeoutNowResponse.newBuilder().setDeclined(true).build();
             }
             if (witness) {
                 log("declining TimeoutNow" + (claimed.isEmpty() ? "" : " from " + claimed)
