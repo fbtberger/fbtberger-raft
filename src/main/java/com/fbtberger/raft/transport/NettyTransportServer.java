@@ -106,7 +106,11 @@ public final class NettyTransportServer implements RaftTransportServer {
 
     @Override
     public void close() {
-        if (serverChannel != null) serverChannel.close();
+        // Wait for the listening socket to be released. close() on a channel only
+        // schedules the close, so a caller that closed this server and bound the same
+        // port straight away -- a restart in the same process, or the next test -- could
+        // lose the race and get "Address already in use" from a server that was "closed".
+        if (serverChannel != null) serverChannel.close().syncUninterruptibly();
         bossGroup.shutdownGracefully();
         workerGroup.shutdownGracefully();
     }
