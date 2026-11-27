@@ -8,12 +8,25 @@ import io.netty.handler.ssl.ClientAuth;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Properties;
 
 public final class TlsConfig {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TlsConfig.class);
+
+    /** How close to its expiry a node certificate has to be before startup says so. */
+    static final Duration EXPIRY_WARNING = Duration.ofDays(30);
 
     private final boolean enabled;
     private final File certFile;
@@ -35,7 +48,17 @@ public final class TlsConfig {
 
     public static TlsConfig fromProperties(Properties props) {
         boolean enabled = Boolean.parseBoolean(props.getProperty("tls.enabled", "false"));
-        if (!enabled) return disabled();
+        if (!enabled) {
+            // tls.mtls.enabled is only read when tls.enabled is true. Someone who set the one
+            // without the other asked for mutual authentication and gets plaintext, and until
+            // now nothing said so: the node came up, the cluster worked, and the flag was dead.
+            if (Boolean.parseBoolean(props.getProperty("tls.mtls.enabled", "false"))) {
+                LOG.warn("tls.mtls.enabled=true is IGNORED because tls.enabled=false: "
+                        + "the peer transport runs in plaintext, with no encryption and no "
+                        + "client certificates. Set tls.enabled=true to get mTLS.");
+            }
+            return disabled();
+        }
 
         File cert = new File(require(props, "tls.cert.path"));
         File key = new File(require(props, "tls.key.path"));
@@ -55,6 +78,74 @@ public final class TlsConfig {
     public File keyFile()        { return keyFile; }
     public File caFile()         { return caFile; }
     public boolean mtlsEnabled() { return mtlsEnabled; }
+
+    /**
+     * Says, once, at startup, what security a peer transport server actually came up with.
+     *
+     * <p>Before this, a node logged nothing about TLS at all. Whether a cluster was running
+     * plaintext, one-way TLS or mTLS could only be found out by reading its properties file or
+     * by pointing {@code openssl s_client} at it, and a misconfiguration that silently fell
+     * back to less (see {@link #fromProperties}) was invisible from the log. This line is the
+     * answer to "what is this node actually doing", stated by the node itself.
+     *
+     * <p>For TLS it also names the node certificate: its CN, because that is the identity peers
+     * bind the sender id to (see {@link PeerIdentity}), and its expiry, because an expired node
+     * certificate takes the node out of the cluster with nothing but handshake failures on the
+     * other side. Problems with the certificate are warned about, never thrown: building the SSL
+     * context is what decides whether the node can start, and it already fails loudly.
+     *
+     * @param transport     the transport's name, e.g. {@code "gRPC"} or {@code "Netty"}
+     * @param port          the port the server is bound to
+     * @param bindsSenderId whether that server compares the declared sender id against the
+     *                      certificate CN under mTLS
+     */
+    public void logStartup(String transport, int port, boolean bindsSenderId) {
+        logStartup(transport, port, bindsSenderId, Instant.now());
+    }
+
+    void logStartup(String transport, int port, boolean bindsSenderId, Instant now) {
+        if (!enabled) {
+            LOG.warn("Raft peer transport ({}) on port {}: PLAINTEXT (tls.enabled=false). Peer "
+                    + "traffic is neither encrypted nor authenticated.", transport, port);
+            return;
+        }
+        if (mtlsEnabled) {
+            LOG.info("Raft peer transport ({}) on port {}: mTLS, client certificates required, "
+                            + "sender id {} the certificate CN",
+                    transport, port, bindsSenderId ? "bound to" : "NOT bound to");
+        } else {
+            LOG.info("Raft peer transport ({}) on port {}: TLS, server-authenticated only "
+                    + "(tls.mtls.enabled=false). Peers present no certificate and their "
+                    + "sender ids are not checked.", transport, port);
+        }
+
+        X509Certificate cert;
+        try (InputStream in = new FileInputStream(certFile)) {
+            cert = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(in);
+        } catch (Exception e) {
+            LOG.warn("Raft peer transport ({}): could not read the node certificate {}: {}",
+                    transport, certFile, e.toString());
+            return;
+        }
+        String cn = PeerIdentity.fromCertificate(cert);
+        Instant notAfter = cert.getNotAfter().toInstant();
+        LOG.info("Raft peer transport ({}): node certificate CN={}, issuer {}, valid until {} "
+                        + "(cert={}, key={}, ca={})",
+                transport, cn, cert.getIssuerX500Principal().getName(), notAfter,
+                certFile, keyFile, caFile);
+
+        if (!notAfter.isAfter(now)) {
+            LOG.error("Raft peer transport ({}): the node certificate EXPIRED at {}. Peers will "
+                    + "refuse every handshake with this node.", transport, notAfter);
+        } else if (Duration.between(now, notAfter).compareTo(EXPIRY_WARNING) < 0) {
+            LOG.warn("Raft peer transport ({}): the node certificate expires at {}, in less than "
+                    + "{} days.", transport, notAfter, EXPIRY_WARNING.toDays());
+        }
+        if (mtlsEnabled && cn == null) {
+            LOG.warn("Raft peer transport ({}): the node certificate has no CN. Peers that bind "
+                    + "the sender id to the certificate will refuse this node's RPCs.", transport);
+        }
+    }
 
     /**
      * Explicitly {@link SslProvider#JDK} on both contexts below — found live on a real 3-node

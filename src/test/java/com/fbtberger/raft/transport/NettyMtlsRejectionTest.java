@@ -18,7 +18,6 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
-import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -41,11 +40,21 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@link GrpcTransportServer} builds its own through {@code GrpcSslContexts} and never touches
  * that method. {@code mtlsEnabled()} is honoured in both places, separately — so it can be
  * correct in one and wrong in the other.
+ *
+ * <p>Like the gRPC variant this is a test about <em>trust</em>, not identity: the legitimate and
+ * the rogue certificate carry the same node id and differ only in who signed them. Since the
+ * Netty server binds the sender id to the certificate CN, a certificate with an unrelated CN
+ * would be refused for that reason instead, and the test would stop saying anything about the CA.
+ * Identity is {@code NettyPeerIdentityBindingTest}'s subject.
  */
 class NettyMtlsRejectionTest {
 
-    private SelfSignedCertificate clusterCa;
-    private SelfSignedCertificate foreignCa;
+    private static final String LEADER_ID = "kwatro-1";
+
+    private TestPki clusterPki;
+    private TestPki foreignPki;
+    private TestPki.Node legitimate;
+    private TestPki.Node rogue;
     private CountingHandler handler;
     private NettyTransportServer server;
     private NioEventLoopGroup clientGroup;
@@ -53,8 +62,10 @@ class NettyMtlsRejectionTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        clusterCa = new SelfSignedCertificate("localhost");
-        foreignCa = new SelfSignedCertificate("localhost");
+        clusterPki = TestPki.create("kwatro-cluster-ca");
+        foreignPki = TestPki.create("some-other-ca");
+        legitimate = clusterPki.issue(LEADER_ID);
+        rogue = foreignPki.issue(LEADER_ID);
         handler = new CountingHandler();
         clientGroup = new NioEventLoopGroup(1);
         try (ServerSocket ss = new ServerSocket(0)) {
@@ -72,17 +83,16 @@ class NettyMtlsRejectionTest {
         if (clientGroup != null) {
             clientGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS);
         }
-        if (clusterCa != null) {
-            clusterCa.delete();
+        if (clusterPki != null) {
+            clusterPki.close();
         }
-        if (foreignCa != null) {
-            foreignCa.delete();
+        if (foreignPki != null) {
+            foreignPki.close();
         }
     }
 
     private TlsConfig clusterTls() {
-        return new TlsConfig(true, clusterCa.certificate(), clusterCa.privateKey(),
-                clusterCa.certificate(), true);
+        return legitimate.tls(clusterPki);
     }
 
     /** Control group — see the equivalent test in {@code GrpcMtlsRejectionTest} for why. */
@@ -107,8 +117,8 @@ class NettyMtlsRejectionTest {
     void rejectsPeerSignedByForeignCa() throws Exception {
         assertRejected(SslContextBuilder.forClient()
                 .sslProvider(SslProvider.JDK)
-                .keyManager(foreignCa.certificate(), foreignCa.privateKey())
-                .trustManager(clusterCa.certificate())
+                .keyManager(rogue.certFile(), rogue.keyFile())
+                .trustManager(clusterPki.caFile())
                 .build());
     }
 
@@ -117,18 +127,15 @@ class NettyMtlsRejectionTest {
     void rejectsPeerWithoutClientCertificate() throws Exception {
         assertRejected(SslContextBuilder.forClient()
                 .sslProvider(SslProvider.JDK)
-                .trustManager(clusterCa.certificate())
+                .trustManager(clusterPki.caFile())
                 .build());
     }
 
     /**
-     * As in the gRPC variant, the exception type is not pinned — and here there is a second
-     * reason beyond TLS 1.3 asynchrony: {@link NettyTransport} completes a pending future
-     * exceptionally only if the <em>write</em> listener fails. A write that is buffered by the
-     * SSL handler and then discarded when the connection dies can leave the future hanging, so a
-     * timeout is a plausible outcome. That is arguably a robustness gap in the transport (a
-     * closed channel should fail everything still pending), but it is a separate finding and
-     * deliberately not fixed here — this change adds no production code.
+     * As in the gRPC variant, the exception type is not pinned: under TLS 1.3 the rejection can
+     * surface as a failed handshake, a failed write or a closed connection. What is pinned is
+     * that it surfaces at all -- {@link NettyTransport} fails everything pending when the channel
+     * closes, so a timeout here would be a defect, not a plausible outcome.
      */
     private void assertRejected(SslContext rogueSsl) {
         NettyTransport client = new NettyTransport("localhost", port, clientGroup, rogueSsl);
@@ -136,8 +143,10 @@ class NettyMtlsRejectionTest {
             AppendEntriesResponse resp = client.appendEntries(appendEntries()).get(10, TimeUnit.SECONDS);
             fail("untrusted peer got a response from the Raft transport: success="
                     + resp.getSuccess() + " term=" + resp.getTerm());
+        } catch (java.util.concurrent.TimeoutException hung) {
+            fail("the request to a rejecting peer was still pending after 10s");
         } catch (Exception expected) {
-            // Any failure mode is acceptable here; see the javadoc above.
+            // Any other failure mode is acceptable here; see the javadoc above.
         } finally {
             client.close();
         }
@@ -148,7 +157,7 @@ class NettyMtlsRejectionTest {
     private static AppendEntriesRequest appendEntries() {
         return AppendEntriesRequest.newBuilder()
                 .setTerm(7)
-                .setLeaderId("kwatro-1")
+                .setLeaderId(LEADER_ID)
                 .setPrevLogIndex(0)
                 .setPrevLogTerm(0)
                 .build();

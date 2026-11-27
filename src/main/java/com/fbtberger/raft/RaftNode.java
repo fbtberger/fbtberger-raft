@@ -1970,7 +1970,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         log("target " + targetId + " is caught up, sending TimeoutNow");
         long currentTerm = store.getCurrentTerm();
         transport.timeoutNow(TimeoutNowRequest.newBuilder()
-                .setTerm(currentTerm).build()).whenComplete((resp, t) -> {
+                .setTerm(currentTerm).setLeaderId(config.selfId()).build()).whenComplete((resp, t) -> {
             lock.lock();
             try {
                 // The block on new commands stays up until the transfer is decided, not until
@@ -2022,7 +2022,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     public TimeoutNowResponse handleTimeoutNow(TimeoutNowRequest request) {
         lock.lock();
         try {
-            log("received TimeoutNow, starting immediate election");
+            // Only the leader this node follows may hand it the lead. The transport has already
+            // established, under mTLS, that the sender is who it says it is; this is the other
+            // half -- that who it is, is the leader. Without it a truthful non-leader (a learner
+            // with a perfectly valid certificate) could still make this node campaign.
+            //
+            // An empty id is a peer from before the field existed. It is let through here so a
+            // plaintext cluster can be upgraded node by node; on an mTLS cluster it never gets
+            // this far, because an empty claim does not match any certificate.
+            String claimed = request.getLeaderId();
+            if (!claimed.isEmpty() && !claimed.equals(currentLeaderId)) {
+                log("ignoring TimeoutNow from " + claimed + ": it is not the leader this node "
+                        + "follows (" + currentLeaderId + ")");
+                return TimeoutNowResponse.getDefaultInstance();
+            }
+            log("received TimeoutNow" + (claimed.isEmpty() ? "" : " from " + claimed)
+                    + ", starting immediate election");
             // The incumbent asked us to take over, so our RequestVotes must carry the transfer
             // flag -- every other voter still hears from that (very much alive) leader and would
             // otherwise refuse us on stickiness grounds.

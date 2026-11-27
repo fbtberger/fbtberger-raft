@@ -311,6 +311,15 @@ rpc.timeout.pre.vote.ms=1000
 authentication via `TlsConfig` (parsed from `.properties`). gRPC uses
 `GrpcSslContexts` with shaded Netty; raw Netty uses `SslContextBuilder`.
 
+Under mTLS both servers bind the sender id a message declares (`leaderId` /
+`candidateId`, on all five peer RPCs including `TimeoutNow`) to the CN of the
+client certificate, so a node certificate must be issued as `CN=<nodeId>` with
+the node's addresses as SANs. A mismatch is refused: `PERMISSION_DENIED` on
+gRPC, a closed connection on Netty. `TimeoutNowRequest.leaderId` was added for
+this; a peer that predates the field is refused on an mTLS cluster, so
+leadership transfers from a not-yet-upgraded leader fail during a rolling
+upgrade. Each server logs its mode and node certificate at startup.
+
 # 9. Storage Layer
 
 Three `RaftStorage` implementations are available:

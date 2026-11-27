@@ -30,14 +30,17 @@ import javax.net.ssl.SSLException;
 public final class GrpcTransportServer implements RaftTransportServer {
 
     private final Server server;
+    private final TlsConfig tlsConfig;
 
     public GrpcTransportServer(int port, RaftRpcHandler handler) {
+        this.tlsConfig = TlsConfig.disabled();
         this.server = ServerBuilder.forPort(port)
                 .addService(new RaftServiceAdapter(handler, false))
                 .build();
     }
 
     public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) throws SSLException {
+        this.tlsConfig = tlsConfig;
         if (!tlsConfig.enabled()) {
             this.server = ServerBuilder.forPort(port)
                     .addService(new RaftServiceAdapter(handler, false))
@@ -60,12 +63,14 @@ public final class GrpcTransportServer implements RaftTransportServer {
     }
 
     public GrpcTransportServer(ServerBuilder<?> builder, RaftRpcHandler handler) {
+        this.tlsConfig = TlsConfig.disabled();
         this.server = builder.addService(new RaftServiceAdapter(handler, false)).build();
     }
 
     @Override
     public void start() throws IOException {
         server.start();
+        tlsConfig.logStartup("gRPC", server.getPort(), tlsConfig.mtlsEnabled());
     }
 
     @Override
@@ -178,20 +183,25 @@ public final class GrpcTransportServer implements RaftTransportServer {
         }
 
         /**
-         * The one RPC that cannot be bound to its sender: {@code TimeoutNowRequest} carries a term
-         * and nothing else — no {@code leaderId}, no {@code candidateId}. There is no claimed
-         * identity to compare the certificate against, so the guard above does not apply here.
+         * Bound like the other four since {@code TimeoutNowRequest} carries a {@code leaderId}.
+         * It used to carry a term and nothing else, which left this the one RPC any
+         * cluster-certificate holder could send as anybody: TimeoutNow makes the receiver start
+         * an election immediately (§3.10), so repeated calls were a cheap way to keep a cluster
+         * churning.
          *
-         * <p>Stated rather than quietly skipped, because the omission is load-bearing. TimeoutNow
-         * makes the receiver start an election immediately (§3.10), so any cluster-certificate
-         * holder can provoke one, and repeated calls are a cheap way to keep a cluster churning —
-         * a **D** vector that survives this change. Closing it needs a sender field in the proto,
-         * which is a wire-format change and therefore its own deliberate step, not a side effect
-         * of adding certificate binding. Everything an attacker gains is bounded by what a term
-         * check already permits: a spurious election, not a forged log entry.
+         * <p>A request without the field -- a peer that predates it -- claims the empty id, which
+         * matches no certificate and is refused under mTLS. That is deliberate: accepting an
+         * absent sender would let an attacker opt out of the check by omitting it. The cost is
+         * that a leadership transfer from a not-yet-upgraded leader to an upgraded node fails
+         * during a rolling upgrade of an mTLS cluster; nothing else depends on this RPC.
+         *
+         * <p>The binding says the sender is who it claims to be. Whether that node is entitled to
+         * hand over the lead is the receiver's question, answered in
+         * {@code RaftNode.handleTimeoutNow}.
          */
         @Override
         public void timeoutNow(TimeoutNowRequest request, StreamObserver<TimeoutNowResponse> observer) {
+            if (!senderIsWhoItClaims("TimeoutNow", request.getLeaderId(), observer)) return;
             try {
                 observer.onNext(handler.handleTimeoutNow(request));
                 observer.onCompleted();

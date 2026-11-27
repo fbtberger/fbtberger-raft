@@ -143,6 +143,42 @@ class RequestVoteStickinessTest {
                 "every RequestVote from a TimeoutNow must be marked as a transfer");
     }
 
+    /**
+     * Only the leader this node follows may hand it the lead. The transport's certificate
+     * binding establishes that the sender is who it says it is; a truthful non-leader -- a
+     * learner with a perfectly valid certificate -- must still not be able to make this node
+     * campaign against a healthy leader.
+     */
+    @Test
+    void aTimeoutNowFromANodeThatIsNotTheLeaderIsIgnored() {
+        node.handleAppendEntries(heartbeatFrom("n2"));
+        long termBefore = store.getCurrentTerm();
+
+        node.handleTimeoutNow(TimeoutNowRequest.newBuilder().setTerm(1).setLeaderId("n3").build());
+
+        assertTrue(peers.voteRequests().isEmpty(), "a non-leader provoked an election");
+        assertEquals(termBefore, store.getCurrentTerm());
+    }
+
+    /** With no leader known at all there is nobody entitled to hand over. */
+    @Test
+    void aTimeoutNowFromANamedNodeIsIgnoredWhenNoLeaderIsKnown() {
+        node.handleTimeoutNow(TimeoutNowRequest.newBuilder().setTerm(1).setLeaderId("n3").build());
+
+        assertTrue(peers.voteRequests().isEmpty(), "an unknown node provoked an election");
+    }
+
+    /** The control: the check must not break the transfer it guards. */
+    @Test
+    void aTimeoutNowFromTheLeaderStartsTheElection() {
+        node.handleAppendEntries(heartbeatFrom("n2"));
+
+        node.handleTimeoutNow(TimeoutNowRequest.newBuilder().setTerm(1).setLeaderId("n2").build());
+
+        assertFalse(peers.voteRequests().isEmpty(), "the leader's TimeoutNow was ignored");
+        assertTrue(peers.voteRequests().stream().allMatch(RequestVoteRequest::getLeadershipTransfer));
+    }
+
     /** And the converse: an ordinary election must NOT claim to be a transfer. */
     @Test
     void anOrdinaryElectionDoesNotClaimToBeATransfer() {
@@ -160,6 +196,13 @@ class RequestVoteStickinessTest {
                 .setCandidateId(candidate).setTerm(term)
                 .setLastLogIndex(0).setLastLogTerm(0)
                 .setLeadershipTransfer(transfer)
+                .build();
+    }
+
+    private static AppendEntriesRequest heartbeatFrom(String leader) {
+        return AppendEntriesRequest.newBuilder()
+                .setTerm(1).setLeaderId(leader)
+                .setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0)
                 .build();
     }
 
