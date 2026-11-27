@@ -84,12 +84,16 @@ public final class NettyTransportServer implements RaftTransportServer {
                     .bind(port)
                     .sync()
                     .channel();
-            int bound = ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort();
-            tlsConfig.logStartup("Netty", bound, false);
+            tlsConfig.logStartup("Netty", boundPort(), false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("bind interrupted", e);
         }
+    }
+
+    /** The port actually bound, which differs from the one asked for when that was 0. */
+    int boundPort() {
+        return ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort();
     }
 
     @Override
