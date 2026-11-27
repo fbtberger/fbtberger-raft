@@ -45,39 +45,6 @@ public interface StateMachine {
     }
 
     /**
-     * Gives the state machine one look at a client command <em>on the leader</em>,
-     * before the command is appended to the log. What this returns is what gets
-     * appended, replicated and later handed to {@link #apply(long, byte[])} on every
-     * server -- including this one.
-     *
-     * <p>This is the only place a state machine may put something non-deterministic
-     * into a command. {@link #apply} runs on every server and must compute the same
-     * thing everywhere, so it cannot read a clock or draw a random number. The
-     * leader can: whatever it writes here is fixed in the log entry, and the
-     * followers replicate the value rather than recompute it.
-     *
-     * <p>Obligations on implementations:
-     * <ol>
-     *   <li><b>Be fast and do no I/O.</b> {@code RaftNode} calls this under the Raft
-     *       lock, between the leadership check and the append.</li>
-     *   <li><b>Do not change state.</b> The command is not committed yet and may
-     *       never be: a leader that loses its term discards uncommitted entries.
-     *       State changes belong in {@link #apply}.</li>
-     *   <li><b>Do not rely on being called.</b> It runs once per client submission
-     *       on the server that was leader at that moment, and never on replay. A
-     *       command that needed preparing and did not get it must be recognisable
-     *       as such in {@link #apply}.</li>
-     * </ol>
-     *
-     * <p>An exception thrown here fails the client's request and appends nothing.
-     * The default returns the command unchanged, which keeps this an additive
-     * change for every existing implementation.
-     */
-    default byte[] prepare(byte[] command) {
-        return command;
-    }
-
-    /**
      * Answers a read-only query against the current state, without going through
      * the log.
      *

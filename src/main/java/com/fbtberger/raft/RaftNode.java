@@ -1790,22 +1790,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (overloadedWithWritesLocked()) {
                 return failedFuture(new OverloadedException("commands", pendingClientRequests.size()));
             }
-            // Leader only, and before the append: the one point at which a state
-            // machine may fix a non-deterministic value into the command (see
-            // StateMachine#prepare). What it returns is what every server applies.
-            byte[] prepared;
-            try {
-                prepared = stateMachine.prepare(command);
-            } catch (RuntimeException e) {
-                metrics.clientRejected();
-                return failedFuture(e);
-            }
-            if (prepared == null) {
-                metrics.clientRejected();
-                return failedFuture(new IllegalStateException(
-                        stateMachine.getClass().getSimpleName() + ".prepare returned null"));
-            }
-            return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(prepared)));
+            return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(command)));
         } finally {
             lock.unlock();
         }
@@ -1854,23 +1839,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (overloadedWithWritesLocked()) {
                 return failedFuture(new OverloadedException("commands", pendingClientRequests.size()));
             }
-            // As in the untagged overload. A retry is prepared again and may be appended
-            // with other values than the first attempt; apply recognises it by its tag,
-            // returns the first result and never applies the second copy.
-            byte[] prepared;
-            try {
-                prepared = stateMachine.prepare(command);
-            } catch (RuntimeException e) {
-                metrics.clientRejected();
-                return failedFuture(e);
-            }
-            if (prepared == null) {
-                metrics.clientRejected();
-                return failedFuture(new IllegalStateException(
-                        stateMachine.getClass().getSimpleName() + ".prepare returned null"));
-            }
             return appendAndReplicateLocked(LogEntry.newBuilder()
-                    .setCommand(ByteString.copyFrom(prepared))
+                    .setCommand(ByteString.copyFrom(command))
                     .setClientId(clientId)
                     .setSequence(sequence)
                     .setAckedSequence(ackedSequence));
