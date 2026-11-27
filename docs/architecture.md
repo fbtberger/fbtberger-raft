@@ -25,7 +25,7 @@ The project implements:
 - **Linearizable reads**: ReadIndex protocol (`readIndex()`) and lease-based reads (`leaseRead()`) for zero-round-trip reads under stable leadership
 - **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid leader is active
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
-- **Copy-on-write snapshotting** (§5.1): `prepareCowSnapshot()` captures state under the lock; serialization runs on a background thread
+- **Copy-on-write, streaming snapshotting** (§5.1): `prepareSnapshotWriter()` captures state under the lock; a background thread streams it to disk, and it is sent and restored chunk by chunk
 - **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts and TLS/mTLS
 - **Storage**: BerkeleyDB JE, append-only WAL, or in-memory (pluggable via `RaftStorage`)
 - **Observability**: SLF4J/Logback logging, Micrometer metrics (Prometheus + JMX), health checks, JMX MBean
@@ -362,24 +362,47 @@ Three optimizations from §10.2 reduce latency:
 
 ![Chunked Snapshot Transfer](snapshot.png){width=85%}
 
-Snapshots are handled in two parts:
+A snapshot is a stream from the moment it is taken to the moment it is restored.
+No step holds the state machine's whole state as one array: the memory a snapshot
+costs is one chunk (default 1 MB), whatever the size of the state.
 
-**Taking snapshots (§5.1 COW)**: `StateMachine.prepareCowSnapshot()` captures a
-lightweight copy-on-write reference under the Raft lock (e.g. a shallow `HashMap`
-copy for `KeyValueStateMachine`). The returned `Supplier<byte[]>` is invoked on a
-background thread to serialize the snapshot and persist it — neither serialization
-nor disk I/O blocks the Raft lock. A staleness check prevents a background
+**Taking snapshots (§5.1 COW)**: `StateMachine.prepareSnapshotWriter()` captures the
+state under the Raft lock (a shallow `HashMap` copy for `KeyValueStateMachine`) and
+returns a `SnapshotWriter`. A background thread lets it write straight into the
+storage backend through `RaftStorage.beginSnapshot(index, term)`, so neither
+serialization nor disk I/O blocks the Raft lock. The backend writes a temporary
+file and makes it the stored snapshot only on `commit`; a snapshot that is not newer
+than the stored one is dropped there, which is what keeps a slow background
 snapshot from overwriting a more recent `InstallSnapshot`.
 
-**Transferring snapshots (§7, Figure 13)**: The leader packs the state machine
-data and cluster configuration into a single byte stream
-(`[4B smLen][smData][cfgData]`) and sends it in fixed-size chunks (default 1 MB).
-When the client session table (section 5.4) is not empty it travels too: the top
-bit of the length word is set and the layout becomes
+**Storing snapshots**: the payload is a file of its own in both durable backends.
+`WalStorage` keeps one `snapshot` file (metadata, then payload) and replaces it by
+rename. `BerkeleyDbStorage` keeps metadata in its database and the payload in
+`snapshots/snapshot-<index>.data`; a snapshot written by an older version, with the
+payload inside the database, is still read. Temporary files left by a crash are
+removed at start.
+
+**Transferring snapshots (§7, Figure 13)**: the leader sends the stream
+`[4B smLen][smData][cfgData]` in fixed-size chunks (default 1 MB), one per heartbeat
+cycle, reading each chunk from the file at its offset
+(`RaftStorage.readSnapshotData`). When the client session table (section 5.4) is not
+empty it travels too: the top bit of the length word is set and the layout becomes
 `[4B smLen|top bit][smData][4B cfgLen][cfgData][sessionData]`. With an empty table
-the bytes are exactly the two-payload format.
-One chunk is sent per heartbeat cycle. The follower buffers incoming chunks and
-applies the reassembled snapshot when the final chunk arrives (`done=true`).
+the bytes are exactly the two-payload format, and in both cases they are the bytes
+earlier versions sent, so old and new nodes exchange snapshots.
+The follower writes each chunk's payload to its own backend as it arrives and keeps
+only the configuration and session table in memory. When the final chunk arrives
+(`done=true`) it commits the file and restores the state machine from it with
+`StateMachine.restoreSnapshot(InputStream)`. A transfer that breaks off deletes its
+temporary file and changes nothing.
+
+**State machines** written against the array methods (`takeSnapshot`,
+`prepareCowSnapshot`, `restoreSnapshot(byte[])`) keep working: the streaming methods
+default to them. Such a state machine still builds its own array; overriding the
+three streaming methods removes that last copy.
+
+**Limit**: the length word leaves 31 bits, so one snapshot payload is at most
+2 GiB. A leader with a larger snapshot logs the reason and does not send it.
 
 \newpage
 
@@ -523,7 +546,8 @@ maximum size (default 64 MB); a new segment is started when the active segment
 exceeds the limit. An in-memory index (log index to segment + file offset) is
 rebuilt on recovery by scanning all segments sequentially; frames with CRC32
 mismatches are truncated. Metadata (term/vote) and snapshots are stored in
-separate files, atomically replaced via rename. Supports deferred fsync (§10.2.1)
+separate files, atomically replaced via rename; a snapshot is written and read as a
+stream (section 7). Supports deferred fsync (§10.2.1)
 via a background thread. Compaction deletes entire obsolete segments after a
 snapshot rather than rewriting.
 

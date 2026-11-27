@@ -26,6 +26,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -155,10 +157,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private final Map<String, SnapshotTransfer> snapshotTransfers = new ConcurrentHashMap<>();
 
     // Follower-side: buffer for reassembling incoming snapshot chunks.
-    private ByteArrayOutputStream pendingSnapshotBuffer;
-    private long pendingSnapshotIndex;
-    private long pendingSnapshotTerm;
-    private long pendingSnapshotExpectedOffset;
+    /** The snapshot this follower is currently receiving, chunk by chunk; null between transfers. */
+    private SnapshotReceiver snapshotReceiver;
 
     // The cluster membership currently in effect (§6): id -> "host:port",
     // including self. Always reflects the *latest* configuration entry in
@@ -298,9 +298,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // recomputeEffectiveConfiguration() needs the snapshot to already
         // be in place if the configuration entry it would otherwise scan
         // for has since been compacted away.
-        RaftStorage.Snapshot existingSnapshot = store.getSnapshot();
+        RaftStorage.SnapshotMeta existingSnapshot = store.getSnapshotMeta();
         if (existingSnapshot != null) {
-            stateMachine.restoreSnapshot(existingSnapshot.stateMachineData);
+            restoreStateMachineFromStoredSnapshot();
             clientSessions.restore(existingSnapshot.sessionData);
             lastApplied.set(existingSnapshot.lastIncludedIndex);
             commitIndex.set(Math.max(commitIndex.get(), existingSnapshot.lastIncludedIndex));
@@ -1065,49 +1065,54 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
             }
 
-            // Start a fresh buffer on offset 0 or when the snapshot identity changes.
+            // Start afresh on offset 0 or when the snapshot identity changes.
             if (request.getOffset() == 0
-                    || pendingSnapshotBuffer == null
-                    || pendingSnapshotIndex != request.getLastIncludedIndex()) {
-                pendingSnapshotBuffer = new ByteArrayOutputStream();
-                pendingSnapshotIndex = request.getLastIncludedIndex();
-                pendingSnapshotTerm = request.getLastIncludedTerm();
-                pendingSnapshotExpectedOffset = 0;
+                    || snapshotReceiver == null
+                    || snapshotReceiver.lastIncludedIndex != request.getLastIncludedIndex()) {
+                discardSnapshotReceiverLocked();
+                snapshotReceiver = new SnapshotReceiver(
+                        request.getLastIncludedIndex(), request.getLastIncludedTerm());
             }
 
-            if (request.getOffset() != pendingSnapshotExpectedOffset) {
-                pendingSnapshotBuffer = null;
+            if (request.getOffset() != snapshotReceiver.expectedOffset) {
+                discardSnapshotReceiverLocked();
                 return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
             }
 
-            byte[] chunkData = request.getData().toByteArray();
-            pendingSnapshotBuffer.write(chunkData, 0, chunkData.length);
-            pendingSnapshotExpectedOffset += chunkData.length;
-            metrics.snapshotChunkReceived();
+            SnapshotReceiver receiver = snapshotReceiver;
+            try {
+                // Straight to the storage backend's file. The only thing buffered is the
+                // few bytes of configuration and session table that follow the payload.
+                receiver.accept(request.getData());
+                metrics.snapshotChunkReceived();
 
-            if (request.getDone()) {
-                byte[] packed = pendingSnapshotBuffer.toByteArray();
-                pendingSnapshotBuffer = null;
+                if (request.getDone()) {
+                    snapshotReceiver = null;
+                    byte[] sessionData = receiver.commit();
+                    restoreStateMachineFromStoredSnapshot();
+                    // The table belongs to the same index as the state it sits beside.
+                    // Keeping our own would pair the leader's state with our older idea of
+                    // which commands produced it.
+                    clientSessions.restore(sessionData);
 
-                RaftStorage.Snapshot snapshot = unpackSnapshotData(
-                        pendingSnapshotIndex, pendingSnapshotTerm, packed);
+                    if (receiver.lastIncludedIndex > commitIndex.get()) {
+                        commitIndex.set(receiver.lastIncludedIndex);
+                    }
+                    lastApplied.set(Math.max(lastApplied.get(), receiver.lastIncludedIndex));
+                    recomputeEffectiveConfiguration();
 
-                store.saveSnapshotAndCompact(snapshot);
-                stateMachine.restoreSnapshot(snapshot.stateMachineData);
-                // The table belongs to the same index as the state it sits beside. Keeping
-                // our own would pair the leader's state with our older idea of which
-                // commands produced it.
-                clientSessions.restore(snapshot.sessionData);
-
-                if (snapshot.lastIncludedIndex > commitIndex.get()) {
-                    commitIndex.set(snapshot.lastIncludedIndex);
+                    metrics.snapshotInstalled();
+                    log("installed snapshot through index " + receiver.lastIncludedIndex
+                            + " (term " + receiver.lastIncludedTerm + ") from " + request.getLeaderId());
                 }
-                lastApplied.set(Math.max(lastApplied.get(), snapshot.lastIncludedIndex));
-                recomputeEffectiveConfiguration();
-
-                metrics.snapshotInstalled();
-                log("installed snapshot through index " + snapshot.lastIncludedIndex
-                        + " (term " + snapshot.lastIncludedTerm + ") from " + request.getLeaderId());
+            } catch (IOException e) {
+                // Nothing was committed: the stored snapshot and the log are as they were.
+                // Failing the RPC makes the leader send this chunk again, which no longer
+                // matches and so restarts the transfer from the beginning.
+                discardSnapshotReceiverLocked();
+                receiver.close();
+                throw new UncheckedIOException("could not store snapshot chunk at offset "
+                        + request.getOffset() + " of snapshot " + request.getLastIncludedIndex(), e);
             }
 
             return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
@@ -1267,13 +1272,17 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
 
         if (transfer == null) {
-            RaftStorage.Snapshot snapshot = store.getSnapshot();
+            RaftStorage.SnapshotMeta snapshot = store.getSnapshotMeta();
             if (snapshot == null) {
                 return;
             }
-            byte[] packed = packSnapshotData(snapshot.stateMachineData, snapshot.configurationData,
-                    snapshot.sessionData);
-            transfer = new SnapshotTransfer(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm, packed);
+            if (snapshot.dataLength > Integer.MAX_VALUE) {
+                logThrottled(peerId, "cannot send snapshot " + snapshot.lastIncludedIndex + " to " + peerId
+                        + ": its payload of " + snapshot.dataLength + " bytes exceeds the 2 GiB the "
+                        + "InstallSnapshot stream can describe");
+                return;
+            }
+            transfer = new SnapshotTransfer(snapshot);
             snapshotTransfers.put(peerId, transfer);
         }
 
@@ -1281,11 +1290,25 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             return;
         }
 
-        int offset = (int) transfer.nextOffset;
-        int chunkSize = config.snapshotChunkSize();
-        int remaining = transfer.data.length - offset;
-        int len = Math.min(chunkSize, remaining);
-        boolean done = (offset + len >= transfer.data.length);
+        long offset = transfer.nextOffset;
+        int len = (int) Math.min(config.snapshotChunkSize(), transfer.totalLength - offset);
+        boolean done = (offset + len >= transfer.totalLength);
+        byte[] chunk;
+        try {
+            // One chunk in memory at a time, read from the backend's file at the offset
+            // it belongs to. The snapshot as a whole is never assembled.
+            chunk = transfer.read(store, offset, len);
+        } catch (IOException e) {
+            logThrottled(peerId, "could not read snapshot " + transfer.lastIncludedIndex + " for "
+                    + peerId + ": " + e);
+            snapshotTransfers.remove(peerId);
+            return;
+        }
+        if (chunk == null) {
+            // A newer snapshot replaced the one being sent. Start over with it next round.
+            snapshotTransfers.remove(peerId);
+            return;
+        }
 
         long currentTerm = store.getCurrentTerm();
         InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
@@ -1294,7 +1317,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 .setLastIncludedIndex(transfer.lastIncludedIndex)
                 .setLastIncludedTerm(transfer.lastIncludedTerm)
                 .setOffset(offset)
-                .setData(ByteString.copyFrom(transfer.data, offset, len))
+                .setData(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
                 .setDone(done)
                 .build();
 
@@ -1562,7 +1585,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // because deferring a read of a mutating table is the worse mistake. Nothing said
         // how long that took.
         long captureStartNanos = System.nanoTime();
-        java.util.function.Supplier<byte[]> cowSnapshot = captureCowSnapshot();
+        StateMachine.SnapshotWriter cowSnapshot = captureCowSnapshot();
         metrics.captureSnapshotTimer().record(System.nanoTime() - captureStartNanos, TimeUnit.NANOSECONDS);
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
         // Serialised here, under the lock, and not in the background task below: the
@@ -1584,14 +1607,20 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 if (applied <= store.getSnapshotIndex()) {
                     return;
                 }
-                byte[] stateMachineData = cowSnapshot.get();
-                RaftStorage.Snapshot snapshot = new RaftStorage.Snapshot(
-                        applied, includedTerm, stateMachineData, configurationData, sessionData);
-                store.saveSnapshotAndCompact(snapshot);
+                // Written straight into the backend's file; the sink leaves the stored
+                // snapshot and the log alone until commit, and drops this one there if a
+                // newer snapshot was installed while it was being written.
+                try (RaftStorage.SnapshotSink sink = store.beginSnapshot(applied, includedTerm)) {
+                    cowSnapshot.writeTo(sink.stream());
+                    sink.commit(configurationData, sessionData);
+                } catch (IOException e) {
+                    logWarn("snapshot through index " + applied + " failed and was discarded: " + e);
+                    return;
+                }
                 metrics.snapshotTaken();
                 metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
-                log("snapshotted through index " + snapshot.lastIncludedIndex
-                        + " (term " + snapshot.lastIncludedTerm
+                log("snapshotted through index " + applied
+                        + " (term " + includedTerm
                         + "); log entries at or before it have been discarded");
             } finally {
                 snapshotInProgress = false;
@@ -1607,8 +1636,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * critical path. Implementations like {@code KeyValueStateMachine} do a
      * fast {@code new HashMap<>(data)} here instead of serializing.
      */
-    private java.util.function.Supplier<byte[]> captureCowSnapshot() {
-        return stateMachine.prepareCowSnapshot();
+    private StateMachine.SnapshotWriter captureCowSnapshot() {
+        return stateMachine.prepareSnapshotWriter();
     }
 
     /** Synchronous snapshot for {@link #snapshotNow()} — blocks until complete. */
@@ -1622,10 +1651,13 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         // Raft lock throughout. A measurement that only covered the background path would
         // report the cheaper case.
         long startNanos = System.nanoTime();
-        byte[] stateMachineData = stateMachine.takeSnapshot();
         byte[] configurationData = configProto(currentConfiguration, currentLearners).toByteArray();
-        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(applied, includedTerm, stateMachineData,
-                configurationData, clientSessions.toBytes()));
+        try (RaftStorage.SnapshotSink sink = store.beginSnapshot(applied, includedTerm)) {
+            stateMachine.writeSnapshot(sink.stream());
+            sink.commit(configurationData, clientSessions.toBytes());
+        } catch (IOException e) {
+            throw new UncheckedIOException("snapshot through index " + applied + " failed", e);
+        }
         metrics.snapshotTaken();
         metrics.takeSnapshotTimer().record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
         log("snapshotted through index " + applied + " (term " + includedTerm
@@ -2714,7 +2746,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return;
             }
         }
-        RaftStorage.Snapshot snapshot = store.getSnapshot();
+        RaftStorage.SnapshotMeta snapshot = store.getSnapshotMeta();
         if (snapshot != null && snapshot.configurationData.length > 0) {
             try {
                 applyConfigurationLocked(snapshotIndex, ClusterConfiguration.parseFrom(snapshot.configurationData));
@@ -2929,18 +2961,187 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     // Snapshot chunking helpers (§7, Figure 13)
     // ------------------------------------------------------------------
 
+    /**
+     * One snapshot on its way to one follower. Holds where the transfer stands and the
+     * few bytes that frame the payload -- never the payload, which stays in the storage
+     * backend and is read a chunk at a time.
+     *
+     * <p>What goes over the wire is the stream {@link #packSnapshotData} describes:
+     * {@code header | payload | trailer}.
+     */
     static final class SnapshotTransfer {
         final long lastIncludedIndex;
         final long lastIncludedTerm;
-        final byte[] data;
+        final byte[] header;
+        final long payloadLength;
+        final byte[] trailer;
+        final long totalLength;
         long nextOffset;
         boolean inFlight;
 
-        SnapshotTransfer(long lastIncludedIndex, long lastIncludedTerm, byte[] data) {
+        SnapshotTransfer(RaftStorage.SnapshotMeta snapshot) {
+            this.lastIncludedIndex = snapshot.lastIncludedIndex;
+            this.lastIncludedTerm = snapshot.lastIncludedTerm;
+            this.payloadLength = snapshot.dataLength;
+            this.header = snapshotHeader((int) snapshot.dataLength, snapshot.sessionData.length > 0);
+            this.trailer = snapshotTrailer(snapshot.configurationData, snapshot.sessionData);
+            this.totalLength = header.length + payloadLength + trailer.length;
+        }
+
+        /**
+         * The {@code length} bytes of the stream starting at {@code offset}, or null if the
+         * stored snapshot is no longer this one.
+         */
+        byte[] read(RaftStorage store, long offset, int length) throws IOException {
+            byte[] chunk = new byte[length];
+            int filled = 0;
+            while (filled < length) {
+                long at = offset + filled;
+                int want = length - filled;
+                if (at < header.length) {
+                    int n = (int) Math.min(want, header.length - at);
+                    System.arraycopy(header, (int) at, chunk, filled, n);
+                    filled += n;
+                } else if (at < header.length + payloadLength) {
+                    long payloadAt = at - header.length;
+                    int n = (int) Math.min(want, payloadLength - payloadAt);
+                    int read = store.readSnapshotData(lastIncludedIndex, payloadAt, chunk, filled, n);
+                    if (read < 0) {
+                        return null;
+                    }
+                    if (read != n) {
+                        throw new IOException("snapshot " + lastIncludedIndex + " is shorter than recorded: "
+                                + read + " of " + n + " bytes at offset " + payloadAt);
+                    }
+                    filled += n;
+                } else {
+                    long trailerAt = at - header.length - payloadLength;
+                    int n = (int) Math.min(want, trailer.length - trailerAt);
+                    System.arraycopy(trailer, (int) trailerAt, chunk, filled, n);
+                    filled += n;
+                }
+            }
+            return chunk;
+        }
+    }
+
+    /**
+     * The receiving end of {@link SnapshotTransfer}: takes the stream apart as it arrives.
+     * The payload goes to the storage backend's sink as it comes; only the header and the
+     * trailer, a few bytes of configuration and session table, are held here.
+     */
+    private final class SnapshotReceiver implements AutoCloseable {
+        final long lastIncludedIndex;
+        final long lastIncludedTerm;
+        long expectedOffset;
+
+        private final byte[] header = new byte[Integer.BYTES];
+        private int headerFilled;
+        private boolean hasSessions;
+        private long payloadLength;
+        private long payloadWritten;
+        private RaftStorage.SnapshotSink sink;
+        private final ByteArrayOutputStream trailer = new ByteArrayOutputStream();
+
+        SnapshotReceiver(long lastIncludedIndex, long lastIncludedTerm) {
             this.lastIncludedIndex = lastIncludedIndex;
             this.lastIncludedTerm = lastIncludedTerm;
-            this.data = data;
         }
+
+        void accept(ByteString data) throws IOException {
+            int position = 0;
+            int size = data.size();
+            while (position < size && headerFilled < header.length) {
+                header[headerFilled++] = data.byteAt(position++);
+            }
+            if (headerFilled == header.length && sink == null) {
+                int head = readInt(header, 0);
+                hasSessions = (head & SNAPSHOT_HAS_SESSIONS) != 0;
+                payloadLength = head & ~SNAPSHOT_HAS_SESSIONS;
+                sink = store.beginSnapshot(lastIncludedIndex, lastIncludedTerm);
+            }
+            if (sink != null && position < size) {
+                int toPayload = (int) Math.min(size - position, payloadLength - payloadWritten);
+                if (toPayload > 0) {
+                    data.substring(position, position + toPayload).writeTo(sink.stream());
+                    payloadWritten += toPayload;
+                    position += toPayload;
+                }
+                if (position < size) {
+                    data.substring(position).writeTo(trailer);
+                }
+            }
+            expectedOffset += size;
+        }
+
+        /** Makes the received snapshot the stored one and returns its session table. */
+        byte[] commit() throws IOException {
+            if (sink == null || payloadWritten != payloadLength) {
+                throw new IOException("snapshot " + lastIncludedIndex + " ended after " + payloadWritten
+                        + " of " + payloadLength + " payload bytes");
+            }
+            byte[] rest = trailer.toByteArray();
+            byte[] configurationData;
+            byte[] sessionData;
+            if (hasSessions) {
+                int configLength = readInt(rest, 0);
+                configurationData = Arrays.copyOfRange(rest, Integer.BYTES, Integer.BYTES + configLength);
+                sessionData = Arrays.copyOfRange(rest, Integer.BYTES + configLength, rest.length);
+            } else {
+                configurationData = rest;
+                sessionData = new byte[0];
+            }
+            try (RaftStorage.SnapshotSink committing = sink) {
+                committing.commit(configurationData, sessionData);
+            }
+            return sessionData;
+        }
+
+        @Override
+        public void close() {
+            if (sink != null) {
+                sink.close();
+            }
+        }
+    }
+
+    /** Drops a half-received snapshot and the temporary file behind it. Caller must hold {@code lock}. */
+    private void discardSnapshotReceiverLocked() {
+        if (snapshotReceiver != null) {
+            snapshotReceiver.close();
+            snapshotReceiver = null;
+        }
+    }
+
+    /** Replaces the state machine's state with the stored snapshot's, read as a stream. */
+    private void restoreStateMachineFromStoredSnapshot() {
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            if (in == null) {
+                throw new IllegalStateException("the storage backend reports a snapshot and has no data for it");
+            }
+            stateMachine.restoreSnapshot(in);
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not read the stored snapshot", e);
+        }
+    }
+
+    /** The four bytes that open the stream: payload length, top bit set if a session table follows. */
+    static byte[] snapshotHeader(int payloadLength, boolean withSessions) {
+        byte[] header = new byte[Integer.BYTES];
+        writeInt(header, 0, withSessions ? payloadLength | SNAPSHOT_HAS_SESSIONS : payloadLength);
+        return header;
+    }
+
+    /** What follows the payload: the configuration, length-prefixed and followed by the table if there is one. */
+    static byte[] snapshotTrailer(byte[] configurationData, byte[] sessionData) {
+        if (sessionData.length == 0) {
+            return configurationData;
+        }
+        byte[] trailer = new byte[Integer.BYTES + configurationData.length + sessionData.length];
+        writeInt(trailer, 0, configurationData.length);
+        System.arraycopy(configurationData, 0, trailer, Integer.BYTES, configurationData.length);
+        System.arraycopy(sessionData, 0, trailer, Integer.BYTES + configurationData.length, sessionData.length);
+        return trailer;
     }
 
     /**
@@ -2962,22 +3163,12 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
      * is free because a length is never negative.
      */
     static byte[] packSnapshotData(byte[] stateMachineData, byte[] configurationData, byte[] sessionData) {
-        boolean withSessions = sessionData.length > 0;
-        int cfgPrefix = withSessions ? 4 : 0;
-        byte[] packed = new byte[4 + stateMachineData.length + cfgPrefix
-                + configurationData.length + sessionData.length];
-        int head = withSessions ? stateMachineData.length | SNAPSHOT_HAS_SESSIONS : stateMachineData.length;
-        writeInt(packed, 0, head);
-        int at = 4;
-        System.arraycopy(stateMachineData, 0, packed, at, stateMachineData.length);
-        at += stateMachineData.length;
-        if (withSessions) {
-            writeInt(packed, at, configurationData.length);
-            at += 4;
-        }
-        System.arraycopy(configurationData, 0, packed, at, configurationData.length);
-        at += configurationData.length;
-        System.arraycopy(sessionData, 0, packed, at, sessionData.length);
+        byte[] header = snapshotHeader(stateMachineData.length, sessionData.length > 0);
+        byte[] trailer = snapshotTrailer(configurationData, sessionData);
+        byte[] packed = new byte[header.length + stateMachineData.length + trailer.length];
+        System.arraycopy(header, 0, packed, 0, header.length);
+        System.arraycopy(stateMachineData, 0, packed, header.length, stateMachineData.length);
+        System.arraycopy(trailer, 0, packed, header.length + stateMachineData.length, trailer.length);
         return packed;
     }
 

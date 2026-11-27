@@ -42,9 +42,11 @@ For a quick API reference, see the
   - §4 errata fix (config changes rejected until leader's no-op commits)
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
-  - Copy-on-write async snapshotting (§5.1): `prepareCowSnapshot()` captures a
+  - Copy-on-write async snapshotting (§5.1): `prepareSnapshotWriter()` captures a
     lightweight reference under the lock; serialization and disk I/O run on a
     background thread without blocking the Raft lock
+  - Streaming snapshots: written to disk, sent, received and restored chunk by
+    chunk, so a snapshot costs one chunk of memory whatever the size of the state
   - Independent per-server compaction with configurable threshold
 - **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
   implementations, with per-RPC configurable timeouts and TLS/mTLS support
@@ -292,6 +294,10 @@ open build/reports/jacoco/test/html/index.html
 
 ## Known limits
 
+- **Snapshot size**: one snapshot payload is at most 2 GiB (31-bit length word in
+  the transfer format). State machines that only implement the array methods
+  (`takeSnapshot`, `restoreSnapshot(byte[])`) still build their state as one array;
+  override the streaming methods to avoid that.
 - **Token revocation**: tokens are verified offline, so one revoked in Keycloak
   stays valid on the cluster until it expires. Keep access tokens short-lived.
 - **Local operator interfaces are not covered by Keycloak**: the interactive CLI

@@ -116,6 +116,102 @@ public interface RaftStorage extends AutoCloseable {
         }
     }
 
+    // ---- streaming snapshots -----------------------------------------
+    //
+    // The four methods below are how RaftNode reads and writes snapshots. Their
+    // defaults are built on getSnapshot()/saveSnapshotAndCompact(), so a backend
+    // that only implements those keeps working and holds the payload in memory;
+    // WalStorage and BerkeleyDbStorage override them and keep it in a file.
+
+    /** Everything about a snapshot except the state machine's bytes. */
+    final class SnapshotMeta {
+        public final long lastIncludedIndex;
+        public final long lastIncludedTerm;
+        public final byte[] configurationData;
+        public final byte[] sessionData;
+        /** Length in bytes of the state machine payload. */
+        public final long dataLength;
+
+        public SnapshotMeta(long lastIncludedIndex, long lastIncludedTerm, byte[] configurationData,
+                            byte[] sessionData, long dataLength) {
+            this.lastIncludedIndex = lastIncludedIndex;
+            this.lastIncludedTerm = lastIncludedTerm;
+            this.configurationData = configurationData;
+            this.sessionData = sessionData == null ? new byte[0] : sessionData;
+            this.dataLength = dataLength;
+        }
+    }
+
+    /**
+     * A snapshot being written. Write the state machine's bytes to {@link #stream()},
+     * then {@link #commit}; {@link #close()} without a commit discards what was written.
+     * Nothing about the stored snapshot or the log changes before {@code commit}.
+     */
+    interface SnapshotSink extends AutoCloseable {
+        java.io.OutputStream stream();
+
+        /**
+         * Makes this the stored snapshot and discards every log entry at or before its
+         * index, exactly as {@link #saveSnapshotAndCompact} does -- including that a
+         * snapshot not newer than the stored one is dropped.
+         */
+        void commit(byte[] configurationData, byte[] sessionData) throws java.io.IOException;
+
+        @Override
+        void close();
+    }
+
+    /** The stored snapshot without its payload, or null if there is none. Cheap. */
+    default SnapshotMeta getSnapshotMeta() {
+        Snapshot snapshot = getSnapshot();
+        return snapshot == null ? null : new SnapshotMeta(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm,
+                snapshot.configurationData, snapshot.sessionData, snapshot.stateMachineData.length);
+    }
+
+    /** Starts writing a snapshot that covers the log through {@code lastIncludedIndex}. */
+    default SnapshotSink beginSnapshot(long lastIncludedIndex, long lastIncludedTerm) throws java.io.IOException {
+        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        return new SnapshotSink() {
+            @Override public java.io.OutputStream stream() { return buffer; }
+
+            @Override public void commit(byte[] configurationData, byte[] sessionData) {
+                saveSnapshotAndCompact(new Snapshot(lastIncludedIndex, lastIncludedTerm,
+                        buffer.toByteArray(), configurationData, sessionData));
+            }
+
+            @Override public void close() { }
+        };
+    }
+
+    /**
+     * The stored snapshot's state machine payload as a stream, or null if there is no
+     * snapshot. The caller closes it. The stream stays valid if a newer snapshot is
+     * stored while it is being read.
+     */
+    default java.io.InputStream openSnapshotData() throws java.io.IOException {
+        Snapshot snapshot = getSnapshot();
+        return snapshot == null ? null : new java.io.ByteArrayInputStream(snapshot.stateMachineData);
+    }
+
+    /**
+     * Reads part of the stored snapshot's payload: up to {@code length} bytes from
+     * {@code offset} into {@code target}. This is what a leader sends a follower one
+     * chunk at a time.
+     *
+     * @return the number of bytes read, or -1 if the stored snapshot is no longer the one
+     *         at {@code lastIncludedIndex} -- the transfer then starts over with the new one
+     */
+    default int readSnapshotData(long lastIncludedIndex, long offset, byte[] target, int targetOffset, int length)
+            throws java.io.IOException {
+        Snapshot snapshot = getSnapshot();
+        if (snapshot == null || snapshot.lastIncludedIndex != lastIncludedIndex) {
+            return -1;
+        }
+        int available = (int) Math.max(0, Math.min(length, snapshot.stateMachineData.length - offset));
+        System.arraycopy(snapshot.stateMachineData, (int) offset, target, targetOffset, available);
+        return available;
+    }
+
     /** The lastIncludedIndex of the most recently saved snapshot, or 0 if this server has never taken or installed one. Cheap -- prefer this over {@link #getSnapshot()} when only the boundary is needed. */
     long getSnapshotIndex();
 

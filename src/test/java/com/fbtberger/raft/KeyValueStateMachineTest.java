@@ -230,4 +230,47 @@ class KeyValueStateMachineTest {
         assertThrows(IllegalArgumentException.class,
                 () -> sm.restoreSnapshot(new byte[]{0, 0, 0, 10, 'x'})); // count=10 but no data
     }
+
+    @Test
+    void theStreamedSnapshotIsTheSameSnapshotAsTheArray() throws Exception {
+        KeyValueStateMachine sm = new KeyValueStateMachine();
+        sm.apply("SET a 1".getBytes());
+        sm.apply("SET b 2".getBytes());
+
+        java.io.ByteArrayOutputStream direct = new java.io.ByteArrayOutputStream();
+        sm.writeSnapshot(direct);
+        java.io.ByteArrayOutputStream captured = new java.io.ByteArrayOutputStream();
+        sm.prepareSnapshotWriter().writeTo(captured);
+
+        // Either form restores into either form: a node upgraded between taking a
+        // snapshot and restoring it must not care which one wrote it.
+        KeyValueStateMachine fromStream = new KeyValueStateMachine();
+        fromStream.restoreSnapshot(new java.io.ByteArrayInputStream(sm.takeSnapshot()));
+        KeyValueStateMachine fromArray = new KeyValueStateMachine();
+        fromArray.restoreSnapshot(direct.toByteArray());
+        KeyValueStateMachine fromCaptured = new KeyValueStateMachine();
+        fromCaptured.restoreSnapshot(captured.toByteArray());
+
+        for (KeyValueStateMachine restored : java.util.List.of(fromStream, fromArray, fromCaptured)) {
+            org.junit.jupiter.api.Assertions.assertEquals("1", restored.get("a"));
+            org.junit.jupiter.api.Assertions.assertEquals("2", restored.get("b"));
+        }
+    }
+
+    @Test
+    void aCapturedWriterDoesNotSeeLaterWrites() throws Exception {
+        KeyValueStateMachine sm = new KeyValueStateMachine();
+        sm.apply("SET a 1".getBytes());
+        StateMachine.SnapshotWriter writer = sm.prepareSnapshotWriter();
+        sm.apply("SET a 2".getBytes());
+        sm.apply("SET b 3".getBytes());
+
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        writer.writeTo(out);
+        KeyValueStateMachine restored = new KeyValueStateMachine();
+        restored.restoreSnapshot(new java.io.ByteArrayInputStream(out.toByteArray()));
+
+        org.junit.jupiter.api.Assertions.assertEquals("1", restored.get("a"));
+        org.junit.jupiter.api.Assertions.assertNull(restored.get("b"));
+    }
 }

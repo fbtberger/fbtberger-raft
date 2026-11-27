@@ -68,6 +68,20 @@ public class MyStateMachine
     var copy = shallowCopy(state); // fast
     return () -> serialize(copy);  // lazy
   }
+
+  // Optional streaming overrides: no array
+  // of the whole state, ever.
+  @Override
+  public SnapshotWriter prepareSnapshotWriter() {
+    var copy = shallowCopy(state);
+    return out -> writeTo(copy, out);
+  }
+
+  @Override
+  public void restoreSnapshot(InputStream in)
+      throws IOException {
+    state = readFrom(in);
+  }
 }
 ```
 

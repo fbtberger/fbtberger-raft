@@ -107,6 +107,43 @@ public final class KeyValueStateMachine implements StateMachine {
         return () -> serialize(copy);
     }
 
+    /**
+     * The streaming forms. Same bytes as {@link #takeSnapshot()}, written entry by entry,
+     * so a snapshot of this map never exists as one array on its way to or from disk.
+     */
+    @Override
+    public void writeSnapshot(java.io.OutputStream out) throws IOException {
+        write(new HashMap<>(data), out);
+    }
+
+    @Override
+    public SnapshotWriter prepareSnapshotWriter() {
+        Map<String, String> copy = new HashMap<>(data);
+        return out -> write(copy, out);
+    }
+
+    @Override
+    public void restoreSnapshot(java.io.InputStream in) throws IOException {
+        DataInputStream dis = new DataInputStream(new java.io.BufferedInputStream(in));
+        int count = dis.readInt();
+        Map<String, String> restored = new HashMap<>();
+        for (int i = 0; i < count; i++) {
+            restored.put(dis.readUTF(), dis.readUTF());
+        }
+        data.clear();
+        data.putAll(restored);
+    }
+
+    private static void write(Map<String, String> map, java.io.OutputStream out) throws IOException {
+        DataOutputStream dos = new DataOutputStream(new java.io.BufferedOutputStream(out));
+        dos.writeInt(map.size());
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            dos.writeUTF(entry.getKey());
+            dos.writeUTF(entry.getValue());
+        }
+        dos.flush();
+    }
+
     private static byte[] serialize(Map<String, String> map) {
         try {
             ByteArrayOutputStream out = new ByteArrayOutputStream();

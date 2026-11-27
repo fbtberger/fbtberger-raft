@@ -18,6 +18,8 @@ import com.sleepycat.je.OperationStatus;
 import com.sleepycat.je.Transaction;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -46,6 +48,10 @@ public final class BerkeleyDbStorage implements RaftStorage {
     // Absent in an environment written before client sessions existed; readBytes turns
     // that into an empty table, which is exactly what such a snapshot holds.
     private static final byte[] KEY_SNAPSHOT_SESSIONS = "snapshotSessions".getBytes(StandardCharsets.UTF_8);
+    // Name of the file under snapshots/ that holds the payload. Absent for a snapshot
+    // stored before payloads moved out of the database: that one is still the value of
+    // KEY_SNAPSHOT_STATE and is read from there until the next snapshot replaces it.
+    private static final byte[] KEY_SNAPSHOT_FILE = "snapshotFile".getBytes(StandardCharsets.UTF_8);
 
     private final Environment env;
     private final Database metaDb; // currentTerm, votedFor, snapshot metadata + payload
@@ -62,9 +68,23 @@ public final class BerkeleyDbStorage implements RaftStorage {
     private volatile long snapshotIndex;
     private volatile long snapshotTerm;
 
+    /**
+     * Where snapshot payloads live. Beside the database, not in it: a payload is one large
+     * value that is written once and read sequentially, which is what a file is for, and
+     * as a database value it could only ever be read and written as a single array.
+     */
+    private final File snapshotDir;
+    /** The current payload file's name, or null while the payload is still a database value. */
+    private volatile String snapshotFileName;
+    private final java.util.concurrent.atomic.AtomicLong snapshotTmpCounter = new java.util.concurrent.atomic.AtomicLong();
+
     public BerkeleyDbStorage(File dataDir) {
         if (!dataDir.exists() && !dataDir.mkdirs()) {
             throw new IllegalStateException("could not create data dir: " + dataDir);
+        }
+        this.snapshotDir = new File(dataDir, "snapshots");
+        if (!snapshotDir.exists() && !snapshotDir.mkdirs()) {
+            throw new IllegalStateException("could not create snapshot dir: " + snapshotDir);
         }
         EnvironmentConfig envConfig = new EnvironmentConfig();
         envConfig.setAllowCreate(true);
@@ -92,6 +112,16 @@ public final class BerkeleyDbStorage implements RaftStorage {
     private void recoverSnapshotBounds() {
         this.snapshotIndex = readLong(KEY_SNAPSHOT_INDEX);
         this.snapshotTerm = readLong(KEY_SNAPSHOT_TERM);
+        byte[] fileName = readBytes(KEY_SNAPSHOT_FILE);
+        this.snapshotFileName = fileName.length == 0 ? null : new String(fileName, StandardCharsets.UTF_8);
+        // Whatever else is in the directory was never committed: a payload whose
+        // transaction did not happen, or a temporary file from a write that died.
+        File[] files = snapshotDir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (!file.getName().equals(snapshotFileName)) file.delete();
+            }
+        }
     }
 
     private void recoverCachedLogBounds() {
@@ -285,20 +315,124 @@ public final class BerkeleyDbStorage implements RaftStorage {
     @Override
     public synchronized Snapshot getSnapshot() {
         if (snapshotIndex == 0) return null;
-        byte[] stateData = readBytes(KEY_SNAPSHOT_STATE);
+        byte[] stateData;
+        if (snapshotFileName == null) {
+            stateData = readBytes(KEY_SNAPSHOT_STATE);
+        } else {
+            try {
+                stateData = java.nio.file.Files.readAllBytes(payloadFile().toPath());
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
         byte[] configData = readBytes(KEY_SNAPSHOT_CONFIG);
         return new Snapshot(snapshotIndex, snapshotTerm, stateData, configData, readBytes(KEY_SNAPSHOT_SESSIONS));
     }
 
+    private File payloadFile() {
+        return new File(snapshotDir, snapshotFileName);
+    }
+
+    @Override
+    public synchronized SnapshotMeta getSnapshotMeta() {
+        if (snapshotIndex == 0) return null;
+        long length = snapshotFileName == null ? readBytes(KEY_SNAPSHOT_STATE).length : payloadFile().length();
+        return new SnapshotMeta(snapshotIndex, snapshotTerm, readBytes(KEY_SNAPSHOT_CONFIG),
+                readBytes(KEY_SNAPSHOT_SESSIONS), length);
+    }
+
+    @Override
+    public synchronized java.io.InputStream openSnapshotData() throws IOException {
+        if (snapshotIndex == 0) return null;
+        if (snapshotFileName == null) {
+            return new java.io.ByteArrayInputStream(readBytes(KEY_SNAPSHOT_STATE));
+        }
+        // Stays readable if a newer snapshot replaces this one meanwhile: deleting the old
+        // file removes its name, not the data this descriptor is reading.
+        return new java.io.BufferedInputStream(new java.io.FileInputStream(payloadFile()), 1 << 16);
+    }
+
+    @Override
+    public synchronized int readSnapshotData(long lastIncludedIndex, long offset, byte[] target,
+                                             int targetOffset, int length) throws IOException {
+        if (snapshotIndex == 0 || snapshotIndex != lastIncludedIndex) {
+            return -1;
+        }
+        if (snapshotFileName == null) {
+            byte[] inline = readBytes(KEY_SNAPSHOT_STATE);
+            int available = (int) Math.max(0, Math.min(length, inline.length - offset));
+            System.arraycopy(inline, (int) offset, target, targetOffset, available);
+            return available;
+        }
+        try (java.io.RandomAccessFile file = new java.io.RandomAccessFile(payloadFile(), "r")) {
+            int available = (int) Math.max(0, Math.min(length, file.length() - offset));
+            if (available == 0) return 0;
+            file.seek(offset);
+            file.readFully(target, targetOffset, available);
+            return available;
+        }
+    }
+
+    @Override
+    public void saveSnapshotAndCompact(Snapshot snapshot) {
+        try (SnapshotSink sink = beginSnapshot(snapshot.lastIncludedIndex, snapshot.lastIncludedTerm)) {
+            sink.stream().write(snapshot.stateMachineData);
+            sink.commit(snapshot.configurationData, snapshot.sessionData);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     /**
-     * Persists the snapshot's metadata and payload, then -- in the same
-     * transaction, so the two never disagree even across a crash -- deletes
-     * every log entry at or before {@code snapshot.lastIncludedIndex}. Any
+     * Writes the payload to a temporary file under {@code snapshots/}. At commit that file
+     * is made durable and given its final name, and only then does the transaction name it
+     * as the snapshot and delete the log prefix -- so the database never points at a file
+     * that is not completely on disk. A crash between the two leaves an unreferenced file,
+     * which the next start removes.
+     */
+    @Override
+    public SnapshotSink beginSnapshot(long lastIncludedIndex, long lastIncludedTerm) throws IOException {
+        File tmp = new File(snapshotDir, "snapshot-" + lastIncludedIndex + "-"
+                + snapshotTmpCounter.incrementAndGet() + ".tmp");
+        java.io.FileOutputStream file = new java.io.FileOutputStream(tmp);
+        java.io.OutputStream payload = new java.io.BufferedOutputStream(file, 1 << 16);
+        return new SnapshotSink() {
+            private boolean finished;
+
+            @Override public java.io.OutputStream stream() { return payload; }
+
+            @Override
+            public void commit(byte[] configurationData, byte[] sessionData) throws IOException {
+                payload.flush();
+                file.getFD().sync();
+                file.close();
+                finished = true;
+                install(tmp, lastIncludedIndex, lastIncludedTerm, configurationData, sessionData);
+            }
+
+            @Override
+            public void close() {
+                if (finished) return;
+                finished = true;
+                try {
+                    file.close();
+                } catch (IOException ignored) {
+                    // the file is being thrown away
+                }
+                tmp.delete();
+            }
+        };
+    }
+
+    /**
+     * Makes the payload in {@code tmp} the stored snapshot, then -- in one
+     * transaction, so metadata and log never disagree even across a crash -- records
+     * it and deletes every log entry at or before {@code lastIncludedIndex}. Any
      * entries already in the log beyond that index are left exactly as they
      * were; only a prefix is ever discarded.
      */
-    @Override
-    public synchronized void saveSnapshotAndCompact(Snapshot snapshot) {
+    private synchronized void install(File tmp, long lastIncludedIndex, long lastIncludedTerm,
+                                      byte[] configurationData, byte[] sessionData) throws IOException {
         // One transaction, and the monitor held throughout. Splitting the deletion into
         // batches with the monitor released between them was tried and measured on the Pi
         // cluster: at a threshold of 20000 the snapshot went from 450 ms to 760 ms -- forty
@@ -316,22 +450,30 @@ public final class BerkeleyDbStorage implements RaftStorage {
         // (e.g. one just installed by InstallSnapshot after a step-down/
         // re-election) landed in between, that stale save is dropped here rather
         // than overwriting the higher boundary and rewinding compaction.
-        if (snapshotIndex != 0 && snapshot.lastIncludedIndex <= snapshotIndex) {
+        if (snapshotIndex != 0 && lastIncludedIndex <= snapshotIndex) {
+            tmp.delete();
             return;
         }
+        // Durable and under its final name before the transaction refers to it.
+        String fileName = "snapshot-" + lastIncludedIndex + ".data";
+        java.nio.file.Files.move(tmp.toPath(), new File(snapshotDir, fileName).toPath(),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         Transaction txn = env.beginTransaction(null, null);
         try {
-            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_INDEX), new DatabaseEntry(longToBytes(snapshot.lastIncludedIndex)));
-            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_TERM), new DatabaseEntry(longToBytes(snapshot.lastIncludedTerm)));
-            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_STATE), new DatabaseEntry(snapshot.stateMachineData));
-            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_CONFIG), new DatabaseEntry(snapshot.configurationData));
-            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_SESSIONS), new DatabaseEntry(snapshot.sessionData));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_INDEX), new DatabaseEntry(longToBytes(lastIncludedIndex)));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_TERM), new DatabaseEntry(longToBytes(lastIncludedTerm)));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_FILE),
+                    new DatabaseEntry(fileName.getBytes(StandardCharsets.UTF_8)));
+            // An older snapshot may still have its payload in here as a value.
+            metaDb.delete(txn, new DatabaseEntry(KEY_SNAPSHOT_STATE));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_CONFIG), new DatabaseEntry(configurationData));
+            metaDb.put(txn, new DatabaseEntry(KEY_SNAPSHOT_SESSIONS), new DatabaseEntry(sessionData));
 
             try (Cursor cursor = logDb.openCursor(txn, null)) {
                 DatabaseEntry key = new DatabaseEntry();
                 DatabaseEntry value = new DatabaseEntry();
                 OperationStatus status = cursor.getFirst(key, value, LockMode.DEFAULT);
-                while (status == OperationStatus.SUCCESS && bytesToLong(key.getData()) <= snapshot.lastIncludedIndex) {
+                while (status == OperationStatus.SUCCESS && bytesToLong(key.getData()) <= lastIncludedIndex) {
                     cursor.delete();
                     status = cursor.getNext(key, value, LockMode.DEFAULT);
                 }
@@ -341,13 +483,18 @@ public final class BerkeleyDbStorage implements RaftStorage {
             txn.abort();
             throw e;
         }
-        this.snapshotIndex = snapshot.lastIncludedIndex;
-        this.snapshotTerm = snapshot.lastIncludedTerm;
-        if (lastLogIndex <= snapshot.lastIncludedIndex) {
+        String previousFile = this.snapshotFileName;
+        this.snapshotFileName = fileName;
+        if (previousFile != null && !previousFile.equals(fileName)) {
+            new File(snapshotDir, previousFile).delete();
+        }
+        this.snapshotIndex = lastIncludedIndex;
+        this.snapshotTerm = lastIncludedTerm;
+        if (lastLogIndex <= lastIncludedIndex) {
             // Nothing was left beyond the snapshot boundary -- it's now the
             // effective "last entry" until something new is appended.
-            this.lastLogIndex = snapshot.lastIncludedIndex;
-            this.lastLogTerm = snapshot.lastIncludedTerm;
+            this.lastLogIndex = lastIncludedIndex;
+            this.lastLogTerm = lastIncludedTerm;
         }
     }
 
