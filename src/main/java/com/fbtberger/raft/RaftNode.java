@@ -1738,7 +1738,22 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
             }
-            return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(command)));
+            // Leader only, and before the append: the one point at which a state
+            // machine may fix a non-deterministic value into the command (see
+            // StateMachine#prepare). What it returns is what every server applies.
+            byte[] prepared;
+            try {
+                prepared = stateMachine.prepare(command);
+            } catch (RuntimeException e) {
+                metrics.clientRejected();
+                return failedFuture(e);
+            }
+            if (prepared == null) {
+                metrics.clientRejected();
+                return failedFuture(new IllegalStateException(
+                        stateMachine.getClass().getSimpleName() + ".prepare returned null"));
+            }
+            return appendAndReplicateLocked(LogEntry.newBuilder().setCommand(ByteString.copyFrom(prepared)));
         } finally {
             lock.unlock();
         }
