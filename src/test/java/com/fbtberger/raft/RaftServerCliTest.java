@@ -199,4 +199,23 @@ class RaftServerCliTest {
         try (var out = Files.newOutputStream(tmp)) { props.store(out, null); }
         return RaftConfig.load(tmp);
     }
+
+    @org.junit.jupiter.api.Test
+    void theCommandLineIsOnUnlessSwitchedOff() {
+        String before = System.getProperty("raft.cli.enabled");
+        try {
+            System.clearProperty("raft.cli.enabled");
+            org.junit.jupiter.api.Assertions.assertTrue(RaftServer.cliEnabled());
+            System.setProperty("raft.cli.enabled", "false");
+            org.junit.jupiter.api.Assertions.assertFalse(RaftServer.cliEnabled(),
+                    "a container has no stdin, and its end must not stop the node");
+            System.setProperty("raft.cli.enabled", " FALSE ");
+            org.junit.jupiter.api.Assertions.assertFalse(RaftServer.cliEnabled());
+            System.setProperty("raft.cli.enabled", "true");
+            org.junit.jupiter.api.Assertions.assertTrue(RaftServer.cliEnabled());
+        } finally {
+            if (before == null) System.clearProperty("raft.cli.enabled");
+            else System.setProperty("raft.cli.enabled", before);
+        }
+    }
 }

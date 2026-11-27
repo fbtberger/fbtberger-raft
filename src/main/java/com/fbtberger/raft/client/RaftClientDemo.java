@@ -43,10 +43,10 @@ public final class RaftClientDemo {
 
         RaftConfig config = RaftConfig.load(Path.of(args[0]));
 
-        try (RaftClient raftClient = new RaftClient(config.peerAddresses())) {
+        try (RaftClient raftClient = connect(config, System.getenv())) {
             KeyValueClient kvClient = new KeyValueClient(raftClient);
             System.out.println("Connected to cluster: " + config.peerAddresses().keySet());
-            System.out.println("Commands: SET <key> <value> | ADD <id> <host:port> | REMOVE <id> | quit");
+            System.out.println("Commands: SET <key> <value> | GET <key> | ADD <id> <host:port> | REMOVE <id> | quit");
 
             BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
             String line;
@@ -66,6 +66,13 @@ public final class RaftClientDemo {
                     }
                     try {
                         System.out.println(kvClient.set(parts[0], parts[1]));
+                    } catch (RaftClientException e) {
+                        System.out.println("error: " + e.getMessage());
+                    }
+                } else if (line.regionMatches(true, 0, "GET ", 0, 4)) {
+                    try {
+                        String value = kvClient.get(line.substring(4).trim());
+                        System.out.println(value == null || value.isEmpty() ? "(not found)" : value);
                     } catch (RaftClientException e) {
                         System.out.println("error: " + e.getMessage());
                     }
@@ -90,9 +97,32 @@ public final class RaftClientDemo {
                         System.out.println("error: " + e.getMessage());
                     }
                 } else {
-                    System.out.println("unknown command, try SET <key> <value> | ADD <id> <host:port> | REMOVE <id> | quit");
+                    System.out.println("unknown command, try SET <key> <value> | GET <key> | ADD <id> <host:port> | REMOVE <id> | quit");
                 }
             }
         }
+    }
+
+    /**
+     * A client for the cluster the properties file describes, secured the way that file
+     * says the cluster is: TLS from its {@code tls.*} keys, and, if it has
+     * {@code auth.keycloak.enabled=true}, a Keycloak service account whose id and secret
+     * come from the environment ({@code RAFT_KEYCLOAK_CLIENT_ID},
+     * {@code RAFT_KEYCLOAK_CLIENT_SECRET}) -- a secret does not belong in that file.
+     */
+    static RaftClient connect(RaftConfig config, java.util.Map<String, String> environment) {
+        java.util.function.Supplier<String> token = null;
+        if (config.clientAuthConfig().enabled()) {
+            String id = environment.get("RAFT_KEYCLOAK_CLIENT_ID");
+            String secret = environment.get("RAFT_KEYCLOAK_CLIENT_SECRET");
+            if (id == null || id.isEmpty() || secret == null || secret.isEmpty()) {
+                throw new IllegalStateException("this cluster requires Keycloak tokens: set "
+                        + "RAFT_KEYCLOAK_CLIENT_ID and RAFT_KEYCLOAK_CLIENT_SECRET to a service account "
+                        + "of the realm " + config.clientAuthConfig().issuer());
+            }
+            token = new com.fbtberger.raft.auth.KeycloakTokenSupplier(
+                    config.clientAuthConfig().issuer(), id, secret);
+        }
+        return new RaftClient(config.peerAddresses(), config.tlsConfig(), token);
     }
 }

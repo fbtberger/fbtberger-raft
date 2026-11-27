@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RaftServiceGrpc;
@@ -17,6 +19,7 @@ import com.fbtberger.raft.proto.RequestVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.ServerServiceDefinition;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.netty.shaded.io.netty.handler.ssl.ClientAuth;
@@ -25,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import javax.net.ssl.SSLException;
 
 public final class GrpcTransportServer implements RaftTransportServer {
@@ -40,25 +44,55 @@ public final class GrpcTransportServer implements RaftTransportServer {
     }
 
     public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig) throws SSLException {
+        this(port, handler, tlsConfig, List.of());
+    }
+
+    /**
+     * As above, serving {@code additionalServices} on the same port and under the same
+     * transport security as the peer service.
+     *
+     * <p>This is how the client service gets onto a TLS node. Before it existed the only
+     * way to add a service was the {@link #GrpcTransportServer(ServerBuilder, RaftRpcHandler)}
+     * constructor, which is plaintext by construction -- so the Spring wiring registered the
+     * client service on a plaintext node and, with {@code tls.enabled=true}, on no node at
+     * all.
+     */
+    public GrpcTransportServer(int port, RaftRpcHandler handler, TlsConfig tlsConfig,
+                               List<ServerServiceDefinition> additionalServices) throws SSLException {
         this.tlsConfig = tlsConfig;
         if (!tlsConfig.enabled()) {
-            this.server = ServerBuilder.forPort(port)
-                    .addService(new RaftServiceAdapter(handler, false))
-                    .build();
+            ServerBuilder<?> builder = ServerBuilder.forPort(port)
+                    .addService(new RaftServiceAdapter(handler, false));
+            additionalServices.forEach(builder::addService);
+            this.server = builder.build();
         } else {
-            var sslBuilder = GrpcSslContexts.forServer(tlsConfig.certFile(), tlsConfig.keyFile())
-                    .trustManager(tlsConfig.caFile());
+            // The managers, not the files: a renewed certificate is then used by the next
+            // handshake without this server being rebuilt. See TlsMaterial.
+            //
+            // The JDK engine, explicitly. gRPC would pick its bundled native one, and that
+            // engine fixes the list of certificate authorities it names to a client when
+            // the context is built. After a CA rollover the server would trust the new CA
+            // and still ask clients for a certificate of the old one; a client holding
+            // only the new one then sends none and is turned away with
+            // CERTIFICATE_REQUIRED. The JDK engine asks the trust manager at every
+            // handshake. TlsConfig makes the same choice for the Netty transport.
+            var sslBuilder = GrpcSslContexts.configure(
+                    io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder
+                            .forServer(tlsConfig.material().keyManager()),
+                    io.grpc.netty.shaded.io.netty.handler.ssl.SslProvider.JDK)
+                    .trustManager(tlsConfig.material().trustManager());
             if (tlsConfig.mtlsEnabled()) {
                 sslBuilder.clientAuth(ClientAuth.REQUIRE);
             }
             // The sender-id binding rides on mTLS and only on mTLS: without a client certificate
             // there is no authenticated identity to compare against, and demanding one would
             // reject every peer on a one-way-TLS cluster.
-            this.server = NettyServerBuilder.forPort(port)
+            NettyServerBuilder builder = NettyServerBuilder.forPort(port)
                     .sslContext(sslBuilder.build())
                     .intercept(new PeerIdentityInterceptor())
-                    .addService(new RaftServiceAdapter(handler, tlsConfig.mtlsEnabled()))
-                    .build();
+                    .addService(new RaftServiceAdapter(handler, tlsConfig.mtlsEnabled()));
+            additionalServices.forEach(builder::addService);
+            this.server = builder.build();
         }
     }
 
@@ -199,6 +233,26 @@ public final class GrpcTransportServer implements RaftTransportServer {
          * hand over the lead is the receiver's question, answered in
          * {@code RaftNode.handleTimeoutNow}.
          */
+        /**
+         * Bound to the certificate like the rest: the requester id decides whether the
+         * leader answers at all, and an answer costs it a heartbeat round.
+         */
+        @Override
+        public void readIndex(ReadIndexRequest request, StreamObserver<ReadIndexResponse> observer) {
+            if (!senderIsWhoItClaims("ReadIndex", request.getRequesterId(), observer)) return;
+            try {
+                handler.handleReadIndex(request).whenComplete((response, failure) -> {
+                    if (failure != null) {
+                        fail("ReadIndex", failure instanceof RuntimeException r ? r : new RuntimeException(failure),
+                                observer, "requester " + request.getRequesterId());
+                    } else {
+                        observer.onNext(response);
+                        observer.onCompleted();
+                    }
+                });
+            } catch (RuntimeException e) { fail("ReadIndex", e, observer, ""); }
+        }
+
         @Override
         public void timeoutNow(TimeoutNowRequest request, StreamObserver<TimeoutNowResponse> observer) {
             if (!senderIsWhoItClaims("TimeoutNow", request.getLeaderId(), observer)) return;

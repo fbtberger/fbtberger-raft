@@ -35,6 +35,14 @@ public final class RaftMetrics {
         private final Counter entriesApplied;
         private final Counter stepDowns;
         private final Counter clientRejected;
+        private final Counter clientDuplicates;
+        private final Counter clientOverloadedWrites;
+        private final Counter clientOverloadedReads;
+        private final Counter followerReads;
+        private final Counter readIndexServed;
+        private final Counter clientAuthAccepted;
+        private final Counter clientAuthUnauthenticated;
+        private final Counter clientAuthForbidden;
         private final Counter replicationSent;
         private final Counter snapshotChunksSent;
         private final Counter snapshotChunksReceived;
@@ -68,6 +76,26 @@ public final class RaftMetrics {
                                 .tags(tags).description("Times this node stepped down to follower").register(registry);
                 this.clientRejected = Counter.builder("raft.client.rejected")
                                 .tags(tags).description("Client submissions rejected (not leader)").register(registry);
+                this.clientOverloadedWrites = Counter.builder("raft.client.overloaded")
+                                .tags(tags).tag("kind", "write")
+                                .description("Client requests refused because too many were already waiting").register(registry);
+                this.clientOverloadedReads = Counter.builder("raft.client.overloaded")
+                                .tags(tags).tag("kind", "read")
+                                .description("Client requests refused because too many were already waiting").register(registry);
+                this.clientDuplicates = Counter.builder("raft.client.duplicate")
+                                .tags(tags).description("Committed commands not applied again because their client session had seen them").register(registry);
+                this.followerReads = Counter.builder("raft.read.follower")
+                                .tags(tags).description("Linearizable reads answered by this node while not leader").register(registry);
+                this.readIndexServed = Counter.builder("raft.read.index.served")
+                                .tags(tags).description("ReadIndex requests from followers this leader took on").register(registry);
+                this.clientAuthAccepted = Counter.builder("raft.client.auth.accepted")
+                                .tags(tags).description("Client RPCs admitted by token and role").register(registry);
+                this.clientAuthUnauthenticated = Counter.builder("raft.client.auth.rejected")
+                                .tags(tags.and("reason", "unauthenticated"))
+                                .description("Client RPCs refused: no token, or one that did not verify").register(registry);
+                this.clientAuthForbidden = Counter.builder("raft.client.auth.rejected")
+                                .tags(tags.and("reason", "forbidden"))
+                                .description("Client RPCs refused: valid token without the required role").register(registry);
                 this.replicationSent = Counter.builder("raft.replication.sent")
                                 .tags(tags).description("Log entries sent to followers").register(registry);
                 this.snapshotChunksSent = Counter.builder("raft.snapshot.chunk.sent")
@@ -129,6 +157,33 @@ public final class RaftMetrics {
                                 .description("Index of the last log entry").register(registry);
                 Gauge.builder("raft.node.snapshot.index", snapshotIndex).tags(tags)
                                 .description("Snapshot boundary (last compacted index)").register(registry);
+        }
+
+        /**
+         * The node certificate's remaining life and what became of renewals found on disk.
+         * The first is the alarm worth having: it falls steadily and jumps up at every
+         * renewal, and a line that keeps falling says the renewal is not arriving.
+         */
+        public void registerTlsGauges(com.fbtberger.raft.transport.TlsMaterial material) {
+                Gauge.builder("raft.tls.certificate.expiry.seconds", () ->
+                                (material.certificate().getNotAfter().getTime() - System.currentTimeMillis()) / 1000.0)
+                                .tags(tags).description("Seconds until the node certificate in use expires")
+                                .register(registry);
+                io.micrometer.core.instrument.FunctionCounter
+                                .builder("raft.tls.reload", material, m -> m.reloadCount())
+                                .tags(tags).tag("result", "success")
+                                .description("Renewed TLS material found on disk").register(registry);
+                io.micrometer.core.instrument.FunctionCounter
+                                .builder("raft.tls.reload", material, m -> m.failedReloadCount())
+                                .tags(tags).tag("result", "refused")
+                                .description("Renewed TLS material found on disk").register(registry);
+        }
+
+        /** 1 on a witness, 0 on a data node: which members of a cluster hold no state. */
+        public void registerWitnessGauge(Supplier<Number> witness) {
+                Gauge.builder("raft.node.witness", witness).tags(tags)
+                                .description("1 if this node is a witness (votes, stores the log, holds no state)")
+                                .register(registry);
         }
 
         /**
@@ -241,6 +296,40 @@ public final class RaftMetrics {
 
         public void clientRejected() {
                 clientRejected.increment();
+        }
+
+        public void clientAuthAccepted() {
+                clientAuthAccepted.increment();
+        }
+
+        /** @param reason {@code "forbidden"} for a missing role, anything else counts as unauthenticated */
+        public void clientAuthRejected(String reason) {
+                ("forbidden".equals(reason) ? clientAuthForbidden : clientAuthUnauthenticated).increment();
+        }
+
+        public void followerReadServed() {
+                followerReads.increment();
+        }
+
+        public void readIndexServed() {
+                readIndexServed.increment();
+        }
+
+        public void clientDuplicate() {
+                clientDuplicates.increment();
+        }
+
+        /** @param write true for a refused command, false for a refused read */
+        public void clientOverloaded(boolean write) {
+                (write ? clientOverloadedWrites : clientOverloadedReads).increment();
+        }
+
+        /** How many commands and reads are waiting on the leader right now: what the limits are measured against. */
+        public void registerPendingGauges(Supplier<Number> pendingWrites, Supplier<Number> pendingReads) {
+                Gauge.builder("raft.client.pending", pendingWrites).tags(tags).tag("kind", "write")
+                                .description("Client requests waiting on this node").register(registry);
+                Gauge.builder("raft.client.pending", pendingReads).tags(tags).tag("kind", "read")
+                                .description("Client requests waiting on this node").register(registry);
         }
 
         public void replicationSent(int entryCount) {

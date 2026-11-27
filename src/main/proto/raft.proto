@@ -63,6 +63,47 @@ message LogEntry {
     ClusterConfiguration configuration = 4;
     NamedCommand named_command = 8;
   }
+
+  // Client session tag (§8, dissertation §6.3). Empty client_id means the
+  // command was submitted without a session and is applied unconditionally,
+  // which is what every entry written before these fields existed reads as.
+  //
+  // With a client_id, (client_id, sequence) names the command: every server
+  // applies it at most once and answers a repeat from its recorded result.
+  // acked_sequence is the highest sequence up to which the client has received
+  // every response, so the servers can drop the results they still hold for it.
+  //
+  // These travel in the log, not beside it, because the decision "is this a
+  // duplicate" must come out the same on every server and survive a leader
+  // change -- the retry that matters is precisely the one that reaches the
+  // NEXT leader.
+  string client_id = 5;
+  int64 sequence = 6;
+  int64 acked_sequence = 7;
+}
+
+// The replicated session table, as it is stored in a snapshot (§7). Order is
+// significant: sessions are listed least recently used first, and eviction
+// follows that order, so two servers restoring the same snapshot must evict
+// the same session next.
+message ClientSessionTable {
+  repeated ClientSession sessions = 1;
+  // Set in the snapshots a witness writes when it compacts its log. Such a snapshot
+  // has no state in it, and a node that is not a witness must never start from one.
+  bool witness = 2;
+}
+
+message ClientSession {
+  string client_id = 1;
+  // Every sequence at or below this has been acknowledged by the client; its
+  // result is gone and a repeat of it is refused rather than re-applied.
+  int64 acked_sequence = 2;
+  repeated ClientSessionResult results = 3;
+}
+
+message ClientSessionResult {
+  int64 sequence = 1;
+  bytes result = 2;
 }
 
 // RequestVote RPC, invoked by candidates to gather votes (§5.2).
@@ -157,9 +198,40 @@ message TimeoutNowRequest {
 }
 
 message TimeoutNowResponse {
+  // Set by a witness: it has no state machine, so it does not take the lead on
+  // request. The leader fails the transfer at once instead of waiting it out.
+  bool witness = 1;
+}
+
+// ReadIndex RPC (dissertation §6.4, "followers can also help offload the
+// processing of read-only queries"). A follower or learner that wants to answer
+// a read itself asks the leader for the index the read must see. The leader
+// confirms its leadership with a heartbeat round exactly as it does for its own
+// reads and answers with that index; the requester waits until it has applied
+// that far and then reads from its own state machine.
+//
+// The leader does the part only a leader can do and the follower does the part
+// that costs: the read itself.
+message ReadIndexRequest {
+  // Who is asking. Bound to the certificate under mTLS like every sender id, and
+  // refused unless it is a member or learner of the leader's configuration.
+  string requester_id = 1;
+}
+
+message ReadIndexResponse {
+  // False if this server is not the leader, lost the leadership while
+  // confirming it, or does not know the requester.
+  bool success = 1;
+  // Set iff success: every command committed before the request arrived is at or
+  // below this index.
+  int64 read_index = 2;
+  int64 term = 3;
+  // Set iff not success and this server knows who the leader is.
+  string leader_hint = 4;
 }
 
 service RaftService {
+  rpc ReadIndex (ReadIndexRequest) returns (ReadIndexResponse);
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);

@@ -17,11 +17,13 @@ import com.fbtberger.raft.client.proto.RemoveServerRequest;
 import com.fbtberger.raft.client.proto.SubmitRequest;
 import com.fbtberger.raft.client.proto.SubmitResponse;
 import com.google.protobuf.ByteString;
+import com.fbtberger.raft.auth.BearerTokenInterceptor;
 import com.fbtberger.raft.transport.TlsConfig;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 
 import javax.net.ssl.SSLException;
@@ -31,9 +33,13 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * A generic, reusable client for talking to a Raft cluster over the
@@ -68,6 +74,26 @@ import java.util.function.Function;
 public final class RaftClient implements AutoCloseable {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(2);
+    /** How often an overloaded leader is asked again before the caller is told. */
+    static final int MAX_OVERLOAD_RETRIES = 5;
+    /** The longest single pause between two of those attempts. */
+    static final long MAX_BACKOFF_MS = 1_000;
+
+    /**
+     * Waits before asking an overloaded leader again: the pause it suggested, doubled per
+     * refusal, capped, and spread by up to half so that the clients it refused together do
+     * not all come back together.
+     */
+    private static void backOff(long suggestedMs, int refusals) throws RaftClientException {
+        long base = Math.min(MAX_BACKOFF_MS, Math.max(1, suggestedMs) << Math.min(refusals, 10));
+        long pause = base / 2 + java.util.concurrent.ThreadLocalRandom.current().nextLong(base / 2 + 1);
+        try {
+            Thread.sleep(pause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RaftClientException("interrupted while waiting for an overloaded leader", e);
+        }
+    }
 
     /**
      * What a node that is not the leader answers -- set verbatim by
@@ -78,8 +104,26 @@ public final class RaftClient implements AutoCloseable {
 
     private final Map<String, String> clusterAddresses; // nodeId -> host:port
     private final TlsConfig tlsConfig;
+    /** Supplies the caller's current Keycloak access token, or null if the cluster asks for none. */
+    private final Supplier<String> bearerToken;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private volatile String knownLeaderId; // best guess; null means "unknown, try everyone"
+
+    /**
+     * This client's session (§8). Every command gets the next sequence number and keeps it
+     * across every retry, so the cluster can tell a retry from a new command and apply it
+     * once. A fresh random id per instance: two instances are two clients, and a process
+     * that restarts starts a new session rather than guessing where the old one stopped.
+     */
+    private final String clientId = UUID.randomUUID().toString();
+    private final AtomicLong nextSequence = new AtomicLong(1);
+    private final AtomicLong followerReadRotation = new AtomicLong();
+    /**
+     * Sequences submitted and not yet answered or given up. Everything below the lowest is
+     * acknowledged -- the lowest, not the newest, so that sharing an instance between threads
+     * cannot acknowledge a command another thread is still retrying.
+     */
+    private final ConcurrentSkipListSet<Long> outstanding = new ConcurrentSkipListSet<>();
 
     /**
      * A plaintext client, which is what this class used to be able to be and nothing else.
@@ -114,11 +158,29 @@ public final class RaftClient implements AutoCloseable {
      * certificate; it is not authorisation.
      */
     public RaftClient(Map<String, String> clusterAddresses, TlsConfig tlsConfig) {
+        this(clusterAddresses, tlsConfig, null);
+    }
+
+    /**
+     * A client that also says who it is: every RPC carries the token {@code bearerToken}
+     * returns at that moment, which is what a cluster with {@code auth.keycloak.enabled=true}
+     * checks before it lets the RPC through. This is the authorisation the constructor
+     * above says mTLS is not.
+     *
+     * <p>The supplier is asked per call, so it can hand out a refreshed token without the
+     * client being rebuilt -- {@code KeycloakTokenSupplier} for a service account, or the
+     * token of the user on whose behalf the caller acts.
+     *
+     * @param bearerToken supplies the access token without the {@code Bearer } prefix;
+     *                    null for a cluster that requires none
+     */
+    public RaftClient(Map<String, String> clusterAddresses, TlsConfig tlsConfig, Supplier<String> bearerToken) {
         if (clusterAddresses.isEmpty()) {
             throw new IllegalArgumentException("clusterAddresses must not be empty");
         }
         this.clusterAddresses = new LinkedHashMap<>(clusterAddresses);
         this.tlsConfig = tlsConfig;
+        this.bearerToken = bearerToken;
     }
 
     /** Submits a command with the default timeout per attempted node. */
@@ -157,17 +219,60 @@ public final class RaftClient implements AutoCloseable {
      */
     public byte[] submit(String stateMachine, byte[] command, Duration perAttemptTimeout)
             throws RaftClientException {
+        // One sequence number for the whole walk below. That is the point of it: the
+        // attempt that times out against a leader which committed the command and the
+        // attempt that then reaches its successor are the same command to the cluster.
+        long sequence;
+        long acked;
+        // Numbered, registered and acknowledged-up-to in one step. Apart, a second
+        // thread could compute its acknowledgement between this thread taking a number
+        // and registering it, and acknowledge a command that has not been sent yet.
+        synchronized (outstanding) {
+            sequence = nextSequence.getAndIncrement();
+            outstanding.add(sequence);
+            acked = outstanding.first() - 1;
+        }
+        try {
+            return submitTagged(stateMachine, command, sequence, acked, perAttemptTimeout);
+        } finally {
+            // Answered or given up: either way this client never asks for it again, so
+            // the servers may drop its result once a later command carries the news.
+            outstanding.remove(sequence);
+        }
+    }
+
+    private byte[] submitTagged(String stateMachine, byte[] command, long sequence, long acked,
+                                Duration perAttemptTimeout) throws RaftClientException {
         SubmitRequest request = SubmitRequest.newBuilder()
                 .setStateMachine(stateMachine)
                 .setCommand(ByteString.copyFrom(command))
+                .setClientId(clientId)
+                .setSequence(sequence)
+                .setAckedSequence(acked)
                 .build();
         RaftClientException lastError = null;
 
         for (String nodeId : candidateOrder()) {
             try {
-                RaftClientServiceGrpc.RaftClientServiceBlockingStub stub = stubFor(nodeId)
-                        .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS);
-                SubmitResponse response = stub.submit(request);
+                SubmitResponse response = null;
+                // The same node again while it says "overloaded": it is the leader, and
+                // the nodes after it in the walk are followers that can only say no. The
+                // command was not appended, and it carries the same sequence number each
+                // time, so asking again cannot apply it twice.
+                for (int refusals = 0; ; refusals++) {
+                    response = stubFor(nodeId)
+                            .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                            .submit(request);
+                    if (!response.getOverloaded()) {
+                        break;
+                    }
+                    knownLeaderId = nodeId;
+                    if (refusals == MAX_OVERLOAD_RETRIES) {
+                        throw RaftClientException.overloaded(nodeId + " is overloaded and refused the command "
+                                + (refusals + 1) + " times (" + response.getError() + ")");
+                    }
+                    backOff(response.getRetryAfterMs(), refusals);
+                }
 
                 if (response.getSuccess()) {
                     knownLeaderId = nodeId;
@@ -177,6 +282,7 @@ public final class RaftClient implements AutoCloseable {
                 lastError = new RaftClientException(
                         nodeId + " rejected the command (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null; // an unreachable node is not a useful guess anymore
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -217,24 +323,46 @@ public final class RaftClient implements AutoCloseable {
         QueryRequest request = QueryRequest.newBuilder()
                 .setQuery(ByteString.copyFrom(query))
                 .setLease(mode == ReadMode.LEASE)
+                .setAllowFollower(mode == ReadMode.FOLLOWER)
                 .setStateMachine(stateMachine)
                 .build();
         RaftClientException lastError = null;
+        boolean followerRead = mode == ReadMode.FOLLOWER;
 
-        for (String nodeId : candidateOrder()) {
+        for (String nodeId : followerRead ? followerFirstOrder() : candidateOrder()) {
             try {
-                QueryResponse response = stubFor(nodeId)
-                        .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
-                        .query(request);
+                QueryResponse response = null;
+                for (int refusals = 0; ; refusals++) {
+                    response = stubFor(nodeId)
+                            .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                            .query(request);
+                    if (!response.getOverloaded()) {
+                        break;
+                    }
+                    if (refusals == MAX_OVERLOAD_RETRIES) {
+                        throw RaftClientException.overloaded(nodeId + " is overloaded and refused the query "
+                                + (refusals + 1) + " times (" + response.getError() + ")");
+                    }
+                    backOff(response.getRetryAfterMs(), refusals);
+                }
 
                 if (response.getSuccess()) {
-                    knownLeaderId = nodeId;
+                    // Whoever answered a follower read need not be the leader, and must
+                    // not be remembered as one: the next submit would start its walk there.
+                    if (!followerRead) {
+                        knownLeaderId = nodeId;
+                    }
                     return response.getResult().toByteArray();
                 }
-                knownLeaderId = response.getLeaderHint().isEmpty() ? null : response.getLeaderHint();
+                if (!response.getLeaderHint().isEmpty()) {
+                    knownLeaderId = response.getLeaderHint();
+                } else if (!followerRead) {
+                    knownLeaderId = null;
+                }
                 lastError = new RaftClientException(
                         nodeId + " rejected the query (" + (response.getError().isEmpty() ? "not leader" : response.getError()) + ")");
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -371,6 +499,7 @@ public final class RaftClient implements AutoCloseable {
                 }
                 lastError = rejection;
             } catch (StatusRuntimeException e) {
+                throwIfNotAuthorised(nodeId, e);
                 knownLeaderId = null;
                 lastError = new RaftClientException("could not reach " + nodeId + " (" + clusterAddresses.get(nodeId) + ")", e);
             }
@@ -379,6 +508,11 @@ public final class RaftClient implements AutoCloseable {
             throw reasoned;
         }
         throw lastError != null ? lastError : new RaftClientException("no nodes configured");
+    }
+
+    /** The id this client tags its commands with (§8). */
+    public String clientId() {
+        return clientId;
     }
 
     /** This client's current best guess at who the leader is, or null if unknown. */
@@ -400,9 +534,48 @@ public final class RaftClient implements AutoCloseable {
         return order;
     }
 
+    /**
+     * For a follower read: every node that is not the known leader, starting one further
+     * along on each call so the reads spread, and the leader last as the fallback that
+     * can always answer.
+     */
+    private List<String> followerFirstOrder() {
+        String leader = knownLeaderId;
+        List<String> others = new ArrayList<>(clusterAddresses.size());
+        for (String nodeId : clusterAddresses.keySet()) {
+            if (!nodeId.equals(leader)) {
+                others.add(nodeId);
+            }
+        }
+        if (!others.isEmpty()) {
+            java.util.Collections.rotate(others, -(int) (followerReadRotation.getAndIncrement() % others.size()));
+        }
+        if (leader != null && clusterAddresses.containsKey(leader)) {
+            others.add(leader);
+        }
+        return others;
+    }
+
     private RaftClientServiceGrpc.RaftClientServiceBlockingStub stubFor(String nodeId) {
         ManagedChannel channel = channels.computeIfAbsent(nodeId, this::openChannel);
-        return RaftClientServiceGrpc.newBlockingStub(channel);
+        RaftClientServiceGrpc.RaftClientServiceBlockingStub stub = RaftClientServiceGrpc.newBlockingStub(channel);
+        return bearerToken == null ? stub : stub.withInterceptors(new BearerTokenInterceptor(bearerToken));
+    }
+
+    /**
+     * A refusal for lack of a token or a role ends the walk at once. Every node applies
+     * the same rule to the same token, so asking the others cannot succeed -- and letting
+     * the loop run on would report "could not reach node3", which sends the reader after
+     * a network fault that is not there.
+     */
+    private static void throwIfNotAuthorised(String nodeId, StatusRuntimeException e) throws RaftClientException {
+        Status.Code code = e.getStatus().getCode();
+        if (code == Status.Code.UNAUTHENTICATED || code == Status.Code.PERMISSION_DENIED) {
+            String detail = e.getStatus().getDescription();
+            throw new RaftClientException(nodeId + " refused the request: "
+                    + (code == Status.Code.UNAUTHENTICATED ? "not authenticated" : "not authorised")
+                    + (detail == null ? "" : " (" + detail + ")"), e);
+        }
     }
 
     /** Same shape as {@code GrpcTransportFactory.connect}, so both ends read alike. */
@@ -417,7 +590,7 @@ public final class RaftClient implements AutoCloseable {
             // server, offering one is harmless; requiring the operator to have one when the
             // server never checks would be a configuration people work around.
             if (tlsConfig.mtlsEnabled()) {
-                ssl.keyManager(tlsConfig.certFile(), tlsConfig.keyFile());
+                ssl.keyManager(tlsConfig.material().keyManager());
             }
             return NettyChannelBuilder.forTarget(address)
                     .sslContext(ssl.trustManager(tlsConfig.caFile()).build())

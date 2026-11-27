@@ -1,0 +1,34 @@
+@startuml
+title A witness carries a committed entry across
+skinparam defaultFontSize 10
+
+participant "A (data, leader)" as A
+participant "W (witness)" as W
+participant "B (data)" as B
+
+A -> W: AppendEntries(entry 7)
+W --> A: ok
+note over A: entry 7 committed by A and W\nB has not received it yet
+A ->x B: AppendEntries(entry 7)
+
+destroy A
+note over A: A fails
+
+B -> W: PreVote(lastLogIndex=6)
+W --> B: refused: W's log is newer (§5.4.1)
+note over B: B cannot win
+
+note over W: election timeout of a witness:\nthree times that of a data node
+W -> B: PreVote / RequestVote(lastLogIndex=7)
+B --> W: granted
+note over W: W leads.\nIt refuses every client request.
+
+W -> B: AppendEntries(entry 7, no-op 8)
+B --> W: ok, matchIndex = 8
+note over W: B holds the whole log
+W -> B: TimeoutNow
+B -> W: RequestVote(transfer)
+W --> B: granted
+note over B: B leads and serves clients.\nEntry 7 was never lost.
+
+@enduml

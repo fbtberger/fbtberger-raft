@@ -21,4 +21,22 @@ public final class RaftClientException extends Exception {
     public RaftClientException(String message, Throwable cause) {
         super(message, cause);
     }
+
+    private boolean overloaded;
+
+    /** The leader was reached and kept refusing the request because it is overloaded. */
+    static RaftClientException overloaded(String message) {
+        RaftClientException e = new RaftClientException(message);
+        e.overloaded = true;
+        return e;
+    }
+
+    /**
+     * True if the cluster has a leader and it refused the request for load, every time
+     * this client asked. Nothing was applied. This is the one failure where trying again
+     * straight away makes things worse: slow down, or shed the work.
+     */
+    public boolean overloaded() {
+        return overloaded;
+    }
 }

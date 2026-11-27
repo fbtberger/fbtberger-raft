@@ -25,8 +25,8 @@ The project implements:
 - **Linearizable reads**: ReadIndex protocol (`readIndex()`) and lease-based reads (`leaseRead()`) for zero-round-trip reads under stable leadership
 - **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid leader is active
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
-- **Copy-on-write snapshotting** (§5.1): `prepareCowSnapshot()` captures state under the lock; serialization runs on a background thread
-- **Named state machines**: `StateMachineRegistry` holds the application state machine and named ones beside it; a `NamedCommand` log entry is applied by exactly the state machine it names, and each has its own snapshot section. A state machine that implements `LeaderPreparation` sees its commands on the leader before the append
+- **Copy-on-write, streaming snapshotting** (§5.1): `prepareSnapshotWriter()` captures state under the lock; a background thread streams it to disk, and it is sent and restored chunk by chunk
+- **Named state machines**: `StateMachineRegistry` holds the application state machine and named ones beside it; a `NamedCommand` log entry is applied by exactly the state machine it names, and each has its own snapshot section. A state machine that implements `LeaderPreparation` sees its commands on the leader before the append. The other features sit in front of this routing or behind it: a session decides whether a command is a repeat before it is routed, so one client numbers its commands across all state machines; a follower read names its state machine like any query; the snapshot container is written and restored section by section as a stream (each section is spooled to a temporary file because its length precedes it); and a witness replaces the whole registry, so it applies an entry for any name and keeps none of it
 - **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts and TLS/mTLS
 - **Storage**: BerkeleyDB JE, append-only WAL, or in-memory (pluggable via `RaftStorage`)
 - **Observability**: SLF4J/Logback logging, Micrometer metrics (Prometheus + JMX), health checks, JMX MBean
@@ -176,6 +176,52 @@ node.leaseRead().thenRun(() -> {
 Lease reads assume bounded clock skew. Use `readIndex()` if clocks may diverge
 significantly. Single-node clusters complete immediately for both methods.
 
+# 5.1.1 Follower Reads (§6.4)
+
+![A linearizable read served by a follower](followerread.png){width=85%}
+
+ReadIndex and lease reads are answered by the leader, so read load lands on the
+one node that also orders every write. A follower or learner can answer instead
+without giving up linearizability:
+
+1. The node asks the leader for a read index (`ReadIndex` peer RPC, carried by
+   all three transports).
+2. The leader confirms its leadership with a heartbeat round, exactly as for a
+   read of its own, and answers with the index.
+3. The node waits until its own `lastApplied` has reached that index.
+4. It reads from its own state machine.
+
+The leader does the part only a leader can do; the follower does the read. Each
+follower read still costs the leader one confirmation round, so this is for
+read-heavy load and large reads, not for lower latency.
+
+**What cannot happen.** A follower that cannot reach the leader, or whose leader
+has been deposed, obtains no index and fails the read (`NotLeaderException`); it
+never answers from its own possibly stale state. A follower that does not catch
+up to the index within 2 s fails the read (`FollowerReadException`) and the
+client tries the next node.
+
+**The read index of a new leader.** A leader's read index is
+`max(commitIndex, index of its own no-op)`. A freshly elected leader holds every
+committed entry but does not yet know which are committed; without the floor a
+read could run before a write its predecessor had already acknowledged. This
+applies to leader reads as well and was corrected together with this feature.
+
+**API.**
+
+```java
+node.queryAnyRole(query);                                // any role, linearizable
+client.query(query, timeout, ReadMode.FOLLOWER);         // non-leaders first, in rotation
+```
+
+`QueryRequest.allow_follower` selects it on the wire. The leader answers a
+`ReadIndex` only to members and learners of its configuration; under mTLS the
+requester id is bound to the certificate like every other sender id.
+
+**Mixed versions.** A follower read needs a leader that knows the `ReadIndex`
+RPC. Against an older leader it fails and the client falls back to the leader,
+so reads stay correct and are merely not offloaded.
+
 # 5.2 Joint Consensus (§6)
 
 In addition to single-step changes (`addServer`/`removeServer`), the system
@@ -231,6 +277,111 @@ node.removeLearner("n4").get(5, SECONDS);             // or drop it without prom
 
 \newpage
 
+# 5.4 Client Sessions: Exactly-Once Commands (§8)
+
+![A retry across a leader change](sessions.png){width=85%}
+
+Raft by itself gives a client *at-least-once*: a leader can commit a command and
+fail before it answers, the client retries against the next leader, and the
+command is in the log twice. A session closes that gap.
+
+**The tag.** A client picks a random `client_id` once and numbers its commands
+from 1. `SubmitRequest` carries `client_id`, `sequence` and `acked_sequence`; the
+leader copies all three into the `LogEntry`. A retry repeats the same pair, on
+whichever node it reaches.
+
+**The table.** `ClientSessions` maps each client to the results of the sequences
+it has not acknowledged yet. `RaftNode.applyCommittedEntries()` consults it for
+every tagged entry, in log order, on every server:
+
+| Verdict | Condition | Effect |
+|---------|-----------|--------|
+| `NEW` | sequence not recorded | state machine applies; result recorded |
+| `DUPLICATE` | sequence recorded | state machine **not** called; recorded result returned |
+| `STALE` | sequence at or below `acked_sequence` | not applied; fails with `StaleClientRequestException` |
+
+A duplicate is still appended and committed. Whether a command is a duplicate
+is only certain at apply time, once everything before it has been applied; a
+leader that refused it earlier from its current view would miss a copy still in
+flight in the log.
+
+**Replicated, not cached.** The table changes only while applying committed
+entries, so all servers hold the same table at the same index. It is stored in
+every snapshot (`RaftStorage.Snapshot.sessionData`) and replaced whenever a
+snapshot is restored or installed, which is what keeps a retry recognised after
+the entry that carried the tag has been compacted away.
+
+**Bounded.** A result is dropped as soon as a later command from the same client
+acknowledges it. A client that never returns is evicted once
+`ClientSessions.MAX_SESSIONS` (4096) other clients have been active, least
+recently used first. The bound is a constant and not a setting: eviction decides
+whether a command is applied, so it must be identical on every server.
+
+**Limits, stated.**
+
+- A client whose retry is still in flight while 4096 other clients commit loses
+  the protection for that one retry.
+- A command submitted without a `client_id` is applied on every arrival, as before.
+- Do not send session tags to a cluster that still contains a node older than
+  this feature: it stores the tag but applies the duplicate, and its state
+  diverges. Upgrade every node first, then the clients.
+
+```java
+RaftClient client = new RaftClient(addresses);   // one session per instance
+client.submit(cmd);                              // tagged and retried under one sequence
+
+// in-process, with an explicit tag:
+node.submitCommand(cmd, "client-a", 7, 6).get(2, SECONDS);
+```
+
+\newpage
+
+# 5.5 Witness Nodes
+
+![A witness carries a committed entry across](witness.png){width=85%}
+
+A witness is a voting member that stores the log and has no state machine
+(`node.witness=true`). It votes, acknowledges entries and counts toward every
+majority like any member. Two data nodes and a witness tolerate the loss of any one
+of the three, as three data nodes do, with the state stored twice instead of three
+times.
+
+**What a witness does not do.** It answers no client: writes, reads, follower reads
+and configuration changes are refused with the leader hint, so a client moves on.
+It does not take the lead on request (`TimeoutNow` is answered with `witness=true`,
+and the leader fails that transfer at once). `HealthCheck.serving()` is always DOWN
+on a witness; readiness is the question to ask it.
+
+**Why it still stands for election.** An entry is committed when two of three nodes
+hold it, and those two are as often the leader and the witness as the leader and
+the other data node. If the leader then fails, the surviving data node lacks an
+entry that the witness has. The witness rightly refuses it its vote (§5.4.1), and
+without a leader nothing would bring the entry across: two of three nodes up, and
+the cluster standing still. So a witness does campaign, three times later than a
+data node would, so that a data node that can win does so first. If it wins, it
+replicates its log to the data nodes and hands the lead to the first one that holds
+all of it. While it leads it serves nobody.
+
+**Log compaction.** There is no state to snapshot, so a witness only moves the point
+its log starts at, and it keeps `witness.log.retain` committed entries behind
+(default 10000): that tail is all it can give a data node that fell behind. A
+witness never sends `InstallSnapshot`, because what it stores as a snapshot is empty
+and would erase the receiver's state. A data node further behind than the retained
+tail needs another data node to catch up from. A witness that receives a snapshot
+keeps the boundary (index, term, configuration) and drops the payload.
+
+**Safeguard.** A directory a witness has compacted holds the tail of the log and no
+state for the rest. A node started on it without `node.witness=true` refuses to
+start and says so, instead of coming up with part of the state.
+
+**Limits.** Being a witness is a property of the node, not of the cluster
+configuration: other nodes learn it only from a refused `TimeoutNow`. With one
+data node left, that node has the only copy of the state until the other returns.
+Use at most as many witnesses as keep two data nodes in every majority you want to
+survive; the usual shape is two data nodes and one witness.
+
+\newpage
+
 # 6. Log Replication Pipeline
 
 ![Replication with Parallel Disk Writes and Pipelining](replication.png){width=85%}
@@ -258,20 +409,47 @@ Three optimizations from §10.2 reduce latency:
 
 ![Chunked Snapshot Transfer](snapshot.png){width=85%}
 
-Snapshots are handled in two parts:
+A snapshot is a stream from the moment it is taken to the moment it is restored.
+No step holds the state machine's whole state as one array: the memory a snapshot
+costs is one chunk (default 1 MB), whatever the size of the state.
 
-**Taking snapshots (§5.1 COW)**: `StateMachine.prepareCowSnapshot()` captures a
-lightweight copy-on-write reference under the Raft lock (e.g. a shallow `HashMap`
-copy for `KeyValueStateMachine`). The returned `Supplier<byte[]>` is invoked on a
-background thread to serialize the snapshot and persist it — neither serialization
-nor disk I/O blocks the Raft lock. A staleness check prevents a background
+**Taking snapshots (§5.1 COW)**: `StateMachine.prepareSnapshotWriter()` captures the
+state under the Raft lock (a shallow `HashMap` copy for `KeyValueStateMachine`) and
+returns a `SnapshotWriter`. A background thread lets it write straight into the
+storage backend through `RaftStorage.beginSnapshot(index, term)`, so neither
+serialization nor disk I/O blocks the Raft lock. The backend writes a temporary
+file and makes it the stored snapshot only on `commit`; a snapshot that is not newer
+than the stored one is dropped there, which is what keeps a slow background
 snapshot from overwriting a more recent `InstallSnapshot`.
 
-**Transferring snapshots (§7, Figure 13)**: The leader packs the state machine
-data and cluster configuration into a single byte stream
-(`[4B smLen][smData][cfgData]`) and sends it in fixed-size chunks (default 1 MB).
-One chunk is sent per heartbeat cycle. The follower buffers incoming chunks and
-applies the reassembled snapshot when the final chunk arrives (`done=true`).
+**Storing snapshots**: the payload is a file of its own in both durable backends.
+`WalStorage` keeps one `snapshot` file (metadata, then payload) and replaces it by
+rename. `BerkeleyDbStorage` keeps metadata in its database and the payload in
+`snapshots/snapshot-<index>.data`; a snapshot written by an older version, with the
+payload inside the database, is still read. Temporary files left by a crash are
+removed at start.
+
+**Transferring snapshots (§7, Figure 13)**: the leader sends the stream
+`[4B smLen][smData][cfgData]` in fixed-size chunks (default 1 MB), one per heartbeat
+cycle, reading each chunk from the file at its offset
+(`RaftStorage.readSnapshotData`). When the client session table (section 5.4) is not
+empty it travels too: the top bit of the length word is set and the layout becomes
+`[4B smLen|top bit][smData][4B cfgLen][cfgData][sessionData]`. With an empty table
+the bytes are exactly the two-payload format, and in both cases they are the bytes
+earlier versions sent, so old and new nodes exchange snapshots.
+The follower writes each chunk's payload to its own backend as it arrives and keeps
+only the configuration and session table in memory. When the final chunk arrives
+(`done=true`) it commits the file and restores the state machine from it with
+`StateMachine.restoreSnapshot(InputStream)`. A transfer that breaks off deletes its
+temporary file and changes nothing.
+
+**State machines** written against the array methods (`takeSnapshot`,
+`prepareCowSnapshot`, `restoreSnapshot(byte[])`) keep working: the streaming methods
+default to them. Such a state machine still builds its own array; overriding the
+three streaming methods removes that last copy.
+
+**Limit**: the length word leaves 31 bits, so one snapshot payload is at most
+2 GiB. A leader with a larger snapshot logs the reason and does not send it.
 
 \newpage
 
@@ -321,6 +499,168 @@ this; a peer that predates the field is refused on an mTLS cluster, so
 leadership transfers from a not-yet-upgraded leader fail during a rolling
 upgrade. Each server logs its mode and node certificate at startup.
 
+# 8.1 Client Channel Authorisation (Keycloak)
+
+![Client channel authorisation](auth.png){width=90%}
+
+The peer transport authenticates by certificate. The client channel shares the
+port and, until this section existed, checked nothing: anyone who could reach it
+could submit commands, add or remove servers and move the leader. A client
+certificate under mTLS narrows that to holders of a cluster certificate; it does
+not say what a holder may do.
+
+With `auth.keycloak.enabled=true`, `ClientAuthInterceptor` sits in front of
+`RaftClientGrpcService` (and only there; the peer service is not asked for a
+token). Every client RPC must carry `authorization: Bearer <access token>`.
+
+**Verification is offline.** `KeycloakTokenVerifier` checks the RS256 signature
+against the realm's published keys, then issuer, expiry and, if configured,
+audience. The keys are fetched when first needed and when the realm rotates
+them; between those moments the node decides alone, so Keycloak is not on the
+path of a command and its availability does not multiply into the cluster's.
+The price: a token revoked in Keycloak stays valid here until it expires. Keep
+access tokens short-lived.
+
+**One role per RPC.** Roles come from `realm_access.roles`, plus
+`resource_access.<client>.roles` when `auth.keycloak.client.id` is set.
+
+| RPC | Required role (default name) |
+|-----|------------------------------|
+| `Query` | `raft-read` |
+| `Submit` | `raft-write` |
+| `AddServer`, `RemoveServer`, `AddLearner`, `PromoteLearner`, `RemoveLearner`, `TransferLeadership`, any RPC added later | `raft-admin` |
+
+Roles do not imply each other. A hierarchy belongs in Keycloak as composite
+roles, where those who grant roles can see it.
+
+**Refusals.** No token or one that does not verify: `UNAUTHENTICATED`. A valid
+token without the role: `PERMISSION_DENIED`, naming the role. Both are logged
+on the node and counted. `RaftClient` stops its leader walk at the first such
+answer and reports it as a refusal rather than as an unreachable node.
+
+**Configuration** (node `.properties`):
+
+```properties
+auth.keycloak.enabled=true
+auth.keycloak.issuer=https://keycloak.example/realms/raft
+# auth.keycloak.jwks.uri=   default: <issuer>/protocol/openid-connect/certs
+# auth.keycloak.audience=   optional: required "aud" of the token
+# auth.keycloak.client.id=  optional: also accept this client's resource roles
+# auth.role.read=raft-read  auth.role.write=raft-write  auth.role.admin=raft-admin
+```
+
+Authorisation is off by default so that an upgraded node keeps answering its
+existing clients; the node logs a warning at startup while it is off, and
+another if tokens are required but `tls.enabled=false`, because a token sent in
+the clear can be replayed until it expires.
+
+**Inversion of control.** `TokenVerifier` is an interface and a Spring bean
+declared `@ConditionalOnMissingBean`: a deployment with a different identity
+provider supplies its own and the Keycloak one steps aside.
+
+**Client side.**
+
+```java
+Supplier<String> token = new KeycloakTokenSupplier(
+        "https://keycloak.example/realms/raft", "raft-web", clientSecret);
+RaftClient client = new RaftClient(addresses, tlsConfig, token);
+```
+
+`KeycloakTokenSupplier` performs the client credentials grant and reuses the
+token until 30 seconds before it expires. An application acting for a logged-in
+user passes that user's token instead.
+
+**Also fixed here.** The Spring wiring registered the client service only on a
+plaintext node; with `tls.enabled=true` the node answered its peers and no
+client. Both cases now use one `GrpcTransportServer` constructor that takes the
+additional services.
+
+\newpage
+
+# 8.2 Certificate Reload Without Restart
+
+Every TLS context of a node (gRPC and Netty peer transport, client channel, metrics
+endpoint) is built from one `TlsMaterial`. It hands out a key manager and a trust
+manager that stay the same objects for the life of the node and whose content is
+replaced when the files change. A context is consulted at every handshake, so the
+next connection in or out uses the renewed certificate. Connections that are open
+keep their session; nothing is dropped and no node restarts.
+
+The three files (`tls.cert.path`, `tls.key.path`, `tls.ca.path`) are compared with
+what is in use every `tls.reload.interval.seconds` (default 30, 0 = read once at
+start). A change takes effect only if everything parses and the key belongs to the
+certificate, which is checked by signing with the one and verifying with the other.
+Renewal tools write certificate and key one after the other, and a poll can land in
+between: that state is logged as an error once, counted, and the pair in use stays
+in use. At start there is nothing to fall back on, so unreadable material stops the
+node.
+
+A CA rollover works the same way: put both authorities into the CA file, let every
+node reload, renew the node certificates from the new authority, then remove the old
+one. For this the gRPC server uses the JDK TLS engine, as the Netty transport already
+did. The native engine fixes the list of authorities it names to clients when the
+context is built, so after a rollover it would trust the new CA and still ask clients
+for a certificate of the old one.
+
+Metrics: `raft.tls.certificate.expiry.seconds` (alarm on a value that keeps falling),
+`raft.tls.reload{result=success|refused}`.
+
+Not covered: a private key in the traditional `BEGIN RSA PRIVATE KEY` form is not
+read; use PKCS#8 (`BEGIN PRIVATE KEY`), RSA or EC. A `RaftClient` reloads its client
+certificate the same way; its CA file is read when a channel is opened.
+
+# 8.3 Overload Protection
+
+A command the leader accepts occupies memory and log until a majority has stored
+it. When followers or the disk are slower than the clients, accepting everything
+only moves the queue into the leader, where it grows until every client has timed
+out on a command that will still be applied. The leader therefore refuses at the
+door:
+
+| Setting | Default | Limits |
+|---|---|---|
+| `overload.max.pending.writes` | 5000 | Commands appended and not yet committed |
+| `overload.max.pending.reads` | 5000 | Linearizable reads waiting for their heartbeat round |
+
+0 switches a limit off. A refused request is not appended and leaves no trace. The
+answer carries `overloaded=true` and `retry_after_ms`, and no leader hint, because
+the refusing node is the leader. `RaftClient` then asks the same node again with
+the same sequence number (section 5.4, so a retry cannot apply twice), pausing
+between attempts: the suggested 50 ms doubled per refusal, capped at one second and
+spread by up to half. After six refusals it throws a `RaftClientException` whose
+`overloaded()` is true, so a caller can tell load from an outage and slow down.
+
+Configuration changes and leadership transfers are not limited: they are operator
+actions and must stay possible on a loaded cluster.
+
+Between nodes the existing limits apply unchanged: at most a fixed number of
+`AppendEntries` in flight per follower and a byte limit per batch (§10.2.2), and one
+snapshot chunk per heartbeat (section 7).
+
+Metrics: `raft.client.overloaded{kind=write|read}` counts refusals,
+`raft.client.pending{kind=write|read}` shows what the limits are measured against.
+
+# 8.4 Deployment with Docker Compose
+
+![Three-node deployment](deploy.png){width=90%}
+
+`deploy/compose` describes the smallest complete deployment: three nodes and a
+Keycloak. It is the configuration the features of this section are meant to be run
+with, and each line of it is checked against the code by `ComposeDeploymentTest`.
+
+| Part | Choice | Why |
+|---|---|---|
+| Peers | mutual TLS, certificate CN = node id | the sender of every Raft message is checked against it |
+| Certificates | `certs.sh`, reload every 10 s | a renewal needs no restart (section 8.2) |
+| Clients | client certificate and Keycloak token | the client channel shares the peer port (section 8.1) |
+| Issuer | `KC_HOSTNAME` fixed, keys fetched in the cluster network | a token's `iss` must be the same for every caller |
+| Health | `/ready` per node as container health check | readiness is quorum-aware (section 11) |
+| Stdin | `-Draft.cli.enabled=false` | a container has no terminal; the end of stdin must not stop the node |
+| Data | one named volume per node | a restarted node catches up from its own log |
+
+The image is built from `config/Dockerfile` and the fat jar. The JVM is PID 1, so
+`docker stop` reaches it as SIGTERM and the node closes its storage.
+
 # 9. Storage Layer
 
 Three `RaftStorage` implementations are available:
@@ -337,7 +677,8 @@ maximum size (default 64 MB); a new segment is started when the active segment
 exceeds the limit. An in-memory index (log index to segment + file offset) is
 rebuilt on recovery by scanning all segments sequentially; frames with CRC32
 mismatches are truncated. Metadata (term/vote) and snapshots are stored in
-separate files, atomically replaced via rename. Supports deferred fsync (§10.2.1)
+separate files, atomically replaced via rename; a snapshot is written and read as a
+stream (section 7). Supports deferred fsync (§10.2.1)
 via a background thread. Compaction deletes entire obsolete segments after a
 snapshot rather than rewriting.
 
@@ -382,6 +723,11 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.snapshot.chunk.sent` | Counter | Snapshot chunks sent |
 | `raft.snapshot.chunk.received` | Counter | Snapshot chunks received |
 | `raft.client.rejected` | Counter | Client submissions rejected (not leader) |
+| `raft.client.duplicate` | Counter | Committed commands not applied again (session had seen them) |
+| `raft.read.follower` | Counter | Linearizable reads answered by this node while not leader |
+| `raft.read.index.served` | Counter | ReadIndex requests from followers this leader took on |
+| `raft.client.auth.accepted` | Counter | Client RPCs admitted by token and role |
+| `raft.client.auth.rejected` | Counter | Client RPCs refused; tag `reason` = `unauthenticated` or `forbidden` |
 | `raft.rpc.append.entries` | Timer | AppendEntries RPC handling time |
 | `raft.rpc.request.vote` | Timer | RequestVote RPC handling time |
 | `raft.rpc.install.snapshot` | Timer | InstallSnapshot RPC handling time |
@@ -392,4 +738,9 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.node.role` | Gauge | Current role (0=follower, 1=candidate, 2=leader) |
 | `raft.node.log.last.index` | Gauge | Index of the last log entry |
 | `raft.node.snapshot.index` | Gauge | Snapshot boundary (last compacted index) |
+| `raft.node.witness` | Gauge | 1 on a witness, 0 on a data node |
+| `raft.client.overloaded` | Counter | Requests refused for load, tag `kind` |
+| `raft.tls.certificate.expiry.seconds` | Gauge | Seconds until the node certificate expires |
+| `raft.tls.reload` | Counter | Renewed TLS material found on disk, tag `result` |
+| `raft.client.pending` | Gauge | Requests waiting on this node, tag `kind` |
 | `raft.cluster.size` | Gauge | Number of nodes in configuration |

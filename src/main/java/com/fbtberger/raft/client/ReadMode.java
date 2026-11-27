@@ -31,5 +31,17 @@ public enum ReadMode {
      * this is <em>not</em> -- it is not a way to read stale data on demand, because
      * the lease falls back to ReadIndex the moment it is not held.
      */
-    LEASE
+    LEASE,
+
+    /**
+     * Let a follower or learner answer. Still linearizable: the node that answers first
+     * asks the leader for a read index and waits until it has applied that far. What it
+     * takes off the leader is the read itself, so this is for read-heavy load, not for
+     * lower latency -- each read costs the leader one confirmation round, as
+     * {@link #READ_INDEX} does, plus a hop.
+     *
+     * <p>The client asks the nodes that are not the known leader first, in rotation, and
+     * the leader last. A node too far behind refuses and the next one is tried.
+     */
+    FOLLOWER
 }

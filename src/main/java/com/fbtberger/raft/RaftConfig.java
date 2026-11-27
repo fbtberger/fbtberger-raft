@@ -4,6 +4,7 @@
  */
 package com.fbtberger.raft;
 
+import com.fbtberger.raft.auth.ClientAuthConfig;
 import com.fbtberger.raft.transport.RpcTimeouts;
 import com.fbtberger.raft.transport.TlsConfig;
 
@@ -44,6 +45,10 @@ public final class RaftConfig {
 
     private static final int DEFAULT_SNAPSHOT_THRESHOLD = 100;
     private static final int DEFAULT_SNAPSHOT_CHUNK_SIZE = 1_048_576; // 1 MB
+    /** Committed entries a witness keeps behind its commit index. See {@link #witnessLogRetain()}. */
+    public static final int DEFAULT_WITNESS_LOG_RETAIN = 10_000;
+    /** Default for {@link #maxPendingWrites()} and {@link #maxPendingReads()}. */
+    public static final int DEFAULT_MAX_PENDING = 5_000;
 
     private final String selfId;
     private final int selfPort;
@@ -55,10 +60,36 @@ public final class RaftConfig {
     private final boolean learner;
     private final RpcTimeouts rpcTimeouts;
     private final TlsConfig tlsConfig;
+    private final ClientAuthConfig clientAuthConfig;
+    private final boolean witness;
+    private final int witnessLogRetain;
+    // Not constructor arguments: every other setting describes the node, these two tune
+    // it, and a twelfth and thirteenth positional int would be one transposition away
+    // from a silent mistake. Set by load() and withOverloadLimits().
+    private int maxPendingWrites = DEFAULT_MAX_PENDING;
+    private int maxPendingReads = DEFAULT_MAX_PENDING;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
                        int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
-                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig) {
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ClientAuthConfig clientAuthConfig) {
+        this(selfId, selfPort, dataDir, peerAddresses, snapshotThreshold, snapshotChunkSize, metricsPort,
+                learner, rpcTimeouts, tlsConfig, clientAuthConfig, false, DEFAULT_WITNESS_LOG_RETAIN);
+    }
+
+    private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
+                       int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
+                       RpcTimeouts rpcTimeouts, TlsConfig tlsConfig, ClientAuthConfig clientAuthConfig,
+                       boolean witness, int witnessLogRetain) {
+        if (witness && learner) {
+            throw new IllegalArgumentException("node.witness and node.learner exclude each other: "
+                    + "a witness exists to vote, a learner does not vote");
+        }
+        if (witnessLogRetain < 0) {
+            throw new IllegalArgumentException("witness.log.retain must not be negative: " + witnessLogRetain);
+        }
+        this.witness = witness;
+        this.witnessLogRetain = witnessLogRetain;
+        this.clientAuthConfig = clientAuthConfig;
         this.selfId = selfId;
         this.selfPort = selfPort;
         this.dataDir = dataDir;
@@ -105,7 +136,18 @@ public final class RaftConfig {
         }
         RpcTimeouts rpcTimeouts = RpcTimeouts.fromProperties(props);
         TlsConfig tlsConfig = TlsConfig.fromProperties(props);
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
+        ClientAuthConfig clientAuthConfig = ClientAuthConfig.fromProperties(props);
+        // A witness votes and stores the log and holds no state: see RaftNode#isWitness.
+        boolean witness = Boolean.parseBoolean(props.getProperty("node.witness", "false"));
+        int witnessLogRetain = Integer.parseInt(
+                props.getProperty("witness.log.retain", Integer.toString(DEFAULT_WITNESS_LOG_RETAIN)));
+        RaftConfig loaded = new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize,
+                metricsPort, learner, rpcTimeouts, tlsConfig, clientAuthConfig, witness, witnessLogRetain);
+        return loaded.withOverloadLimits(
+                Integer.parseInt(props.getProperty("overload.max.pending.writes",
+                        Integer.toString(DEFAULT_MAX_PENDING))),
+                Integer.parseInt(props.getProperty("overload.max.pending.reads",
+                        Integer.toString(DEFAULT_MAX_PENDING))));
     }
 
     /**
@@ -139,7 +181,39 @@ public final class RaftConfig {
             throw new IllegalArgumentException("peer list must include self (" + selfId + ")");
         }
         return new RaftConfig(selfId, selfPort, dataDir, copy,
-                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig);
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                ClientAuthConfig.disabled());
+    }
+
+    /** This configuration with client-channel authorisation set as given; everything else unchanged. */
+    public RaftConfig withClientAuth(ClientAuthConfig auth) {
+        return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, auth,
+                witness, witnessLogRetain).withOverloadLimits(maxPendingWrites, maxPendingReads);
+    }
+
+    /**
+     * This configuration with the given admission limits; everything else unchanged.
+     * 0 switches a limit off.
+     */
+    public RaftConfig withOverloadLimits(int maxPendingWrites, int maxPendingReads) {
+        if (maxPendingWrites < 0 || maxPendingReads < 0) {
+            throw new IllegalArgumentException("overload limits must not be negative (writes="
+                    + maxPendingWrites + ", reads=" + maxPendingReads + "); 0 switches one off");
+        }
+        RaftConfig copy = new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                clientAuthConfig, witness, witnessLogRetain);
+        copy.maxPendingWrites = maxPendingWrites;
+        copy.maxPendingReads = maxPendingReads;
+        return copy;
+    }
+
+    /** This configuration as a witness that keeps {@code logRetain} committed entries; everything else unchanged. */
+    public RaftConfig asWitness(int logRetain) {
+        return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                clientAuthConfig, true, logRetain).withOverloadLimits(maxPendingWrites, maxPendingReads);
     }
 
     private static String require(Properties props, String key) {
@@ -191,8 +265,43 @@ public final class RaftConfig {
      */
     public boolean isLearner() { return learner; }
 
+    /**
+     * Whether this node is a witness: a voting member that stores the log and has no
+     * state machine. Set via {@code node.witness=true}. Unlike {@code node.learner}
+     * this is a property of the node, not of the cluster configuration, and holds for
+     * as long as the node runs with it.
+     */
+    public boolean isWitness() { return witness; }
+
+    /**
+     * How many committed entries a witness keeps behind its commit index when it
+     * compacts ({@code witness.log.retain}, default {@value #DEFAULT_WITNESS_LOG_RETAIN}).
+     * This tail is all a witness can give a data node that fell behind: it has no
+     * snapshot to send. A data node further behind than this needs another data node.
+     */
+    public int witnessLogRetain() { return witnessLogRetain; }
+
+    /**
+     * How many client commands the leader lets wait for their commit before it refuses
+     * new ones ({@code overload.max.pending.writes}, default {@value #DEFAULT_MAX_PENDING};
+     * 0 = no limit). A command waits here from the moment it is appended until a majority
+     * has stored it, so this bounds what a slow disk or a slow follower can pile up in the
+     * leader's memory and in its log.
+     */
+    public int maxPendingWrites() { return maxPendingWrites; }
+
+    /**
+     * How many linearizable reads the leader lets wait for their heartbeat round before it
+     * refuses new ones ({@code overload.max.pending.reads}, default
+     * {@value #DEFAULT_MAX_PENDING}; 0 = no limit).
+     */
+    public int maxPendingReads() { return maxPendingReads; }
+
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 
     public TlsConfig tlsConfig() { return tlsConfig; }
+
+    /** Who may use the client channel ({@code auth.*} properties); disabled unless configured. */
+    public ClientAuthConfig clientAuthConfig() { return clientAuthConfig; }
 
 }

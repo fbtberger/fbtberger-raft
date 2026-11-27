@@ -30,8 +30,8 @@ public final class GrpcTransportFactory implements RaftTransportFactory {
         }
         try {
             var sslContext = GrpcSslContexts.forClient()
-                    .keyManager(tlsConfig.certFile(), tlsConfig.keyFile())
-                    .trustManager(tlsConfig.caFile())
+                    .keyManager(tlsConfig.material().keyManager())
+                    .trustManager(tlsConfig.material().trustManager())
                     .build();
             return new GrpcTransport(
                     NettyChannelBuilder.forTarget(address).sslContext(sslContext).build());

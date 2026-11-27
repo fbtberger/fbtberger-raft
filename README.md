@@ -40,11 +40,23 @@ For a quick API reference, see the
     excluded from every majority) and is promoted to a voter only once caught up,
     so adding capacity never opens an availability gap
   - §4 errata fix (config changes rejected until leader's no-op commits)
+- **Certificate reload without restart**: a renewed certificate, key or CA on
+  disk is picked up within `tls.reload.interval.seconds` and used for every new
+  connection; open connections stay up
+- **Overload protection**: the leader refuses commands and reads beyond a
+  configurable number waiting, and `RaftClient` backs off and retries the same
+  node instead of timing out
+- **Witness nodes**: a voting member with a log and no state machine
+  (`node.witness=true`). Two data nodes and a witness survive the loss of any one
+  node with the state stored twice. A witness leads only to carry committed
+  entries to a data node and hands the lead over at once
 - **Log compaction / snapshotting** (§7):
   - Chunked InstallSnapshot (Figure 13) with configurable chunk size
-  - Copy-on-write async snapshotting (§5.1): `prepareCowSnapshot()` captures a
+  - Copy-on-write async snapshotting (§5.1): `prepareSnapshotWriter()` captures a
     lightweight reference under the lock; serialization and disk I/O run on a
     background thread without blocking the Raft lock
+  - Streaming snapshots: written to disk, sent, received and restored chunk by
+    chunk, so a snapshot costs one chunk of memory whatever the size of the state
   - Independent per-server compaction with configurable threshold
 - **Named state machines**: a node runs its application state machine and any
   number of named ones beside it (`StateMachineRegistry`, one
@@ -75,8 +87,19 @@ For a quick API reference, see the
     heartbeat round before allowing reads
   - Lease-based: `leaseRead()` serves reads immediately when the leader's lease
     is valid (majority acked within election timeout); falls back to ReadIndex
+  - Follower reads: `queryAnyRole()` / `ReadMode.FOLLOWER` let a follower or
+    learner answer a linearizable read; the leader only supplies the read index
+    (`ReadIndex` peer RPC), the follower waits until it has applied that far
+- **Exactly-once commands** (§8): client sessions. A command tagged with a client
+  id and a sequence number is applied once however often it is retried, across
+  leader changes, restarts and log compaction; `RaftClient` tags every `submit()`
+- **Client channel authorisation with Keycloak**: with `auth.keycloak.enabled=true`
+  every client RPC needs a Keycloak access token, verified offline against the
+  realm's keys, and one role per RPC (`raft-read` for Query, `raft-write` for
+  Submit, `raft-admin` for membership changes and leadership transfer)
 - **Spring IoC** wiring with `@ConditionalOnMissingBean` for overridable components
-- **Docker** deployment configuration
+- **Docker** deployment configuration, and a Compose file for a three-node cluster
+  with Keycloak and mutual TLS (`deploy/compose`)
 - **JaCoCo** test coverage reporting
 
 ## Project layout
@@ -98,7 +121,7 @@ fbtberger-raft/
     ├── main/
     │   ├── proto/
     │   │   ├── raft.proto              # RequestVote, AppendEntries, InstallSnapshot,
-    │   │   │                           # PreVote, TimeoutNow
+    │   │   │                           # PreVote, TimeoutNow, ReadIndex
     │   │   └── client.proto            # Submit, AddServer, RemoveServer
     │   ├── resources/
     │   │   └── logback-raftserver.xml  # logging for the standalone server only
@@ -116,12 +139,20 @@ fbtberger-raft/
     │       ├── StateMachineRegistration.java # Spring bean type that adds a named state machine
     │       ├── LeaderPreparation.java      # optional leader-only hook before the append
     │       ├── KeyValueStateMachine.java   # demo key-value store
+    │       ├── ClientSessions.java         # replicated session table (exactly-once, §8)
     │       ├── RaftClientGrpcService.java  # client-facing gRPC adapter
     │       ├── RaftNodeMXBean.java         # JMX management interface
     │       ├── RaftNodeMBean.java          # JMX MXBean implementation
     │       ├── HealthCheck.java            # liveness + readiness checks
     │       ├── RaftNodeConfiguration.java  # Spring IoC wiring
     │       ├── RaftServer.java             # main() + interactive CLI
+    │       ├── auth/                       # Keycloak authorisation of the client channel
+    │       │   ├── ClientAuthConfig.java         # auth.* properties
+    │       │   ├── ClientAuthInterceptor.java    # token + role check per client RPC
+    │       │   ├── TokenVerifier.java            # verifier interface (injectable)
+    │       │   ├── KeycloakTokenVerifier.java    # offline JWT verification (JWKS)
+    │       │   ├── KeycloakTokenSupplier.java    # client credentials grant, cached
+    │       │   └── BearerTokenInterceptor.java   # client side: attaches the token
     │       ├── transport/
     │       │   ├── RaftTransport.java           # outbound peer interface
     │       │   ├── RaftTransportFactory.java     # connection factory interface
@@ -184,6 +215,10 @@ peer.node3=host3:9093
 snapshot.threshold=100          # entries before auto-snapshot
 snapshot.chunk.size=1048576     # InstallSnapshot chunk size (bytes)
 metrics.port=0                  # Prometheus endpoint (0 = disabled)
+node.witness=false              # true: vote and store the log, hold no state
+witness.log.retain=10000        # committed entries a witness keeps when it compacts
+overload.max.pending.writes=5000  # uncommitted commands the leader accepts (0 = no limit)
+overload.max.pending.reads=5000   # waiting linearizable reads it accepts (0 = no limit)
 
 # Per-RPC timeouts (ms)
 rpc.timeout.request.vote.ms=1000
@@ -191,12 +226,22 @@ rpc.timeout.append.entries.ms=2000
 rpc.timeout.install.snapshot.ms=30000
 rpc.timeout.pre.vote.ms=1000
 
+# Client channel authorisation (optional, off by default)
+auth.keycloak.enabled=false
+auth.keycloak.issuer=https://keycloak.example/realms/raft
+auth.keycloak.audience=          # optional: required "aud" of the token
+auth.keycloak.client.id=         # optional: also accept this client's resource roles
+auth.role.read=raft-read
+auth.role.write=raft-write
+auth.role.admin=raft-admin
+
 # TLS (optional)
 tls.enabled=false
 tls.cert.path=/path/to/cert.pem
 tls.key.path=/path/to/key.pem
 tls.ca.path=/path/to/ca.pem
 tls.mtls.enabled=false
+tls.reload.interval.seconds=30  # check the three files for a renewed certificate (0 = never)
 
 ```
 
@@ -255,6 +300,24 @@ quit             # shut down
 docker build -f config/Dockerfile -t fbtberger-raft .
 ```
 
+Without a terminal attached (`docker run -d`, Compose, a service unit) start the node
+with `JAVA_OPTS=-Draft.cli.enabled=false`. Otherwise it stops when its stdin ends.
+
+### Three nodes with Docker Compose
+
+`deploy/compose` starts three nodes and a Keycloak: mutual TLS between peers, Keycloak
+tokens on the client channel, a health check and a Prometheus endpoint per node.
+
+```
+./gradlew shadowJar
+cd deploy/compose
+./certs.sh
+docker compose up --build -d
+```
+
+See `deploy/compose/README.md` for the client call, the accounts in the realm,
+certificate renewal without a restart and the witness variant.
+
 ## Metrics & JMX
 
 When `metrics.port` is configured, the following HTTP endpoints are exposed:
@@ -279,10 +342,27 @@ See [docs/architecture.pdf](docs/architecture.pdf) for the full metrics table.
 open build/reports/jacoco/test/html/index.html
 ```
 
-## What is *not* implemented
+## Known limits
 
-- **Client request de-duplication** (§8): retried commands may be applied twice.
-  A production system would track per-client serial numbers.
+- **Witness nodes**: a witness has no snapshot to send. A data node that is further
+  behind than `witness.log.retain` entries can only catch up from another data
+  node. Never start a data node on a directory a witness has used; the node
+  refuses to start in that case.
+- **Snapshot size**: one snapshot payload is at most 2 GiB (31-bit length word in
+  the transfer format). State machines that only implement the array methods
+  (`takeSnapshot`, `restoreSnapshot(byte[])`) still build their state as one array;
+  override the streaming methods to avoid that.
+- **Token revocation**: tokens are verified offline, so one revoked in Keycloak
+  stays valid on the cluster until it expires. Keep access tokens short-lived.
+- **Local operator interfaces are not covered by Keycloak**: the interactive CLI
+  on the node's stdin and the JMX MBean act in-process and bypass the client
+  channel. Protect them with host access and JMX authentication.
+
+- **Client sessions and mixed versions**: a node older than client sessions stores
+  a command's session tag but applies a duplicate anyway. Upgrade every node
+  before any client sends tags (every `RaftClient` from this version on does).
+- **Session eviction**: at most 4096 client sessions are remembered, least recently
+  used first. See section 5.4 of the architecture document.
 
 ## License
 

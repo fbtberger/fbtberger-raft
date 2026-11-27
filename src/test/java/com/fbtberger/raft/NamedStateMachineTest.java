@@ -162,6 +162,89 @@ class NamedStateMachineTest {
         assertEquals("order 1", text(store.getSnapshot().stateMachineData));
     }
 
+    // ---- together with client sessions and follower reads ------------------
+
+    @Test
+    void aRepeatedCommandForANamedStateMachineIsAppliedOnce() throws Exception {
+        Recorder app = new Recorder();
+        Recorder values = new Recorder();
+        InMemoryStorage store = new InMemoryStorage();
+        startLeader(store, app, values);
+
+        byte[] first = node.submitCommand("values", utf8("issue 3"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+        byte[] again = node.submitCommand("values", utf8("issue 3"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+
+        assertEquals(List.of("issue 3"), values.applied);
+        assertTrue(app.applied.isEmpty());
+        assertEquals("issue 3", text(first));
+        assertEquals("issue 3", text(again));
+        LogEntry entry = store.getLogEntry(store.getLastLogIndex());
+        assertEquals("values", entry.getNamedCommand().getStateMachine());
+        assertEquals("client-1", entry.getClientId());
+    }
+
+    @Test
+    void theSameClientNumbersItsCommandsAcrossStateMachines() throws Exception {
+        Recorder app = new Recorder();
+        Recorder values = new Recorder();
+        startLeader(new InMemoryStorage(), app, values);
+
+        node.submitCommand(utf8("order 1"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+        node.submitCommand("values", utf8("issue 3"), "client-1", 2, 1).get(2, TimeUnit.SECONDS);
+        // The repeat of number 2 is a repeat whichever state machine it names now.
+        byte[] again = node.submitCommand(utf8("order 2"), "client-1", 2, 1).get(2, TimeUnit.SECONDS);
+
+        assertEquals(List.of("order 1"), app.applied);
+        assertEquals(List.of("issue 3"), values.applied);
+        assertEquals("issue 3", text(again));
+    }
+
+    @Test
+    void aTaggedCommandIsPreparedAndARepeatIsAnsweredWithTheFirstResult() throws Exception {
+        PreparingRecorder values = new PreparingRecorder();
+        InMemoryStorage store = new InMemoryStorage();
+        startLeader(store, new Recorder(), values);
+
+        byte[] first = node.submitCommand("values", utf8("issue"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+        byte[] again = node.submitCommand("values", utf8("issue"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+
+        assertEquals(List.of("issue", "issue"), values.prepared);
+        assertEquals(List.of("issue @leader"), values.applied);
+        assertEquals("issue @leader", text(first));
+        assertEquals("issue @leader", text(again));
+    }
+
+    @Test
+    void aTaggedCommandForAnUnknownStateMachineOrOneThatFailsToPrepareAppendsNothing() throws Exception {
+        InMemoryStorage store = new InMemoryStorage();
+        StateMachine refusing = new RefusingRecorder();
+        startLeader(store, new Recorder(), refusing);
+        long lastIndexBefore = store.getLastLogIndex();
+
+        ExecutionException unknown = assertThrows(ExecutionException.class,
+                () -> node.submitCommand("nobody", utf8("x"), "client-1", 1, 0).get(2, TimeUnit.SECONDS));
+        ExecutionException refused = assertThrows(ExecutionException.class,
+                () -> node.submitCommand("values", utf8("x"), "client-1", 1, 0).get(2, TimeUnit.SECONDS));
+        ExecutionException refusedPlain = assertThrows(ExecutionException.class,
+                () -> node.submitCommand("values", utf8("x")).get(2, TimeUnit.SECONDS));
+
+        assertInstanceOf(UnknownStateMachineException.class, unknown.getCause());
+        assertInstanceOf(IllegalStateException.class, refused.getCause());
+        assertInstanceOf(IllegalStateException.class, refusedPlain.getCause());
+        assertEquals(lastIndexBefore, store.getLastLogIndex());
+    }
+
+    @Test
+    void aReadFromAnyRoleIsAnsweredByTheStateMachineItNames() throws Exception {
+        startLeader(new InMemoryStorage(), new Recorder(), new Recorder());
+        node.submitCommand(utf8("a")).get(2, TimeUnit.SECONDS);
+        node.submitCommand("values", utf8("b")).get(2, TimeUnit.SECONDS);
+
+        assertEquals("a", text(node.queryAnyRole(utf8("?")).get(2, TimeUnit.SECONDS)));
+        assertEquals("b", text(node.queryAnyRole("values", utf8("?")).get(2, TimeUnit.SECONDS)));
+        assertTrue(node.queryAnyRole("nobody", utf8("?")).isCompletedExceptionally());
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     private void startLeader(InMemoryStorage store, StateMachine app, StateMachine values) throws Exception {
@@ -221,6 +304,13 @@ class NamedStateMachineTest {
             if (snapshot.length > 0) {
                 applied.addAll(List.of(text(snapshot).split("\n")));
             }
+        }
+    }
+
+    private static final class RefusingRecorder extends Recorder implements LeaderPreparation {
+        @Override
+        public byte[] prepare(byte[] command) {
+            return null;
         }
     }
 

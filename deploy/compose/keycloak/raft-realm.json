@@ -1,0 +1,63 @@
+{
+  "realm": "raft",
+  "enabled": true,
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "raft-read", "description": "May read from the Raft cluster (Query)" },
+      { "name": "raft-write", "description": "May write to the Raft cluster (Submit)" },
+      { "name": "raft-admin", "description": "May change membership and transfer leadership" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "raft-service",
+      "name": "Service account for applications that use the Raft cluster",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "raft-service-dev-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false
+    },
+    {
+      "clientId": "raft-cli",
+      "name": "Public client for people: password grant, development only",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-raft-service",
+      "enabled": true,
+      "serviceAccountClientId": "raft-service",
+      "realmRoles": ["raft-read", "raft-write"]
+    },
+    {
+      "username": "operator",
+      "enabled": true,
+      "firstName": "Cluster",
+      "lastName": "Operator",
+      "email": "operator@example.invalid",
+      "emailVerified": true,
+      "credentials": [{ "type": "password", "value": "operator", "temporary": false }],
+      "realmRoles": ["raft-read", "raft-write", "raft-admin"]
+    },
+    {
+      "username": "reader",
+      "enabled": true,
+      "firstName": "Read",
+      "lastName": "Only",
+      "email": "reader@example.invalid",
+      "emailVerified": true,
+      "credentials": [{ "type": "password", "value": "reader", "temporary": false }],
+      "realmRoles": ["raft-read"]
+    }
+  ]
+}

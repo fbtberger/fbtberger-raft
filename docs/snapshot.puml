@@ -1,32 +1,43 @@
 @startuml
-title Chunked Snapshot Transfer (§7 / §5.1 COW)
+title Streaming Snapshot Transfer (§7 / §5.1 COW)
 skinparam defaultFontSize 10
 
+participant "StateMachine" as SM
 participant "Leader" as L
+database "Leader storage" as LS
 participant "Follower" as F
+database "Follower storage" as FS
 
-note over L: Follower's nextIndex <= snapshotIndex\nNeed to send snapshot instead of AppendEntries
+== Taking the snapshot (background thread) ==
+L -> SM: prepareSnapshotWriter()\n(under the Raft lock)
+SM --> L: SnapshotWriter
+L -> LS: beginSnapshot(100, term)
+L -> LS: writer.writeTo(sink.stream())\ninto a temporary file
+L -> LS: sink.commit(config, sessions)\nrename, compact the log
 
-L -> L: Load snapshot\nPack SM data + config data\ninto single byte stream
-L -> L: Create SnapshotTransfer\n(tracks offset, inFlight)
+note over L: Follower's nextIndex <= snapshotIndex\nSend the snapshot instead of AppendEntries
+
+L -> LS: getSnapshotMeta()
+L -> L: Create SnapshotTransfer\n(offset, inFlight; no payload)
 
 == Chunk 1 ==
-L -> F: InstallSnapshot(\n  lastIncludedIndex=100,\n  offset=0,\n  data=[chunk1],\n  done=false)
-
-note over F: Buffer chunk at offset 0
+L -> LS: readSnapshotData(100, offset 0)
+L -> F: InstallSnapshot(\n  lastIncludedIndex=100,\n  offset=0,\n  data=[header + chunk1],\n  done=false)
+F -> FS: beginSnapshot(100, term)\nwrite chunk to temporary file
 F --> L: InstallSnapshotResponse(term=T)
 note over L: Advance transfer.nextOffset
 
 == Chunk 2 ==
+L -> LS: readSnapshotData(100, offset)
 L -> F: InstallSnapshot(\n  offset=1048576,\n  data=[chunk2],\n  done=false)
-
-note over F: Append chunk to buffer
+F -> FS: append chunk to temporary file
 F --> L: InstallSnapshotResponse(term=T)
 
 == Final Chunk ==
-L -> F: InstallSnapshot(\n  offset=2097152,\n  data=[chunk3],\n  done=true)
-
-note over F: Reassemble full snapshot\nUnpack SM + config data\nsaveSnapshotAndCompact\nrestoreSnapshot\nRecompute configuration
+L -> F: InstallSnapshot(\n  offset=2097152,\n  data=[chunk3 + config + sessions],\n  done=true)
+F -> FS: write rest of payload\nsink.commit(config, sessions)
+F -> FS: openSnapshotData()
+note over F: restoreSnapshot(InputStream)\nRestore session table\nRecompute configuration
 F --> L: InstallSnapshotResponse(term=T)
 
 note over L: matchIndex[F] = 100\nnextIndex[F] = 101\nResume normal AppendEntries

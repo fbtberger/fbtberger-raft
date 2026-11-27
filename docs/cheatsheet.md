@@ -68,6 +68,20 @@ public class MyStateMachine
     var copy = shallowCopy(state); // fast
     return () -> serialize(copy);  // lazy
   }
+
+  // Optional streaming overrides: no array
+  // of the whole state, ever.
+  @Override
+  public SnapshotWriter prepareSnapshotWriter() {
+    var copy = shallowCopy(state);
+    return out -> writeTo(copy, out);
+  }
+
+  @Override
+  public void restoreSnapshot(InputStream in)
+      throws IOException {
+    state = readFrom(in);
+  }
 }
 ```
 
@@ -102,6 +116,35 @@ RaftClient client = new RaftClient(
 byte[] result = client.submit(cmd);
 ```
 
+**Exactly once (§8):** `RaftClient` tags every command with its own
+`clientId` and a sequence number and keeps the tag across retries, so a
+retried command is applied once. In-process, pass the tag yourself:
+
+```java
+node.submitCommand(cmd, "client-a",
+    /*sequence*/ 7, /*acked*/ 6);
+```
+
+## Client Authorisation (Keycloak)
+
+Node `.properties`:
+
+```properties
+auth.keycloak.enabled=true
+auth.keycloak.issuer=https://kc/realms/raft
+```
+
+Roles: `Query` needs `raft-read`, `Submit` needs `raft-write`,
+everything else `raft-admin`. Client:
+
+```java
+var token = new KeycloakTokenSupplier(
+    "https://kc/realms/raft",
+    "raft-web", clientSecret);
+var client = new RaftClient(
+    addresses, tlsConfig, token);
+```
+
 ## Leadership Transfer (new)
 
 ```java
@@ -128,6 +171,14 @@ String v = stateMachine.get("key");
 ```
 
 `leaseRead()` serves instantly if majority acked within election timeout; falls back to `readIndex()` otherwise. Assumes bounded clock skew.
+
+**Follower reads** (linearizable, served off the leader):
+
+```java
+client.query(q, timeout,
+    ReadMode.FOLLOWER);
+node.queryAnyRole(q);   // in-process
+```
 
 ## Cluster Reconfiguration
 
@@ -326,6 +377,11 @@ curl http://localhost:10091/metrics
 |-----------|---------|--------|
 | `snapshot.threshold` | 100 | Entries before auto-snapshot |
 | `snapshot.chunk.size` | 1 MB | InstallSnapshot chunk size |
+| `node.witness` | false | Vote, store log, no state |
+| `witness.log.retain` | 10000 | Entries a witness keeps |
+| `tls.reload.interval.seconds` | 30 | Check for renewed certificate |
+| `overload.max.pending.writes` | 5000 | Uncommitted commands accepted |
+| `overload.max.pending.reads` | 5000 | Waiting reads accepted |
 | `rpc.timeout.*.ms` | 1-30s | Per-RPC timeout |
 | `HEARTBEAT_INTERVAL_MS` | 50 | Heartbeat frequency |
 | `ELECTION_TIMEOUT_*_MS` | 150-300 | Election timeout range |

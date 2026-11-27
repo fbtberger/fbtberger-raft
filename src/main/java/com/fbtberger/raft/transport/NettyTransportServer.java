@@ -8,6 +8,8 @@ import com.fbtberger.raft.proto.AppendEntriesRequest;
 import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.RequestVoteRequest;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.MessageLite;
@@ -106,7 +108,11 @@ public final class NettyTransportServer implements RaftTransportServer {
 
     @Override
     public void close() {
-        if (serverChannel != null) serverChannel.close();
+        // Wait for the listening socket to be released. close() on a channel only
+        // schedules the close, so a caller that closed this server and bound the same
+        // port straight away -- a restart in the same process, or the next test -- could
+        // lose the race and get "Address already in use" from a server that was "closed".
+        if (serverChannel != null) serverChannel.close().syncUninterruptibly();
         bossGroup.shutdownGracefully();
         workerGroup.shutdownGracefully();
     }
@@ -211,6 +217,18 @@ public final class NettyTransportServer implements RaftTransportServer {
                         response = handler.handleTimeoutNow(req);
                         respType = NettyProtocol.TIMEOUT_NOW_RESP;
                     }
+                    case NettyProtocol.READ_INDEX_REQ -> {
+                        ReadIndexRequest req = ReadIndexRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "ReadIndex", req.getRequesterId())) return;
+                        // Answered when the leader has confirmed itself, not on this event
+                        // loop: blocking here for a heartbeat round would stall every other
+                        // request on the connection. A failure is answered as "no", because
+                        // on this wire an unanswered request id waits until the timeout.
+                        handler.handleReadIndex(req).whenComplete((answer, failure) ->
+                                write(ctx, NettyProtocol.READ_INDEX_RESP, reqId,
+                                        failure == null ? answer : ReadIndexResponse.getDefaultInstance()));
+                        return;
+                    }
                     default -> throw new IllegalStateException("unknown request type: " + type);
                 }
             } catch (InvalidProtocolBufferException e) {
@@ -218,6 +236,10 @@ public final class NettyTransportServer implements RaftTransportServer {
                 return;
             }
 
+            write(ctx, respType, reqId, response);
+        }
+
+        private void write(ChannelHandlerContext ctx, byte respType, int reqId, MessageLite response) {
             byte[] respPayload = response.toByteArray();
             ByteBuf buf = ctx.alloc().buffer(NettyProtocol.HEADER_BYTES + respPayload.length);
             buf.writeByte(respType);

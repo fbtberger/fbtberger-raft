@@ -1,0 +1,29 @@
+@startuml
+title Client Sessions: a retry across a leader change (§8)
+skinparam defaultFontSize 10
+
+participant "RaftClient\n(clientId=c, seq=7)" as C
+participant "Leader A" as A
+participant "Leader B\n(after election)" as B
+participant "StateMachine\n(every server)" as SM
+
+C -> A: Submit(cmd, client_id=c,\n  sequence=7, acked=6)
+A -> A: append LogEntry(cmd, c, 7, acked=6)
+note over A, B: entry replicated and committed
+A -> SM: sessions.begin(c, 7) = NEW\napply(cmd) -> r\nsessions.record(c, 7, r)
+A -x C: response lost\n(leader A crashes)
+
+== Leader change ==
+note over B: B applied the same entry from its log:\nits session table already holds (c, 7) -> r
+
+C -> B: Submit(cmd, client_id=c,\n  sequence=7, acked=6)\n(same tag, the retry)
+B -> B: append LogEntry(cmd, c, 7, acked=6)
+note over B: committed like any other entry
+B -> SM: sessions.begin(c, 7) = DUPLICATE\nstate machine is NOT called
+B --> C: SubmitResponse(result = r)
+
+== Next command ==
+C -> B: Submit(cmd2, client_id=c,\n  sequence=8, acked=7)
+B -> SM: sessions.begin(c, 8, acked=7)\ndrops the result held for 7\napply(cmd2)
+B --> C: SubmitResponse(result = r2)
+@enduml

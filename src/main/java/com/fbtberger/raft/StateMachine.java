@@ -133,6 +133,52 @@ public interface StateMachine {
         return () -> data;
     }
 
+    // ------------------------------------------------------------------
+    // Streaming snapshots: the same three operations without the byte[]
+    // ------------------------------------------------------------------
+
+    /**
+     * Writes the snapshot {@link #takeSnapshot()} would return, to a stream.
+     *
+     * <p>{@code RaftNode} only ever calls the three streaming methods; the {@code byte[]}
+     * ones above are what their defaults fall back to. So an existing state machine
+     * keeps working unchanged and keeps its cost -- the whole snapshot in one array --
+     * while one that overrides these never has its state in memory twice: the bytes go
+     * from here to the storage backend's file, from that file to the wire in chunks,
+     * and from the wire to the receiver's file.
+     *
+     * <p>Override all three or none. The bytes must be the same either way, because a
+     * snapshot written by one path may be restored through the other after an upgrade.
+     */
+    default void writeSnapshot(java.io.OutputStream out) throws java.io.IOException {
+        out.write(takeSnapshot());
+    }
+
+    /** Writes one captured state. See {@link #prepareSnapshotWriter()}. */
+    @FunctionalInterface
+    interface SnapshotWriter {
+        void writeTo(java.io.OutputStream out) throws java.io.IOException;
+    }
+
+    /**
+     * The streaming form of {@link #prepareCowSnapshot()}, under the same contract --
+     * and it is the safety contract described there, not a performance one: this method
+     * runs under the Raft lock and must capture the state as of now; the returned writer
+     * runs later on another thread and must write exactly that captured state.
+     */
+    default SnapshotWriter prepareSnapshotWriter() {
+        java.util.function.Supplier<byte[]> captured = prepareCowSnapshot();
+        return out -> out.write(captured.get());
+    }
+
+    /**
+     * The streaming form of {@link #restoreSnapshot(byte[])}: replaces the entire state
+     * with what {@code in} holds. The stream ends where the snapshot ends.
+     */
+    default void restoreSnapshot(java.io.InputStream in) throws java.io.IOException {
+        restoreSnapshot(in.readAllBytes());
+    }
+
     /**
      * Replaces this state machine's entire current state with what's encoded
      * in {@code snapshot}, as produced by a prior call to

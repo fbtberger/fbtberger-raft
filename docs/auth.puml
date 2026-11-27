@@ -1,0 +1,39 @@
+@startuml
+title Client Channel Authorisation with Keycloak
+skinparam defaultFontSize 10
+
+participant "RaftClient" as C
+participant "Keycloak\n(realm)" as K
+box "Raft node" #F6F6F6
+participant "ClientAuthInterceptor" as I
+participant "KeycloakTokenVerifier" as V
+participant "RaftClientGrpcService" as S
+end box
+
+== Token (service account, cached until shortly before expiry) ==
+C -> K: POST .../openid-connect/token\n(client_credentials)
+K --> C: access_token (JWT, RS256)
+
+== First request: realm keys are fetched once ==
+C -> I: Submit(cmd)\nauthorization: Bearer <token>
+I -> V: verify(token)
+V -> K: GET .../openid-connect/certs
+K --> V: JWK set (cached)
+V -> V: signature (RS256 only)\nissuer, expiry, audience
+V --> I: AuthenticatedClient(subject, roles)
+I -> I: Submit needs 'raft-write'
+I -> S: Submit(cmd)
+S --> C: SubmitResponse
+
+== Later requests: no call to Keycloak ==
+C -> I: AddServer(n4)\nauthorization: Bearer <token>
+I -> V: verify(token)
+V --> I: AuthenticatedClient(subject, roles)
+I -> I: AddServer needs 'raft-admin'
+I --> C: PERMISSION_DENIED\n(role 'raft-admin' is required)
+note over S: never reached
+
+== No or invalid token ==
+C -> I: Query(q)
+I --> C: UNAUTHENTICATED
+@enduml

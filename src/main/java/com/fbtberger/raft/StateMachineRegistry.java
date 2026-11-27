@@ -4,7 +4,19 @@
  */
 package com.fbtberger.raft;
 
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PushbackInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashSet;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -66,8 +78,15 @@ public final class StateMachineRegistry {
     private final StateMachine application;
     /** Sorted, so every server writes the sections in the same order. */
     private final Map<String, StateMachine> named;
+    /** A witness's registry: every name leads to the one state machine that keeps nothing. */
+    private final boolean anyName;
 
     public StateMachineRegistry(StateMachine application, Map<String, StateMachine> named) {
+        this(application, named, false);
+    }
+
+    private StateMachineRegistry(StateMachine application, Map<String, StateMachine> named, boolean anyName) {
+        this.anyName = anyName;
         this.application = Objects.requireNonNull(application, "application");
         TreeMap<String, StateMachine> copy = new TreeMap<>();
         for (Map.Entry<String, StateMachine> entry : named.entrySet()) {
@@ -80,6 +99,16 @@ public final class StateMachineRegistry {
     /** A registry with the application state machine only. */
     public static StateMachineRegistry of(StateMachine application) {
         return new StateMachineRegistry(application, Map.of());
+    }
+
+    /**
+     * The registry of a witness. A witness applies every committed entry like any
+     * server and keeps no state, so whatever name an entry carries leads to
+     * {@code nothing}, and {@link #names()} is empty: the witness need not be told
+     * which names the data nodes registered.
+     */
+    static StateMachineRegistry forWitness(StateMachine nothing) {
+        return new StateMachineRegistry(nothing, Map.of(), true);
     }
 
     /** Builds a registry from registrations; two registrations with one name are refused. */
@@ -122,7 +151,7 @@ public final class StateMachineRegistry {
      * @throws UnknownStateMachineException if nothing is registered under the name
      */
     public StateMachine require(String name) {
-        if (name == null || name.isEmpty()) {
+        if (anyName || name == null || name.isEmpty()) {
             return application;
         }
         StateMachine stateMachine = named.get(name);
@@ -202,6 +231,178 @@ public final class StateMachineRegistry {
         }
         for (Map.Entry<String, StateMachine> entry : named.entrySet()) {
             entry.getValue().restoreSnapshot(sections.getOrDefault(entry.getKey(), EMPTY));
+        }
+    }
+
+    // ---- snapshots as streams ----------------------------------------------
+    //
+    // The same layout as above, written and read without holding a whole snapshot
+    // in memory. RaftNode only uses these three.
+
+    /** The streaming form of {@link #takeSnapshot()}. */
+    public void writeSnapshot(OutputStream out) throws IOException {
+        if (named.isEmpty()) {
+            application.writeSnapshot(out);
+            return;
+        }
+        List<StateMachine.SnapshotWriter> sections = new ArrayList<>();
+        sections.add(application::writeSnapshot);
+        for (StateMachine stateMachine : named.values()) {
+            sections.add(stateMachine::writeSnapshot);
+        }
+        writeContainer(sections, out);
+    }
+
+    /**
+     * The streaming form of {@link #prepareCowSnapshot()}, with the contract of
+     * {@link StateMachine#prepareSnapshotWriter()}: every state machine is captured
+     * here, under the Raft lock, and written later.
+     */
+    public StateMachine.SnapshotWriter prepareSnapshotWriter() {
+        if (named.isEmpty()) {
+            return application.prepareSnapshotWriter();
+        }
+        List<StateMachine.SnapshotWriter> sections = new ArrayList<>();
+        sections.add(application.prepareSnapshotWriter());
+        for (StateMachine stateMachine : named.values()) {
+            sections.add(stateMachine.prepareSnapshotWriter());
+        }
+        return out -> writeContainer(sections, out);
+    }
+
+    /**
+     * A section's length stands in front of it, and a state machine that streams
+     * does not know its length before it has written. So each section goes to a
+     * temporary file first and is copied from there: one section on disk twice for
+     * a moment, none of them in memory.
+     */
+    private void writeContainer(List<StateMachine.SnapshotWriter> sections, OutputStream out) throws IOException {
+        DataOutputStream data = new DataOutputStream(out);
+        data.write(SNAPSHOT_MAGIC);
+        List<String> names = new ArrayList<>();
+        names.add(APPLICATION);
+        names.addAll(named.keySet());
+        for (int i = 0; i < names.size(); i++) {
+            byte[] name = names.get(i).getBytes(StandardCharsets.UTF_8);
+            Path spool = Files.createTempFile("raft-snapshot-section", ".tmp");
+            try {
+                try (OutputStream section = new BufferedOutputStream(Files.newOutputStream(spool))) {
+                    sections.get(i).writeTo(section);
+                }
+                long length = Files.size(spool);
+                if (length > Integer.MAX_VALUE) {
+                    throw new IOException("the snapshot of state machine '" + names.get(i) + "' is " + length
+                            + " bytes; a section holds at most " + Integer.MAX_VALUE);
+                }
+                data.writeShort(name.length);
+                data.write(name);
+                data.writeInt((int) length);
+                Files.copy(spool, data);
+            } finally {
+                Files.deleteIfExists(spool);
+            }
+        }
+        data.flush();
+    }
+
+    /**
+     * The streaming form of {@link #restoreSnapshot(byte[])}, with one difference
+     * that follows from reading front to back: a section for a name that is not
+     * registered is only found when the stream reaches it, after the sections in
+     * front of it have been restored. The restore fails all the same, and a server
+     * whose restore failed must not go on to serve.
+     */
+    public void restoreSnapshot(InputStream snapshot) throws IOException {
+        if (anyName) {
+            application.restoreSnapshot(snapshot);
+            return;
+        }
+        PushbackInputStream in = new PushbackInputStream(snapshot, SNAPSHOT_MAGIC.length);
+        byte[] head = in.readNBytes(SNAPSHOT_MAGIC.length);
+        if (!isContainer(head)) {
+            in.unread(head);
+            application.restoreSnapshot(in);
+            for (StateMachine stateMachine : named.values()) {
+                stateMachine.restoreSnapshot(new ByteArrayInputStream(EMPTY));
+            }
+            return;
+        }
+        DataInputStream data = new DataInputStream(in);
+        Set<String> restored = new HashSet<>();
+        while (true) {
+            int first = data.read();
+            if (first < 0) {
+                break;
+            }
+            try {
+                byte[] name = new byte[(first << 8) | data.readUnsignedByte()];
+                data.readFully(name);
+                int length = data.readInt();
+                if (length < 0) {
+                    throw new IllegalArgumentException("snapshot section is cut off");
+                }
+                String sectionName = new String(name, StandardCharsets.UTF_8);
+                SectionInputStream section = new SectionInputStream(data, length);
+                require(sectionName).restoreSnapshot(section);
+                // A state machine need not read its section to the end, and one that
+                // read less must not leave the next section's header out of place.
+                section.skipToEnd();
+                restored.add(sectionName);
+            } catch (EOFException e) {
+                throw new IllegalArgumentException("snapshot section is cut off", e);
+            }
+        }
+        for (Map.Entry<String, StateMachine> entry : named.entrySet()) {
+            if (!restored.contains(entry.getKey())) {
+                entry.getValue().restoreSnapshot(new ByteArrayInputStream(EMPTY));
+            }
+        }
+    }
+
+    /** One section of a container: ends where the section ends, not where the file does. */
+    private static final class SectionInputStream extends InputStream {
+        private final InputStream in;
+        private long remaining;
+
+        SectionInputStream(InputStream in, long length) {
+            this.in = in;
+            this.remaining = length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining == 0) {
+                return -1;
+            }
+            int b = in.read();
+            if (b < 0) {
+                throw new EOFException();
+            }
+            remaining--;
+            return b;
+        }
+
+        @Override
+        public int read(byte[] target, int offset, int length) throws IOException {
+            if (length == 0) {
+                return 0;
+            }
+            if (remaining == 0) {
+                return -1;
+            }
+            int read = in.read(target, offset, (int) Math.min(length, remaining));
+            if (read < 0) {
+                throw new EOFException();
+            }
+            remaining -= read;
+            return read;
+        }
+
+        void skipToEnd() throws IOException {
+            byte[] scratch = new byte[8192];
+            while (read(scratch, 0, scratch.length) >= 0) {
+                // discard
+            }
         }
     }
 

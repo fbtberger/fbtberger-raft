@@ -45,7 +45,14 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
     @Override
     public void submit(SubmitRequest request, StreamObserver<SubmitResponse> responseObserver) {
         Timer.Sample sample = Timer.start(metrics.registry());
-        raftNode.submitCommand(request.getStateMachine(), request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
+        byte[] command = request.getCommand().toByteArray();
+        // No client id is a request without a session, which is what every client older
+        // than the field sends; it is applied on every arrival as before.
+        CompletableFuture<byte[]> outcome = request.getClientId().isEmpty()
+                ? raftNode.submitCommand(request.getStateMachine(), command)
+                : raftNode.submitCommand(request.getStateMachine(), command, request.getClientId(),
+                        request.getSequence(), request.getAckedSequence());
+        outcome.whenComplete((result, throwable) -> {
             sample.stop(metrics.clientSubmitTimer());
             responseObserver.onNext(throwable == null ? success(result) : failure(unwrap(throwable)));
             responseObserver.onCompleted();
@@ -58,10 +65,16 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         // to be able to serve both during the same run, or the two cannot be compared
         // without a restart in between -- and a restart is a different experiment.
         byte[] q = request.getQuery().toByteArray();
-        CompletableFuture<byte[]> answer =
-                request.getLease()
-                        ? raftNode.queryWithLease(request.getStateMachine(), q)
-                        : raftNode.query(request.getStateMachine(), q);
+        String target = request.getStateMachine();
+        CompletableFuture<byte[]> answer;
+        if (request.getAllowFollower() && raftNode.role() != ServerRole.LEADER) {
+            // Not the leader and allowed to answer anyway: the leader supplies the read
+            // index, this node the read. On the leader the flag changes nothing, so the
+            // lease choice below still applies there.
+            answer = raftNode.queryAnyRole(target, q);
+        } else {
+            answer = request.getLease() ? raftNode.queryWithLease(target, q) : raftNode.query(target, q);
+        }
         answer.whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
             responseObserver.onCompleted();
@@ -137,7 +150,9 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
 
     private static SubmitResponse failure(Throwable cause) {
         SubmitResponse.Builder builder = SubmitResponse.newBuilder().setSuccess(false);
-        if (cause instanceof RaftNode.NotLeaderException nle) {
+        if (cause instanceof RaftNode.OverloadedException overloaded) {
+            builder.setOverloaded(true).setRetryAfterMs(overloaded.retryAfterMs).setError(overloaded.getMessage());
+        } else if (cause instanceof RaftNode.NotLeaderException nle) {
             if (nle.leaderHint != null) {
                 builder.setLeaderHint(nle.leaderHint);
             }
@@ -157,7 +172,9 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
 
     private static QueryResponse queryFailure(Throwable cause) {
         QueryResponse.Builder builder = QueryResponse.newBuilder().setSuccess(false);
-        if (cause instanceof RaftNode.NotLeaderException nle) {
+        if (cause instanceof RaftNode.OverloadedException overloaded) {
+            builder.setOverloaded(true).setRetryAfterMs(overloaded.retryAfterMs).setError(overloaded.getMessage());
+        } else if (cause instanceof RaftNode.NotLeaderException nle) {
             if (nle.leaderHint != null) {
                 builder.setLeaderHint(nle.leaderHint);
             }

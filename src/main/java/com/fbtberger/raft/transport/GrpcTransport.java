@@ -10,6 +10,8 @@ import com.fbtberger.raft.proto.InstallSnapshotRequest;
 import com.fbtberger.raft.proto.InstallSnapshotResponse;
 import com.fbtberger.raft.proto.PreVoteRequest;
 import com.fbtberger.raft.proto.PreVoteResponse;
+import com.fbtberger.raft.proto.ReadIndexRequest;
+import com.fbtberger.raft.proto.ReadIndexResponse;
 import com.fbtberger.raft.proto.TimeoutNowRequest;
 import com.fbtberger.raft.proto.TimeoutNowResponse;
 import com.fbtberger.raft.proto.RaftServiceGrpc;
@@ -58,6 +60,11 @@ public final class GrpcTransport implements RaftTransport {
     @Override
     public CompletableFuture<TimeoutNowResponse> timeoutNow(TimeoutNowRequest request) {
         return detached(() -> stub.timeoutNow(request));
+    }
+
+    @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(ReadIndexRequest request) {
+        return detached(() -> stub.readIndex(request));
     }
 
     @Override

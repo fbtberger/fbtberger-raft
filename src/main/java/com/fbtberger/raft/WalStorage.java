@@ -62,7 +62,9 @@ public final class WalStorage implements RaftStorage {
 
     private long currentTerm;
     private String votedFor;
-    private Snapshot snapshot;
+    /** The stored snapshot without its payload, which stays in {@link #snapshotFile}. */
+    private SnapshotMeta snapshotMeta;
+    private final java.util.concurrent.atomic.AtomicLong snapshotTmpCounter = new java.util.concurrent.atomic.AtomicLong();
     private long lastLogIndex;
     private long lastLogTerm;
 
@@ -289,8 +291,8 @@ public final class WalStorage implements RaftStorage {
         }
 
         if (index.isEmpty()) {
-            lastLogIndex = snapshot != null ? snapshot.lastIncludedIndex : 0;
-            lastLogTerm = snapshot != null ? snapshot.lastIncludedTerm : 0;
+            lastLogIndex = snapshotMeta != null ? snapshotMeta.lastIncludedIndex : 0;
+            lastLogTerm = snapshotMeta != null ? snapshotMeta.lastIncludedTerm : 0;
         } else {
             var last = index.lastEntry();
             lastLogIndex = last.getKey();
@@ -300,54 +302,166 @@ public final class WalStorage implements RaftStorage {
     }
 
     // ---- snapshotting (§7) -----------------------------------------------
+    //
+    // One file, `snapshot`:
+    //   [8 lastIncludedIndex][8 lastIncludedTerm][4 payloadLength][payload]
+    //   [4 configLength][config][4 sessionLength][sessions]
+    //
+    // Only the metadata is held in memory. The payload is written to the file as a
+    // stream and read back from it as a stream or a chunk at a time, so its size is a
+    // question of disk and not of heap. The 4-byte length bounds a payload at 2 GiB.
+
+    /** Where the payload starts in the snapshot file. */
+    private static final int SNAPSHOT_PAYLOAD_OFFSET = Long.BYTES + Long.BYTES + Integer.BYTES;
 
     @Override
     public synchronized long getSnapshotIndex() {
-        return snapshot != null ? snapshot.lastIncludedIndex : 0;
+        return snapshotMeta != null ? snapshotMeta.lastIncludedIndex : 0;
     }
 
     @Override
     public synchronized long getSnapshotTerm() {
-        return snapshot != null ? snapshot.lastIncludedTerm : 0;
+        return snapshotMeta != null ? snapshotMeta.lastIncludedTerm : 0;
     }
 
     @Override
-    public synchronized Snapshot getSnapshot() { return snapshot; }
+    public synchronized SnapshotMeta getSnapshotMeta() {
+        return snapshotMeta;
+    }
+
+    /** The whole snapshot in memory. Kept for callers of the array API; RaftNode does not use it. */
+    @Override
+    public synchronized Snapshot getSnapshot() {
+        if (snapshotMeta == null) return null;
+        byte[] payload = new byte[(int) snapshotMeta.dataLength];
+        try (RandomAccessFile file = new RandomAccessFile(snapshotFile, "r")) {
+            file.seek(SNAPSHOT_PAYLOAD_OFFSET);
+            file.readFully(payload);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return new Snapshot(snapshotMeta.lastIncludedIndex, snapshotMeta.lastIncludedTerm, payload,
+                snapshotMeta.configurationData, snapshotMeta.sessionData);
+    }
 
     @Override
-    public synchronized void saveSnapshotAndCompact(Snapshot snap) {
+    public synchronized java.io.InputStream openSnapshotData() throws IOException {
+        if (snapshotMeta == null) return null;
+        // The descriptor keeps pointing at this snapshot even if a newer one is renamed
+        // over the path while the caller is still reading.
+        FileInputStream in = new FileInputStream(snapshotFile);
+        try {
+            in.skipNBytes(SNAPSHOT_PAYLOAD_OFFSET);
+        } catch (IOException e) {
+            in.close();
+            throw e;
+        }
+        return new BoundedInputStream(new java.io.BufferedInputStream(in, 1 << 16), snapshotMeta.dataLength);
+    }
+
+    @Override
+    public synchronized int readSnapshotData(long lastIncludedIndex, long offset, byte[] target,
+                                             int targetOffset, int length) throws IOException {
+        if (snapshotMeta == null || snapshotMeta.lastIncludedIndex != lastIncludedIndex) {
+            return -1;
+        }
+        int available = (int) Math.max(0, Math.min(length, snapshotMeta.dataLength - offset));
+        if (available == 0) return 0;
+        try (RandomAccessFile file = new RandomAccessFile(snapshotFile, "r")) {
+            file.seek(SNAPSHOT_PAYLOAD_OFFSET + offset);
+            file.readFully(target, targetOffset, available);
+        }
+        return available;
+    }
+
+    @Override
+    public void saveSnapshotAndCompact(Snapshot snap) {
+        try (SnapshotSink sink = beginSnapshot(snap.lastIncludedIndex, snap.lastIncludedTerm)) {
+            sink.stream().write(snap.stateMachineData);
+            sink.commit(snap.configurationData, snap.sessionData);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Writes into a temporary file of its own, so several snapshots can be in progress --
+     * a background one and one being installed from the leader -- without seeing each
+     * other, and the stored snapshot is untouched until {@code commit}.
+     */
+    @Override
+    public SnapshotSink beginSnapshot(long lastIncludedIndex, long lastIncludedTerm) throws IOException {
+        File tmp = new File(dataDir, "snapshot.tmp." + snapshotTmpCounter.incrementAndGet());
+        RandomAccessFile file = new RandomAccessFile(tmp, "rw");
+        file.writeLong(lastIncludedIndex);
+        file.writeLong(lastIncludedTerm);
+        file.writeInt(0); // payload length, patched in at commit when it is known
+        java.io.OutputStream payload =
+                new java.io.BufferedOutputStream(new FileOutputStream(file.getFD()), 1 << 16);
+        return new SnapshotSink() {
+            private boolean finished;
+
+            @Override public java.io.OutputStream stream() { return payload; }
+
+            @Override
+            public void commit(byte[] configurationData, byte[] sessionData) throws IOException {
+                payload.flush();
+                long payloadLength = file.length() - SNAPSHOT_PAYLOAD_OFFSET;
+                if (payloadLength > Integer.MAX_VALUE) {
+                    throw new IOException("snapshot payload of " + payloadLength
+                            + " bytes exceeds the 2 GiB this file format can describe");
+                }
+                file.seek(file.length());
+                file.writeInt(configurationData.length);
+                file.write(configurationData);
+                // Appended, never inserted: a snapshot file written before the session
+                // table existed simply ends before this, and recovery reads that as empty.
+                file.writeInt(sessionData.length);
+                file.write(sessionData);
+                file.seek(Long.BYTES + Long.BYTES);
+                file.writeInt((int) payloadLength);
+                file.getFD().sync();
+                file.close();
+                finished = true;
+                install(tmp, new SnapshotMeta(lastIncludedIndex, lastIncludedTerm,
+                        configurationData, sessionData, payloadLength));
+            }
+
+            @Override
+            public void close() {
+                if (finished) return;
+                finished = true;
+                try {
+                    file.close();
+                } catch (IOException ignored) {
+                    // the file is being thrown away
+                }
+                tmp.delete();
+            }
+        };
+    }
+
+    private synchronized void install(File tmp, SnapshotMeta meta) {
         // The snapshot boundary must never move backwards: a background (COW)
         // snapshot in RaftNode decides to save off-lock, so if a newer snapshot
         // (e.g. one just installed by InstallSnapshot after a step-down/
         // re-election) landed in between, that stale save is dropped here rather
         // than overwriting the higher boundary and rewinding the compaction.
-        if (this.snapshot != null && snap.lastIncludedIndex <= this.snapshot.lastIncludedIndex) {
+        if (snapshotMeta != null && meta.lastIncludedIndex <= snapshotMeta.lastIncludedIndex) {
+            tmp.delete();
             return;
         }
-        File tmp = new File(dataDir, "snapshot.tmp");
-        try (FileOutputStream fos = new FileOutputStream(tmp);
-             DataOutputStream dos = new DataOutputStream(fos)) {
-            dos.writeLong(snap.lastIncludedIndex);
-            dos.writeLong(snap.lastIncludedTerm);
-            dos.writeInt(snap.stateMachineData.length);
-            dos.write(snap.stateMachineData);
-            dos.writeInt(snap.configurationData.length);
-            dos.write(snap.configurationData);
-            dos.flush();
-            fos.getFD().sync();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
         if (!tmp.renameTo(snapshotFile)) {
-            throw new UncheckedIOException(new IOException("rename snapshot.tmp -> snapshot failed"));
+            tmp.delete();
+            throw new UncheckedIOException(new IOException("rename " + tmp.getName() + " -> snapshot failed"));
         }
-        this.snapshot = snap;
+        this.snapshotMeta = meta;
 
-        index.headMap(snap.lastIncludedIndex, true).clear();
+        index.headMap(meta.lastIncludedIndex, true).clear();
 
-        if (lastLogIndex <= snap.lastIncludedIndex) {
-            lastLogIndex = snap.lastIncludedIndex;
-            lastLogTerm = snap.lastIncludedTerm;
+        if (lastLogIndex <= meta.lastIncludedIndex) {
+            lastLogIndex = meta.lastIncludedIndex;
+            lastLogTerm = meta.lastIncludedTerm;
         }
 
         deleteObsoleteSegments();
@@ -374,21 +488,32 @@ public final class WalStorage implements RaftStorage {
     @Override
     public synchronized long getTermAt(long idx) {
         if (idx <= 0) return 0L;
-        if (snapshot != null && idx == snapshot.lastIncludedIndex) return snapshot.lastIncludedTerm;
+        if (snapshotMeta != null && idx == snapshotMeta.lastIncludedIndex) return snapshotMeta.lastIncludedTerm;
         LogEntry entry = getLogEntry(idx);
         return entry == null ? -1L : entry.getTerm();
     }
 
     private void recoverSnapshot() throws IOException {
+        // A snapshot that was being written when the process died never became the
+        // stored one; its file is only litter.
+        File[] leftovers = dataDir.listFiles((dir, name) -> name.startsWith("snapshot.tmp"));
+        if (leftovers != null) {
+            for (File leftover : leftovers) leftover.delete();
+        }
         if (!snapshotFile.exists()) return;
-        try (DataInputStream dis = new DataInputStream(new FileInputStream(snapshotFile))) {
+        try (DataInputStream dis = new DataInputStream(
+                new java.io.BufferedInputStream(new FileInputStream(snapshotFile), 1 << 16))) {
             long lastIdx = dis.readLong();
             long lastTerm = dis.readLong();
-            int smLen = dis.readInt();
-            byte[] smData = dis.readNBytes(smLen);
+            int payloadLength = dis.readInt();
+            dis.skipNBytes(payloadLength); // the payload stays on disk
             int cfgLen = dis.readInt();
             byte[] cfgData = dis.readNBytes(cfgLen);
-            this.snapshot = new Snapshot(lastIdx, lastTerm, smData, cfgData);
+            byte[] sessionData = new byte[0];
+            if (dis.available() >= Integer.BYTES) {
+                sessionData = dis.readNBytes(dis.readInt());
+            }
+            this.snapshotMeta = new SnapshotMeta(lastIdx, lastTerm, cfgData, sessionData, payloadLength);
             this.lastLogIndex = lastIdx;
             this.lastLogTerm = lastTerm;
         }
@@ -452,7 +577,7 @@ public final class WalStorage implements RaftStorage {
             }
             try {
                 LogEntry entry = LogEntry.parseFrom(buf);
-                long snapshotIdx = snapshot != null ? snapshot.lastIncludedIndex : 0;
+                long snapshotIdx = snapshotMeta != null ? snapshotMeta.lastIncludedIndex : 0;
                 if (entry.getIndex() > snapshotIdx) {
                     index.put(entry.getIndex(), new WalEntry(segId, pos + FRAME_HEADER_SIZE, len));
                 }

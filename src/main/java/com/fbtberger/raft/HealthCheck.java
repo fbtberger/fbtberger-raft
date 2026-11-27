@@ -41,6 +41,11 @@ public final class HealthCheck {
      * elsewhere rather than being told the data does not exist.
      */
     public Status serving() {
+        if (node.isWitness()) {
+            // Whatever its role and however current its log: there is no state here to
+            // read. Readiness is the question to ask a witness.
+            return new Status(false, "witness: votes and stores the log, serves no reads");
+        }
         boolean learner = node.isLearner();
         if (!node.isReadyToServe()) {
             return readinessStatus(node.role(), learner, false, node.currentLeaderId());

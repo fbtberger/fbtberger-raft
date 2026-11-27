@@ -394,6 +394,27 @@ abstract class RaftStorageContract {
     }
 
     @Test
+    void aSnapshotSavedWithoutSessionsHasAnEmptyTableNotNull() {
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(5, 3, "hello".getBytes(), "cfg".getBytes()));
+
+        assertEquals(0, store.getSnapshot().sessionData.length);
+    }
+
+    @Test
+    void theSessionTableSurvivesAReopen() {
+        // §8: the table is replicated state. A store that dropped it would hand RaftNode a
+        // snapshot whose state already contains a command and no record of having applied it.
+        byte[] sessions = "sessions".getBytes();
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b")));
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(2, 1, "state".getBytes(), "cfg".getBytes(), sessions));
+        assertArrayEquals(sessions, store.getSnapshot().sessionData);
+        reopen();
+
+        assertArrayEquals(sessions, store.getSnapshot().sessionData);
+        assertArrayEquals("cfg".getBytes(), store.getSnapshot().configurationData);
+    }
+
+    @Test
     void theSnapshotBoundaryNeverMovesBackwards() {
         // A background (COW) snapshot in RaftNode decides to save off-lock. If a newer snapshot --
         // e.g. one installed by InstallSnapshot after a step-down -- landed in between, the stale
@@ -437,7 +458,181 @@ abstract class RaftStorageContract {
         assertNotNull(store.getLogEntry(3));
     }
 
+    // ---- streaming snapshots ---------------------------------------------
+
+    @Test
+    void thereIsNoSnapshotMetaOrDataBeforeAnySnapshot() throws Exception {
+        assertNull(store.getSnapshotMeta());
+        assertNull(store.openSnapshotData());
+        assertEquals(-1, store.readSnapshotData(1, 0, new byte[4], 0, 4));
+    }
+
+    @Test
+    void aStreamedSnapshotReadsBackAsAStreamAndAsAWhole() throws Exception {
+        byte[] payload = payloadOf(70_000);
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")));
+        streamSnapshot(2, 1, payload, "cfg".getBytes(), "sessions".getBytes());
+
+        RaftStorage.SnapshotMeta meta = store.getSnapshotMeta();
+        assertEquals(2, meta.lastIncludedIndex);
+        assertEquals(1, meta.lastIncludedTerm);
+        assertEquals(payload.length, meta.dataLength);
+        assertArrayEquals("cfg".getBytes(), meta.configurationData);
+        assertArrayEquals("sessions".getBytes(), meta.sessionData);
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            assertArrayEquals(payload, in.readAllBytes());
+        }
+        assertArrayEquals(payload, store.getSnapshot().stateMachineData,
+                "the whole-array view must show the same snapshot");
+        assertEquals(2, store.getSnapshotIndex());
+        assertNull(store.getLogEntry(2), "committing a streamed snapshot compacts like saving one");
+        assertNotNull(store.getLogEntry(3));
+    }
+
+    @Test
+    void aSavedSnapshotReadsBackAsAStream() throws Exception {
+        store.saveSnapshotAndCompact(new RaftStorage.Snapshot(4, 2, "state".getBytes(), "cfg".getBytes()));
+
+        assertEquals(5, store.getSnapshotMeta().dataLength);
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            assertArrayEquals("state".getBytes(), in.readAllBytes());
+        }
+    }
+
+    @Test
+    void snapshotDataCanBeReadAtAnyOffset() throws Exception {
+        byte[] payload = payloadOf(10_000);
+        streamSnapshot(3, 1, payload, new byte[0], new byte[0]);
+
+        byte[] target = new byte[300];
+        assertEquals(256, store.readSnapshotData(3, 7_000, target, 44, 256));
+        assertArrayEquals(java.util.Arrays.copyOfRange(payload, 7_000, 7_256),
+                java.util.Arrays.copyOfRange(target, 44, 300));
+        assertEquals(0, target[43], "nothing may be written before the target offset");
+
+        byte[] tail = new byte[100];
+        assertEquals(100, store.readSnapshotData(3, 9_900, tail, 0, 100));
+        assertArrayEquals(java.util.Arrays.copyOfRange(payload, 9_900, 10_000), tail);
+    }
+
+    @Test
+    void readingASnapshotThatWasReplacedSaysSo() throws Exception {
+        streamSnapshot(3, 1, payloadOf(100), new byte[0], new byte[0]);
+        streamSnapshot(8, 2, payloadOf(200), new byte[0], new byte[0]);
+
+        assertEquals(-1, store.readSnapshotData(3, 0, new byte[10], 0, 10),
+                "a leader in the middle of sending snapshot 3 must learn that it is gone");
+        assertEquals(10, store.readSnapshotData(8, 0, new byte[10], 0, 10));
+    }
+
+    @Test
+    void aSnapshotThatIsNeverCommittedLeavesTheStoredOneAlone() throws Exception {
+        byte[] first = payloadOf(500);
+        streamSnapshot(3, 1, first, "cfg".getBytes(), new byte[0]);
+
+        try (RaftStorage.SnapshotSink sink = store.beginSnapshot(9, 2)) {
+            sink.stream().write(payloadOf(900));
+            // Closed without commit: a transfer that broke off, a state machine that threw.
+        }
+
+        assertEquals(3, store.getSnapshotIndex());
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            assertArrayEquals(first, in.readAllBytes());
+        }
+    }
+
+    @Test
+    void aStreamedSnapshotOlderThanTheStoredOneIsDropped() throws Exception {
+        byte[] newer = payloadOf(300);
+        // The order a background snapshot and an InstallSnapshot can finish in: the one
+        // begun first, for the lower index, commits last.
+        try (RaftStorage.SnapshotSink stale = store.beginSnapshot(3, 2)) {
+            stale.stream().write(payloadOf(50));
+            streamSnapshot(10, 5, newer, new byte[0], new byte[0]);
+            stale.commit(new byte[0], new byte[0]);
+        }
+
+        assertEquals(10, store.getSnapshotIndex(), "boundary must not move backwards");
+        assertEquals(5, store.getSnapshotTerm());
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            assertArrayEquals(newer, in.readAllBytes());
+        }
+    }
+
+    @Test
+    void aStreamBeingReadSurvivesTheSnapshotBeingReplaced() throws Exception {
+        byte[] first = payloadOf(40_000);
+        streamSnapshot(3, 1, first, new byte[0], new byte[0]);
+
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            byte[] head = in.readNBytes(1_000);
+            streamSnapshot(8, 2, payloadOf(40_000), new byte[0], new byte[0]);
+            byte[] rest = in.readAllBytes();
+
+            byte[] read = new byte[head.length + rest.length];
+            System.arraycopy(head, 0, read, 0, head.length);
+            System.arraycopy(rest, 0, read, head.length, rest.length);
+            assertArrayEquals(first, read, "a restore in progress must not see half of each snapshot");
+        }
+    }
+
+    @Test
+    void aStreamedSnapshotSurvivesAReopen() throws Exception {
+        byte[] payload = payloadOf(70_000);
+        store.appendEntries(List.of(entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 2, "c")));
+        streamSnapshot(2, 1, payload, "cfg".getBytes(), "sessions".getBytes());
+        reopen();
+
+        assertEquals(2, store.getSnapshotIndex());
+        assertEquals(1, store.getSnapshotTerm());
+        assertEquals(1, store.getTermAt(2));
+        assertEquals(3, store.getLastLogIndex());
+        RaftStorage.SnapshotMeta meta = store.getSnapshotMeta();
+        assertEquals(payload.length, meta.dataLength);
+        assertArrayEquals("cfg".getBytes(), meta.configurationData);
+        assertArrayEquals("sessions".getBytes(), meta.sessionData);
+        try (java.io.InputStream in = store.openSnapshotData()) {
+            assertArrayEquals(payload, in.readAllBytes());
+        }
+    }
+
+    @Test
+    void anUncommittedSnapshotIsGoneAfterAReopen() throws Exception {
+        streamSnapshot(3, 1, payloadOf(500), new byte[0], new byte[0]);
+        // Not closed: the process died in the middle of writing or receiving.
+        RaftStorage.SnapshotSink abandoned = store.beginSnapshot(9, 2);
+        abandoned.stream().write(payloadOf(900));
+        abandoned.stream().flush();
+        reopen();
+
+        assertEquals(3, store.getSnapshotIndex());
+        assertEquals(500, store.getSnapshotMeta().dataLength);
+        streamSnapshot(9, 2, payloadOf(20), new byte[0], new byte[0]);
+        assertEquals(9, store.getSnapshotIndex(), "the leftover must not be in the way of the next one");
+    }
+
     // ---- helpers ---------------------------------------------------------
+
+    protected void streamSnapshot(long index, long term, byte[] payload, byte[] cfg, byte[] sessions)
+            throws java.io.IOException {
+        try (RaftStorage.SnapshotSink sink = store.beginSnapshot(index, term)) {
+            // In pieces, as a state machine or a transfer would deliver it.
+            for (int at = 0; at < payload.length; at += 4_096) {
+                sink.stream().write(payload, at, Math.min(4_096, payload.length - at));
+            }
+            sink.commit(cfg, sessions);
+        }
+    }
+
+    /** Bytes that differ along their length, so a read at the wrong offset shows. */
+    protected static byte[] payloadOf(int length) {
+        byte[] payload = new byte[length];
+        for (int i = 0; i < length; i++) {
+            payload[i] = (byte) (i * 31 + (i >>> 8));
+        }
+        return payload;
+    }
+
 
     protected static LogEntry entry(long index, long term, String command) {
         return LogEntry.newBuilder()

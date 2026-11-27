@@ -166,12 +166,138 @@ class StateMachineRegistryTest {
         }
     }
 
+    // ---- the same layout, as streams --------------------------------------
+
+    @Test
+    void theStreamedSnapshotIsByteForByteTheArrayOne() throws Exception {
+        StateMachineRegistry plain = StateMachineRegistry.of(new TextStateMachine("orders"));
+        StateMachineRegistry both = new StateMachineRegistry(new TextStateMachine("orders"),
+                Map.of("values", new TextStateMachine("seven"), "audit", new TextStateMachine("")));
+
+        assertArrayEquals(plain.takeSnapshot(), streamed(plain));
+        assertArrayEquals(both.takeSnapshot(), streamed(both));
+
+        java.io.ByteArrayOutputStream captured = new java.io.ByteArrayOutputStream();
+        both.prepareSnapshotWriter().writeTo(captured);
+        assertArrayEquals(both.takeSnapshot(), captured.toByteArray());
+    }
+
+    @Test
+    void theCapturedStreamDoesNotSeeLaterChanges() throws Exception {
+        TextStateMachine values = new TextStateMachine("seven");
+        StateMachineRegistry registry =
+                new StateMachineRegistry(new TextStateMachine("orders"), Map.of("values", values));
+        byte[] before = registry.takeSnapshot();
+
+        StateMachine.SnapshotWriter writer = registry.prepareSnapshotWriter();
+        values.apply(utf8("eight"));
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        writer.writeTo(out);
+
+        assertArrayEquals(before, out.toByteArray());
+    }
+
+    @Test
+    void aStreamedSnapshotGivesEveryStateMachineItsOwnSectionBack() throws Exception {
+        StateMachineRegistry source = new StateMachineRegistry(new TextStateMachine("orders"),
+                Map.of("values", new TextStateMachine("seven"), "audit", new TextStateMachine("log")));
+        TextStateMachine app = new TextStateMachine("?");
+        TextStateMachine values = new TextStateMachine("?");
+        TextStateMachine audit = new TextStateMachine("?");
+        StateMachineRegistry target =
+                new StateMachineRegistry(app, Map.of("values", values, "audit", audit));
+
+        target.restoreSnapshot(new java.io.ByteArrayInputStream(source.takeSnapshot()));
+
+        assertEquals("orders", app.state);
+        assertEquals("seven", values.state);
+        assertEquals("log", audit.state);
+    }
+
+    @Test
+    void aStateMachineThatDoesNotReadItsSectionToTheEndDoesNotDisturbTheNext() throws Exception {
+        StateMachineRegistry source = new StateMachineRegistry(new TextStateMachine("orders"),
+                Map.of("values", new TextStateMachine("seven")));
+        TextStateMachine values = new TextStateMachine("?");
+        StateMachine lazy = new TextStateMachine("?") {
+            @Override
+            public void restoreSnapshot(java.io.InputStream in) throws java.io.IOException {
+                state = String.valueOf((char) in.read());
+            }
+        };
+
+        new StateMachineRegistry(lazy, Map.of("values", values))
+                .restoreSnapshot(new java.io.ByteArrayInputStream(source.takeSnapshot()));
+
+        assertEquals("seven", values.state);
+    }
+
+    @Test
+    void aStreamedPlainSnapshotGoesToTheApplicationAndResetsTheOthers() throws Exception {
+        TextStateMachine app = new TextStateMachine("?");
+        TextStateMachine values = new TextStateMachine("old");
+        StateMachineRegistry registry = new StateMachineRegistry(app, Map.of("values", values));
+
+        registry.restoreSnapshot(new java.io.ByteArrayInputStream(utf8("orders from before")));
+
+        assertEquals("orders from before", app.state);
+        assertEquals("", values.state);
+
+        // Shorter than the magic: still the application's own bytes.
+        registry.restoreSnapshot(new java.io.ByteArrayInputStream(utf8("x")));
+        assertEquals("x", app.state);
+    }
+
+    @Test
+    void aStreamedSectionWithoutAStateMachineOrCutOffFailsTheRestore() {
+        byte[] container = new StateMachineRegistry(new TextStateMachine("orders"),
+                Map.of("values", new TextStateMachine("seven"))).takeSnapshot();
+
+        assertThrows(UnknownStateMachineException.class,
+                () -> StateMachineRegistry.of(new TextStateMachine("?"))
+                        .restoreSnapshot(new java.io.ByteArrayInputStream(container)));
+        // Where the application's section ends, a shorter container is a whole one
+        // that merely lacks the other section; everywhere else it is cut off.
+        int sectionEnd = StateMachineRegistry.SNAPSHOT_MAGIC.length + 2 + 4 + "orders".length();
+        for (int cut = StateMachineRegistry.SNAPSHOT_MAGIC.length + 1; cut < container.length; cut++) {
+            if (cut == sectionEnd) {
+                continue;
+            }
+            byte[] shortened = java.util.Arrays.copyOf(container, cut);
+            StateMachineRegistry registry = new StateMachineRegistry(new TextStateMachine("?"),
+                    Map.of("values", new TextStateMachine("?")));
+            assertThrows(IllegalArgumentException.class,
+                    () -> registry.restoreSnapshot(new java.io.ByteArrayInputStream(shortened)),
+                    "cut at " + cut);
+        }
+    }
+
+    @Test
+    void aWitnessRegistrySendsEveryNameToTheOneStateMachineThatKeepsNothing() throws Exception {
+        WitnessStateMachine nothing = new WitnessStateMachine();
+        StateMachineRegistry witness = StateMachineRegistry.forWitness(nothing);
+
+        assertSame(nothing, witness.require(""));
+        assertSame(nothing, witness.require("values"));
+        assertTrue(witness.names().isEmpty());
+        assertEquals(0, streamed(witness).length);
+        // A data node's container handed to a witness is left alone, not refused.
+        witness.restoreSnapshot(new java.io.ByteArrayInputStream(new StateMachineRegistry(
+                new TextStateMachine("orders"), Map.of("values", new TextStateMachine("seven"))).takeSnapshot()));
+    }
+
+    private static byte[] streamed(StateMachineRegistry registry) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        registry.writeSnapshot(out);
+        return out.toByteArray();
+    }
+
     private static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
     }
 
     /** Its whole state is one string, and its snapshot is that string. */
-    static final class TextStateMachine implements StateMachine {
+    static class TextStateMachine implements StateMachine {
         volatile String state;
 
         TextStateMachine(String state) {
