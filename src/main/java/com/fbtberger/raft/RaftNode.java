@@ -175,6 +175,8 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
     private volatile Map<String, String> currentLearners = Map.of();
 
     // Guards against overlapping background snapshots (§5.1 COW).
+    /** How long {@link #shutdown()} waits for a snapshot that is already being written. */
+    private static final long SNAPSHOT_SHUTDOWN_WAIT_SECONDS = 60;
     private volatile boolean snapshotInProgress = false;
 
     // §4.2.3 PreVote: timestamp of the last valid leader contact (heartbeat
@@ -338,11 +340,42 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         resetElectionTimer();
     }
 
+    /**
+     * Stops this node. When this returns, the node no longer writes to its storage.
+     *
+     * <p>That includes a snapshot that was already running: it is not cut off in the
+     * middle of its write, it is waited for. Without the wait it finishes some time
+     * after this method has returned and compacts the log then -- under whoever
+     * opened the same storage in the meantime. A node restarted on that storage had
+     * restored the older snapshot and found the entries after it gone.
+     */
     public void shutdown() {
         scheduler.shutdownNow();
         snapshotExecutor.shutdownNow();
+        awaitSnapshotExecutor();
         for (RaftTransport transport : peerTransports.values()) {
             transport.close();
+        }
+    }
+
+    private void awaitSnapshotExecutor() {
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    if (!snapshotExecutor.awaitTermination(SNAPSHOT_SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                        log("shutdown: a snapshot is still running after " + SNAPSHOT_SHUTDOWN_WAIT_SECONDS
+                                + " s; not waiting any longer");
+                    }
+                    return;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
