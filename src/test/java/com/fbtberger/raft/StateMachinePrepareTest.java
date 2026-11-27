@@ -119,6 +119,54 @@ class StateMachinePrepareTest {
     }
 
     @Test
+    void aCommandTaggedWithAClientSessionIsPreparedToo() throws Exception {
+        RecordingStateMachine sm = new RecordingStateMachine(command -> concat(command, " @leader"));
+        InMemoryStorage store = new InMemoryStorage();
+        startLeader(store, sm);
+
+        byte[] result = node.submitCommand(utf8("create order"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+
+        assertEquals("create order @leader", text(result));
+        assertEquals(List.of("create order @leader"), sm.applied);
+        assertEquals("create order @leader",
+                store.getLogEntry(store.getLastLogIndex()).getCommand().toStringUtf8());
+    }
+
+    @Test
+    void aRetriedTaggedCommandIsPreparedAgainAndAppliedOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger issued = new java.util.concurrent.atomic.AtomicInteger();
+        RecordingStateMachine sm = new RecordingStateMachine(
+                command -> concat(command, " #" + issued.incrementAndGet()));
+        startLeader(new InMemoryStorage(), sm);
+
+        byte[] first = node.submitCommand(utf8("create order"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+        byte[] retry = node.submitCommand(utf8("create order"), "client-1", 1, 0).get(2, TimeUnit.SECONDS);
+
+        // The retry drew a second value and is in the log with it, and that copy is
+        // never applied: the client gets the answer of the first.
+        assertEquals(2, issued.get());
+        assertEquals("create order #1", text(first));
+        assertEquals("create order #1", text(retry));
+        assertEquals(List.of("create order #1"), sm.applied);
+    }
+
+    @Test
+    void aFailingPrepareFailsATaggedRequestAndAppendsNothing() throws Exception {
+        RecordingStateMachine sm = new RecordingStateMachine(command -> null);
+        InMemoryStorage store = new InMemoryStorage();
+        startLeader(store, sm);
+        long lastIndexBefore = store.getLastLogIndex();
+
+        CompletableFuture<byte[]> future = node.submitCommand(utf8("x"), "client-1", 1, 0);
+
+        ExecutionException failure =
+                assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS));
+        assertInstanceOf(IllegalStateException.class, failure.getCause());
+        assertEquals(lastIndexBefore, store.getLastLogIndex());
+        assertEquals(0, node.clientSessionCount());
+    }
+
+    @Test
     void theDefaultLeavesTheCommandAlone() {
         byte[] command = utf8("SET x 1");
         assertSame(command, new KeyValueStateMachine().prepare(command));

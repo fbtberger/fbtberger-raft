@@ -1795,8 +1795,23 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
             }
+            // As in the untagged overload. A retry is prepared again and may be appended
+            // with other values than the first attempt; apply recognises it by its tag,
+            // returns the first result and never applies the second copy.
+            byte[] prepared;
+            try {
+                prepared = stateMachine.prepare(command);
+            } catch (RuntimeException e) {
+                metrics.clientRejected();
+                return failedFuture(e);
+            }
+            if (prepared == null) {
+                metrics.clientRejected();
+                return failedFuture(new IllegalStateException(
+                        stateMachine.getClass().getSimpleName() + ".prepare returned null"));
+            }
             return appendAndReplicateLocked(LogEntry.newBuilder()
-                    .setCommand(ByteString.copyFrom(command))
+                    .setCommand(ByteString.copyFrom(prepared))
                     .setClientId(clientId)
                     .setSequence(sequence)
                     .setAckedSequence(ackedSequence));
