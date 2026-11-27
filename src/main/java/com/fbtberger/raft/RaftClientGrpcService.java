@@ -149,7 +149,9 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
 
     private static SubmitResponse failure(Throwable cause) {
         SubmitResponse.Builder builder = SubmitResponse.newBuilder().setSuccess(false);
-        if (cause instanceof RaftNode.NotLeaderException nle) {
+        if (cause instanceof RaftNode.OverloadedException overloaded) {
+            builder.setOverloaded(true).setRetryAfterMs(overloaded.retryAfterMs).setError(overloaded.getMessage());
+        } else if (cause instanceof RaftNode.NotLeaderException nle) {
             if (nle.leaderHint != null) {
                 builder.setLeaderHint(nle.leaderHint);
             }
@@ -169,7 +171,9 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
 
     private static QueryResponse queryFailure(Throwable cause) {
         QueryResponse.Builder builder = QueryResponse.newBuilder().setSuccess(false);
-        if (cause instanceof RaftNode.NotLeaderException nle) {
+        if (cause instanceof RaftNode.OverloadedException overloaded) {
+            builder.setOverloaded(true).setRetryAfterMs(overloaded.retryAfterMs).setError(overloaded.getMessage());
+        } else if (cause instanceof RaftNode.NotLeaderException nle) {
             if (nle.leaderHint != null) {
                 builder.setLeaderHint(nle.leaderHint);
             }

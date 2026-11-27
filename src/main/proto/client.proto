@@ -98,6 +98,13 @@ message SubmitResponse {
 
   // Set iff success is false, for diagnostics / display to a human.
   string error = 4;
+
+  // Set iff success is false because this server IS the leader and has more
+  // commands waiting for their commit than it accepts. The command was not
+  // appended. The client should wait retry_after_ms and send it to the same
+  // node again; walking on to another node would only find followers.
+  bool overloaded = 5;
+  int64 retry_after_ms = 6;
 }
 
 message QueryRequest {
@@ -138,6 +145,10 @@ message QueryResponse {
   // Set iff success is false, for diagnostics / display to a human. A state
   // machine that serves no reads at all answers here rather than pretending.
   string error = 4;
+
+  // As in SubmitResponse: the leader has more reads waiting than it accepts.
+  bool overloaded = 5;
+  int64 retry_after_ms = 6;
 }
 
 message AddServerRequest {

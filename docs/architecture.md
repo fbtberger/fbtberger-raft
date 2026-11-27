@@ -576,6 +576,37 @@ additional services.
 
 \newpage
 
+# 8.2 Overload Protection
+
+A command the leader accepts occupies memory and log until a majority has stored
+it. When followers or the disk are slower than the clients, accepting everything
+only moves the queue into the leader, where it grows until every client has timed
+out on a command that will still be applied. The leader therefore refuses at the
+door:
+
+| Setting | Default | Limits |
+|---|---|---|
+| `overload.max.pending.writes` | 5000 | Commands appended and not yet committed |
+| `overload.max.pending.reads` | 5000 | Linearizable reads waiting for their heartbeat round |
+
+0 switches a limit off. A refused request is not appended and leaves no trace. The
+answer carries `overloaded=true` and `retry_after_ms`, and no leader hint, because
+the refusing node is the leader. `RaftClient` then asks the same node again with
+the same sequence number (section 5.4, so a retry cannot apply twice), pausing
+between attempts: the suggested 50 ms doubled per refusal, capped at one second and
+spread by up to half. After six refusals it throws a `RaftClientException` whose
+`overloaded()` is true, so a caller can tell load from an outage and slow down.
+
+Configuration changes and leadership transfers are not limited: they are operator
+actions and must stay possible on a loaded cluster.
+
+Between nodes the existing limits apply unchanged: at most a fixed number of
+`AppendEntries` in flight per follower and a byte limit per batch (§10.2.2), and one
+snapshot chunk per heartbeat (section 7).
+
+Metrics: `raft.client.overloaded{kind=write|read}` counts refusals,
+`raft.client.pending{kind=write|read}` shows what the limits are measured against.
+
 # 9. Storage Layer
 
 Three `RaftStorage` implementations are available:
@@ -654,4 +685,6 @@ transferLeadership) for JConsole/VisualVM.
 | `raft.node.log.last.index` | Gauge | Index of the last log entry |
 | `raft.node.snapshot.index` | Gauge | Snapshot boundary (last compacted index) |
 | `raft.node.witness` | Gauge | 1 on a witness, 0 on a data node |
+| `raft.client.overloaded` | Counter | Requests refused for load, tag `kind` |
+| `raft.client.pending` | Gauge | Requests waiting on this node, tag `kind` |
 | `raft.cluster.size` | Gauge | Number of nodes in configuration |

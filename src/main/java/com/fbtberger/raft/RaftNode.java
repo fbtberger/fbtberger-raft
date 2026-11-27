@@ -332,6 +332,7 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 store::getLastLogIndex,
                 store::getSnapshotIndex);
         metrics.registerWitnessGauge(() -> witness ? 1 : 0);
+        metrics.registerPendingGauges(pendingClientRequests::size, this::pendingReadCount);
     }
 
     /** Every server starts out as a follower (§5.1). */
@@ -1786,6 +1787,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
             }
+            if (overloadedWithWritesLocked()) {
+                return failedFuture(new OverloadedException("commands", pendingClientRequests.size()));
+            }
             // Leader only, and before the append: the one point at which a state
             // machine may fix a non-deterministic value into the command (see
             // StateMachine#prepare). What it returns is what every server applies.
@@ -1846,6 +1850,9 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
             if (leaderTransferTarget != null) {
                 metrics.clientRejected();
                 return failedFuture(new NotLeaderException(leaderTransferTarget));
+            }
+            if (overloadedWithWritesLocked()) {
+                return failedFuture(new OverloadedException("commands", pendingClientRequests.size()));
             }
             // As in the untagged overload. A retry is prepared again and may be appended
             // with other values than the first attempt; apply recognises it by its tag,
@@ -1914,6 +1921,11 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
                 return lastApplied.get() >= ri
                         ? CompletableFuture.completedFuture(ri)
                         : awaitApplied(ri).thenApply(v -> ri);
+            }
+            int maxReads = config.maxPendingReads();
+            if (maxReads > 0 && pendingReadBarriers.size() >= maxReads) {
+                metrics.clientOverloaded(false);
+                return CompletableFuture.failedFuture(new OverloadedException("reads", pendingReadBarriers.size()));
             }
             ReadBarrier barrier = new ReadBarrier(ri);
             pendingReadBarriers.add(barrier);
@@ -2922,6 +2934,48 @@ public final class RaftNode implements com.fbtberger.raft.transport.RaftRpcHandl
         }
         log("witness: log compacted through index " + target + "; "
                 + config.witnessLogRetain() + " committed entries kept");
+    }
+
+    /**
+     * This server is the leader and will not take the request now: more are already
+     * waiting than {@code overload.max.pending.writes} / {@code .reads} allow. Nothing was
+     * appended. Unlike {@link NotLeaderException} this is not a reason to try another
+     * node -- the others are followers -- but to wait {@link #retryAfterMs} and ask again.
+     *
+     * <p>Why refuse at all: a command accepted here occupies memory and log until a
+     * majority has stored it. When followers or the disk are slower than the clients,
+     * accepting everything only moves the queue into this process, where it grows until
+     * every client has timed out on a command that is still going to be applied. Refusing
+     * at the door keeps the latency of what was accepted bounded and tells the client the
+     * truth while it can still act on it.
+     */
+    public static final class OverloadedException extends RuntimeException {
+        /** A first guess; the client stretches it on every further refusal. */
+        public static final long RETRY_AFTER_MS = 50;
+        public final long retryAfterMs = RETRY_AFTER_MS;
+
+        public OverloadedException(String what, int waiting) {
+            super("overloaded: " + waiting + " " + what + " already waiting; retry in " + RETRY_AFTER_MS + " ms");
+        }
+    }
+
+    /** Whether the leader has as many commands waiting for their commit as it accepts. Counts the refusal. */
+    private boolean overloadedWithWritesLocked() {
+        int max = config.maxPendingWrites();
+        if (max > 0 && pendingClientRequests.size() >= max) {
+            metrics.clientOverloaded(true);
+            return true;
+        }
+        return false;
+    }
+
+    private int pendingReadCount() {
+        lock.lock();
+        try {
+            return pendingReadBarriers.size();
+        } finally {
+            lock.unlock();
+        }
     }
 
     public static final class NotLeaderException extends RuntimeException {

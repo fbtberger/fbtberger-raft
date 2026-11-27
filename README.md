@@ -40,6 +40,9 @@ For a quick API reference, see the
     excluded from every majority) and is promoted to a voter only once caught up,
     so adding capacity never opens an availability gap
   - §4 errata fix (config changes rejected until leader's no-op commits)
+- **Overload protection**: the leader refuses commands and reads beyond a
+  configurable number waiting, and `RaftClient` backs off and retries the same
+  node instead of timing out
 - **Witness nodes**: a voting member with a log and no state machine
   (`node.witness=true`). Two data nodes and a witness survive the loss of any one
   node with the state stored twice. A witness leads only to carry committed
@@ -199,6 +202,8 @@ snapshot.chunk.size=1048576     # InstallSnapshot chunk size (bytes)
 metrics.port=0                  # Prometheus endpoint (0 = disabled)
 node.witness=false              # true: vote and store the log, hold no state
 witness.log.retain=10000        # committed entries a witness keeps when it compacts
+overload.max.pending.writes=5000  # uncommitted commands the leader accepts (0 = no limit)
+overload.max.pending.reads=5000   # waiting linearizable reads it accepts (0 = no limit)
 
 # Per-RPC timeouts (ms)
 rpc.timeout.request.vote.ms=1000

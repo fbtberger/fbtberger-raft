@@ -379,6 +379,8 @@ curl http://localhost:10091/metrics
 | `snapshot.chunk.size` | 1 MB | InstallSnapshot chunk size |
 | `node.witness` | false | Vote, store log, no state |
 | `witness.log.retain` | 10000 | Entries a witness keeps |
+| `overload.max.pending.writes` | 5000 | Uncommitted commands accepted |
+| `overload.max.pending.reads` | 5000 | Waiting reads accepted |
 | `rpc.timeout.*.ms` | 1-30s | Per-RPC timeout |
 | `HEARTBEAT_INTERVAL_MS` | 50 | Heartbeat frequency |
 | `ELECTION_TIMEOUT_*_MS` | 150-300 | Election timeout range |

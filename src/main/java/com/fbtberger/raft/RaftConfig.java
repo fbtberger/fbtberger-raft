@@ -47,6 +47,8 @@ public final class RaftConfig {
     private static final int DEFAULT_SNAPSHOT_CHUNK_SIZE = 1_048_576; // 1 MB
     /** Committed entries a witness keeps behind its commit index. See {@link #witnessLogRetain()}. */
     public static final int DEFAULT_WITNESS_LOG_RETAIN = 10_000;
+    /** Default for {@link #maxPendingWrites()} and {@link #maxPendingReads()}. */
+    public static final int DEFAULT_MAX_PENDING = 5_000;
 
     private final String selfId;
     private final int selfPort;
@@ -61,6 +63,11 @@ public final class RaftConfig {
     private final ClientAuthConfig clientAuthConfig;
     private final boolean witness;
     private final int witnessLogRetain;
+    // Not constructor arguments: every other setting describes the node, these two tune
+    // it, and a twelfth and thirteenth positional int would be one transposition away
+    // from a silent mistake. Set by load() and withOverloadLimits().
+    private int maxPendingWrites = DEFAULT_MAX_PENDING;
+    private int maxPendingReads = DEFAULT_MAX_PENDING;
 
     private RaftConfig(String selfId, int selfPort, Path dataDir, Map<String, String> peerAddresses,
                        int snapshotThreshold, int snapshotChunkSize, int metricsPort, boolean learner,
@@ -134,8 +141,13 @@ public final class RaftConfig {
         boolean witness = Boolean.parseBoolean(props.getProperty("node.witness", "false"));
         int witnessLogRetain = Integer.parseInt(
                 props.getProperty("witness.log.retain", Integer.toString(DEFAULT_WITNESS_LOG_RETAIN)));
-        return new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize, metricsPort,
-                learner, rpcTimeouts, tlsConfig, clientAuthConfig, witness, witnessLogRetain);
+        RaftConfig loaded = new RaftConfig(selfId, port, dataDir, peers, snapshotThreshold, snapshotChunkSize,
+                metricsPort, learner, rpcTimeouts, tlsConfig, clientAuthConfig, witness, witnessLogRetain);
+        return loaded.withOverloadLimits(
+                Integer.parseInt(props.getProperty("overload.max.pending.writes",
+                        Integer.toString(DEFAULT_MAX_PENDING))),
+                Integer.parseInt(props.getProperty("overload.max.pending.reads",
+                        Integer.toString(DEFAULT_MAX_PENDING))));
     }
 
     /**
@@ -177,14 +189,31 @@ public final class RaftConfig {
     public RaftConfig withClientAuth(ClientAuthConfig auth) {
         return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
                 snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig, auth,
-                witness, witnessLogRetain);
+                witness, witnessLogRetain).withOverloadLimits(maxPendingWrites, maxPendingReads);
+    }
+
+    /**
+     * This configuration with the given admission limits; everything else unchanged.
+     * 0 switches a limit off.
+     */
+    public RaftConfig withOverloadLimits(int maxPendingWrites, int maxPendingReads) {
+        if (maxPendingWrites < 0 || maxPendingReads < 0) {
+            throw new IllegalArgumentException("overload limits must not be negative (writes="
+                    + maxPendingWrites + ", reads=" + maxPendingReads + "); 0 switches one off");
+        }
+        RaftConfig copy = new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
+                snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
+                clientAuthConfig, witness, witnessLogRetain);
+        copy.maxPendingWrites = maxPendingWrites;
+        copy.maxPendingReads = maxPendingReads;
+        return copy;
     }
 
     /** This configuration as a witness that keeps {@code logRetain} committed entries; everything else unchanged. */
     public RaftConfig asWitness(int logRetain) {
         return new RaftConfig(selfId, selfPort, dataDir, peerAddresses,
                 snapshotThreshold, snapshotChunkSize, metricsPort, learner, rpcTimeouts, tlsConfig,
-                clientAuthConfig, true, logRetain);
+                clientAuthConfig, true, logRetain).withOverloadLimits(maxPendingWrites, maxPendingReads);
     }
 
     private static String require(Properties props, String key) {
@@ -251,6 +280,22 @@ public final class RaftConfig {
      * snapshot to send. A data node further behind than this needs another data node.
      */
     public int witnessLogRetain() { return witnessLogRetain; }
+
+    /**
+     * How many client commands the leader lets wait for their commit before it refuses
+     * new ones ({@code overload.max.pending.writes}, default {@value #DEFAULT_MAX_PENDING};
+     * 0 = no limit). A command waits here from the moment it is appended until a majority
+     * has stored it, so this bounds what a slow disk or a slow follower can pile up in the
+     * leader's memory and in its log.
+     */
+    public int maxPendingWrites() { return maxPendingWrites; }
+
+    /**
+     * How many linearizable reads the leader lets wait for their heartbeat round before it
+     * refuses new ones ({@code overload.max.pending.reads}, default
+     * {@value #DEFAULT_MAX_PENDING}; 0 = no limit).
+     */
+    public int maxPendingReads() { return maxPendingReads; }
 
     public RpcTimeouts rpcTimeouts() { return rpcTimeouts; }
 

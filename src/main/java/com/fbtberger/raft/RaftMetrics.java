@@ -36,6 +36,8 @@ public final class RaftMetrics {
         private final Counter stepDowns;
         private final Counter clientRejected;
         private final Counter clientDuplicates;
+        private final Counter clientOverloadedWrites;
+        private final Counter clientOverloadedReads;
         private final Counter followerReads;
         private final Counter readIndexServed;
         private final Counter clientAuthAccepted;
@@ -74,6 +76,12 @@ public final class RaftMetrics {
                                 .tags(tags).description("Times this node stepped down to follower").register(registry);
                 this.clientRejected = Counter.builder("raft.client.rejected")
                                 .tags(tags).description("Client submissions rejected (not leader)").register(registry);
+                this.clientOverloadedWrites = Counter.builder("raft.client.overloaded")
+                                .tags(tags).tag("kind", "write")
+                                .description("Client requests refused because too many were already waiting").register(registry);
+                this.clientOverloadedReads = Counter.builder("raft.client.overloaded")
+                                .tags(tags).tag("kind", "read")
+                                .description("Client requests refused because too many were already waiting").register(registry);
                 this.clientDuplicates = Counter.builder("raft.client.duplicate")
                                 .tags(tags).description("Committed commands not applied again because their client session had seen them").register(registry);
                 this.followerReads = Counter.builder("raft.read.follower")
@@ -289,6 +297,19 @@ public final class RaftMetrics {
 
         public void clientDuplicate() {
                 clientDuplicates.increment();
+        }
+
+        /** @param write true for a refused command, false for a refused read */
+        public void clientOverloaded(boolean write) {
+                (write ? clientOverloadedWrites : clientOverloadedReads).increment();
+        }
+
+        /** How many commands and reads are waiting on the leader right now: what the limits are measured against. */
+        public void registerPendingGauges(Supplier<Number> pendingWrites, Supplier<Number> pendingReads) {
+                Gauge.builder("raft.client.pending", pendingWrites).tags(tags).tag("kind", "write")
+                                .description("Client requests waiting on this node").register(registry);
+                Gauge.builder("raft.client.pending", pendingReads).tags(tags).tag("kind", "read")
+                                .description("Client requests waiting on this node").register(registry);
         }
 
         public void replicationSent(int entryCount) {

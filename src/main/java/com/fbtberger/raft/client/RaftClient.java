@@ -74,6 +74,26 @@ import java.util.function.Supplier;
 public final class RaftClient implements AutoCloseable {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(2);
+    /** How often an overloaded leader is asked again before the caller is told. */
+    static final int MAX_OVERLOAD_RETRIES = 5;
+    /** The longest single pause between two of those attempts. */
+    static final long MAX_BACKOFF_MS = 1_000;
+
+    /**
+     * Waits before asking an overloaded leader again: the pause it suggested, doubled per
+     * refusal, capped, and spread by up to half so that the clients it refused together do
+     * not all come back together.
+     */
+    private static void backOff(long suggestedMs, int refusals) throws RaftClientException {
+        long base = Math.min(MAX_BACKOFF_MS, Math.max(1, suggestedMs) << Math.min(refusals, 10));
+        long pause = base / 2 + java.util.concurrent.ThreadLocalRandom.current().nextLong(base / 2 + 1);
+        try {
+            Thread.sleep(pause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RaftClientException("interrupted while waiting for an overloaded leader", e);
+        }
+    }
 
     /**
      * What a node that is not the leader answers -- set verbatim by
@@ -212,9 +232,25 @@ public final class RaftClient implements AutoCloseable {
 
         for (String nodeId : candidateOrder()) {
             try {
-                RaftClientServiceGrpc.RaftClientServiceBlockingStub stub = stubFor(nodeId)
-                        .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS);
-                SubmitResponse response = stub.submit(request);
+                SubmitResponse response = null;
+                // The same node again while it says "overloaded": it is the leader, and
+                // the nodes after it in the walk are followers that can only say no. The
+                // command was not appended, and it carries the same sequence number each
+                // time, so asking again cannot apply it twice.
+                for (int refusals = 0; ; refusals++) {
+                    response = stubFor(nodeId)
+                            .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                            .submit(request);
+                    if (!response.getOverloaded()) {
+                        break;
+                    }
+                    knownLeaderId = nodeId;
+                    if (refusals == MAX_OVERLOAD_RETRIES) {
+                        throw RaftClientException.overloaded(nodeId + " is overloaded and refused the command "
+                                + (refusals + 1) + " times (" + response.getError() + ")");
+                    }
+                    backOff(response.getRetryAfterMs(), refusals);
+                }
 
                 if (response.getSuccess()) {
                     knownLeaderId = nodeId;
@@ -266,9 +302,20 @@ public final class RaftClient implements AutoCloseable {
 
         for (String nodeId : followerRead ? followerFirstOrder() : candidateOrder()) {
             try {
-                QueryResponse response = stubFor(nodeId)
-                        .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
-                        .query(request);
+                QueryResponse response = null;
+                for (int refusals = 0; ; refusals++) {
+                    response = stubFor(nodeId)
+                            .withDeadlineAfter(perAttemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                            .query(request);
+                    if (!response.getOverloaded()) {
+                        break;
+                    }
+                    if (refusals == MAX_OVERLOAD_RETRIES) {
+                        throw RaftClientException.overloaded(nodeId + " is overloaded and refused the query "
+                                + (refusals + 1) + " times (" + response.getError() + ")");
+                    }
+                    backOff(response.getRetryAfterMs(), refusals);
+                }
 
                 if (response.getSuccess()) {
                     // Whoever answered a follower read need not be the leader, and must
