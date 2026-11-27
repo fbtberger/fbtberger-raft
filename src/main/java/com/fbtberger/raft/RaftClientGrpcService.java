@@ -45,7 +45,7 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
     @Override
     public void submit(SubmitRequest request, StreamObserver<SubmitResponse> responseObserver) {
         Timer.Sample sample = Timer.start(metrics.registry());
-        raftNode.submitCommand(request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
+        raftNode.submitCommand(request.getStateMachine(), request.getCommand().toByteArray()).whenComplete((result, throwable) -> {
             sample.stop(metrics.clientSubmitTimer());
             responseObserver.onNext(throwable == null ? success(result) : failure(unwrap(throwable)));
             responseObserver.onCompleted();
@@ -59,7 +59,9 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         // without a restart in between -- and a restart is a different experiment.
         byte[] q = request.getQuery().toByteArray();
         CompletableFuture<byte[]> answer =
-                request.getLease() ? raftNode.queryWithLease(q) : raftNode.query(q);
+                request.getLease()
+                        ? raftNode.queryWithLease(request.getStateMachine(), q)
+                        : raftNode.query(request.getStateMachine(), q);
         answer.whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
             responseObserver.onCompleted();

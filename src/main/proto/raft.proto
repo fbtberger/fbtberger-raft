@@ -37,17 +37,31 @@ message ClusterConfiguration {
   repeated Member learners = 3;
 }
 
-// One entry in the replicated log (paper, Figure 2 / Figure 6): either a
-// state machine command or a configuration change, plus the term in which
-// the leader received it. Exactly one of the two is ever set; which one
-// determines whether applyCommittedEntries() hands it to the state machine
-// or treats it as a membership change (§6).
+// A command for one of the state machines a server runs beside its
+// application state machine (StateMachineRegistry). The name decides who
+// applies it; no other state machine ever sees the bytes.
+message NamedCommand {
+  string state_machine = 1;
+  bytes command = 2;
+}
+
+// One entry in the replicated log (paper, Figure 2 / Figure 6): a command
+// for the application state machine, a configuration change, or a command
+// for a named state machine, plus the term in which the leader received it.
+// Exactly one of the three is ever set; which one determines whether
+// applyCommittedEntries() hands it to the application state machine, treats
+// it as a membership change (§6), or hands it to the state machine it names.
+//
+// A server that predates named_command reads such an entry as an empty
+// command for its application state machine. Upgrade every server before
+// the first named command is submitted.
 message LogEntry {
   int64 index = 1;
   int64 term = 2;
   oneof payload {
     bytes command = 3;
     ClusterConfiguration configuration = 4;
+    NamedCommand named_command = 8;
   }
 }
 

@@ -26,6 +26,7 @@ The project implements:
 - **PreVote + Leader Stickiness** (§4.2.3 / §9.6): prevents partitioned servers from disrupting the cluster; `hasLeaderStickiness()` denies votes when a valid leader is active
 - **Performance optimizations** (§10.2): parallel leader disk writes, batching, pipelining
 - **Copy-on-write snapshotting** (§5.1): `prepareCowSnapshot()` captures state under the lock; serialization runs on a background thread
+- **Named state machines**: `StateMachineRegistry` holds the application state machine and named ones beside it; a `NamedCommand` log entry is applied by exactly the state machine it names, and each has its own snapshot section. A state machine that implements `LeaderPreparation` sees its commands on the leader before the append
 - **Transport abstraction**: pluggable gRPC, Netty TCP, and Hadoop RPC with per-RPC timeouts and TLS/mTLS
 - **Storage**: BerkeleyDB JE, append-only WAL, or in-memory (pluggable via `RaftStorage`)
 - **Observability**: SLF4J/Logback logging, Micrometer metrics (Prometheus + JMX), health checks, JMX MBean
