@@ -134,6 +134,12 @@ message PreVoteResponse {
 // for an election timeout.
 message TimeoutNowRequest {
   int64 term = 1;
+  // The leader handing over. Until this existed TimeoutNow was the one peer RPC with no
+  // sender in it, so it could neither be bound to the mTLS certificate nor checked against
+  // the leader the receiver follows: any holder of a cluster certificate could make any
+  // node start an election. Empty from a peer that predates the field; a server running
+  // mTLS refuses that, a plaintext one accepts it as before.
+  string leaderId = 2;
 }
 
 message TimeoutNowResponse {

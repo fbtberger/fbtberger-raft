@@ -175,6 +175,7 @@ class TlsStartupLoggingTest {
             server.start();
             assertTrue(capture.has(Level.INFO, "(Netty) on port"), capture.toString());
             assertTrue(capture.has(Level.INFO, ": mTLS"), capture.toString());
+            assertTrue(capture.has(Level.INFO, "sender id bound to"), capture.toString());
             assertFalse(capture.has(Level.INFO, "on port 0:"), "logged the requested port, not the bound one");
         } finally {
             server.close();

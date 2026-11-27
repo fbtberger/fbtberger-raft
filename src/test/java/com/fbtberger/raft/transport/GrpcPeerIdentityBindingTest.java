@@ -161,20 +161,41 @@ class GrpcPeerIdentityBindingTest {
     }
 
     /**
-     * The documented hole, pinned so it cannot close by accident and cannot widen unnoticed.
-     * TimeoutNowRequest carries no sender field, so there is nothing to bind; the call goes
-     * through on any trusted certificate. If a sender id is ever added to the proto, this test
-     * fails and the guard belongs on that RPC too.
+     * TimeoutNow used to be the documented hole: the request carried a term and no sender, so
+     * there was nothing to bind and any trusted certificate could make a node start an election.
+     * It now carries {@code leaderId} and is held to it like the other four.
      */
     @Test
-    @DisplayName("TimeoutNow cannot be bound -- it carries no sender id at all")
-    void timeoutNowIsNotBoundBecauseItCarriesNoSender() throws Exception {
+    @DisplayName("a forged leaderId is refused on TimeoutNow")
+    void rejectsAForgedLeaderIdOnTimeoutNow() throws Exception {
         startServer();
-        assertEquals(1, TimeoutNowRequest.getDescriptor().getFields().size(),
-                "TimeoutNowRequest gained a field -- if it is a sender id, bind it (see "
-                        + "GrpcTransportServer.timeoutNow)");
         try (RaftTransport client = clientAs(kwatro2)) {
-            client.timeoutNow(TimeoutNowRequest.newBuilder().setTerm(2).build())
+            assertRejected(() -> client.timeoutNow(TimeoutNowRequest.newBuilder()
+                    .setTerm(2).setLeaderId("kwatro1").build()));
+            assertEquals(0, handler.timeoutNow.get());
+        }
+    }
+
+    /**
+     * A request without the field is what a peer from before the field sends -- and what an
+     * attacker would send if leaving it out were a way around the check. Refused.
+     */
+    @Test
+    @DisplayName("a TimeoutNow without a leaderId is refused under mTLS")
+    void rejectsATimeoutNowWithoutASender() throws Exception {
+        startServer();
+        try (RaftTransport client = clientAs(kwatro2)) {
+            assertRejected(() -> client.timeoutNow(TimeoutNowRequest.newBuilder().setTerm(2).build()));
+            assertEquals(0, handler.timeoutNow.get());
+        }
+    }
+
+    @Test
+    @DisplayName("control: a TimeoutNow from the node it names is accepted")
+    void acceptsATimeoutNowFromItsRealSender() throws Exception {
+        startServer();
+        try (RaftTransport client = clientAs(kwatro2)) {
+            client.timeoutNow(TimeoutNowRequest.newBuilder().setTerm(2).setLeaderId("kwatro2").build())
                     .get(10, TimeUnit.SECONDS);
             assertEquals(1, handler.timeoutNow.get());
         }

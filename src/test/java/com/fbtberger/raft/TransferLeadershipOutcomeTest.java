@@ -138,6 +138,23 @@ class TransferLeadershipOutcomeTest {
     }
 
     /**
+     * The TimeoutNow names the leader that sent it. The receiving transport binds that id to
+     * the mTLS certificate and the receiving node checks it against the leader it follows, so
+     * a request without it is refused on an mTLS cluster -- the transfer would simply never
+     * happen.
+     */
+    @Test
+    void theTimeoutNowNamesTheLeaderThatSentIt() throws Exception {
+        ControllableTransport peer = new ControllableTransport();
+        node = leaderWith(peer);
+
+        node.transferLeadership("n2");
+        assertTrue(peer.timeoutNowSent.await(3, TimeUnit.SECONDS));
+
+        assertEquals("n1", peer.lastRequest.get().getLeaderId());
+    }
+
+    /**
      * No command is accepted between TimeoutNow and the target actually winning.
      *
      * <p>§3.10 says the leader stops serving clients for the duration of a transfer, and this

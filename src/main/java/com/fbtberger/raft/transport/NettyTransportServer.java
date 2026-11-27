@@ -23,11 +23,19 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLPeerUnverifiedException;
 
 public final class NettyTransportServer implements RaftTransportServer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(NettyTransportServer.class);
 
     private final int port;
     private final RaftRpcHandler handler;
@@ -84,7 +92,7 @@ public final class NettyTransportServer implements RaftTransportServer {
                     .bind(port)
                     .sync()
                     .channel();
-            tlsConfig.logStartup("Netty", boundPort(), false);
+            tlsConfig.logStartup("Netty", boundPort(), tlsConfig.mtlsEnabled());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("bind interrupted", e);
@@ -103,7 +111,65 @@ public final class NettyTransportServer implements RaftTransportServer {
         workerGroup.shutdownGracefully();
     }
 
+    /** One instance per connection, so what it learns about the peer is that connection's. */
     private final class RequestHandler extends SimpleChannelInboundHandler<ByteBuf> {
+
+        private boolean refused;
+        private boolean identityRead;
+        private String authenticatedNodeId;
+
+        /**
+         * The Netty counterpart of {@code GrpcTransportServer.RaftServiceAdapter}'s guard, and the
+         * same rule: under mTLS the sender id a message declares must be the CN of the certificate
+         * the connection authenticated with. See {@link PeerIdentity} for why PKI membership alone
+         * is not enough. Until this existed the Netty server required a client certificate and
+         * then never looked at whose it was.
+         *
+         * <p>Returns true when the request may proceed. Otherwise the connection is closed: this
+         * protocol has no error frame, and a peer that forged its sender is not owed a polite
+         * answer on a connection it should not be using. The client's pending request fails on
+         * the close. Logged at ERROR for the reason the gRPC guard is -- a server that drops peer
+         * traffic silently looks like a network fault.
+         */
+        private boolean senderIsWhoItClaims(ChannelHandlerContext ctx, String rpc, String claimedId) {
+            if (!tlsConfig.enabled() || !tlsConfig.mtlsEnabled()) return true;
+            // Frames already decoded when the connection was refused still arrive here; closing
+            // is not instantaneous. They are not served, whatever they claim.
+            if (refused) return false;
+            String authenticated = authenticatedNodeId(ctx);
+            if (authenticated != null && authenticated.equals(claimedId)) return true;
+
+            LOG.error("Raft RPC {} refused: the sender claims to be '{}', the certificate "
+                    + "authenticates '{}'. Closing the connection from {}.",
+                    rpc, claimedId, authenticated, ctx.channel().remoteAddress());
+            refused = true;
+            ctx.close();
+            return false;
+        }
+
+        /**
+         * Read once per connection, after the handshake: a frame can only arrive here through the
+         * SslHandler, so by now the session is established. Null means no usable identity, which
+         * the caller treats as a refusal, not as an exemption.
+         */
+        private String authenticatedNodeId(ChannelHandlerContext ctx) {
+            if (!identityRead) {
+                identityRead = true;
+                SslHandler ssl = ctx.pipeline().get(SslHandler.class);
+                if (ssl != null) {
+                    try {
+                        Certificate[] chain = ssl.engine().getSession().getPeerCertificates();
+                        if (chain != null && chain.length > 0 && chain[0] instanceof X509Certificate leaf) {
+                            authenticatedNodeId = PeerIdentity.fromCertificate(leaf);
+                        }
+                    } catch (SSLPeerUnverifiedException e) {
+                        authenticatedNodeId = null;
+                    }
+                }
+            }
+            return authenticatedNodeId;
+        }
+
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
             byte type = msg.readByte();
@@ -116,23 +182,33 @@ public final class NettyTransportServer implements RaftTransportServer {
             try {
                 switch (type) {
                     case NettyProtocol.REQUEST_VOTE_REQ -> {
-                        response = handler.handleRequestVote(RequestVoteRequest.parseFrom(payload));
+                        RequestVoteRequest req = RequestVoteRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "RequestVote", req.getCandidateId())) return;
+                        response = handler.handleRequestVote(req);
                         respType = NettyProtocol.REQUEST_VOTE_RESP;
                     }
                     case NettyProtocol.APPEND_ENTRIES_REQ -> {
-                        response = handler.handleAppendEntries(AppendEntriesRequest.parseFrom(payload));
+                        AppendEntriesRequest req = AppendEntriesRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "AppendEntries", req.getLeaderId())) return;
+                        response = handler.handleAppendEntries(req);
                         respType = NettyProtocol.APPEND_ENTRIES_RESP;
                     }
                     case NettyProtocol.INSTALL_SNAPSHOT_REQ -> {
-                        response = handler.handleInstallSnapshot(InstallSnapshotRequest.parseFrom(payload));
+                        InstallSnapshotRequest req = InstallSnapshotRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "InstallSnapshot", req.getLeaderId())) return;
+                        response = handler.handleInstallSnapshot(req);
                         respType = NettyProtocol.INSTALL_SNAPSHOT_RESP;
                     }
                     case NettyProtocol.PRE_VOTE_REQ -> {
-                        response = handler.handlePreVote(PreVoteRequest.parseFrom(payload));
+                        PreVoteRequest req = PreVoteRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "PreVote", req.getCandidateId())) return;
+                        response = handler.handlePreVote(req);
                         respType = NettyProtocol.PRE_VOTE_RESP;
                     }
                     case NettyProtocol.TIMEOUT_NOW_REQ -> {
-                        response = handler.handleTimeoutNow(TimeoutNowRequest.parseFrom(payload));
+                        TimeoutNowRequest req = TimeoutNowRequest.parseFrom(payload);
+                        if (!senderIsWhoItClaims(ctx, "TimeoutNow", req.getLeaderId())) return;
+                        response = handler.handleTimeoutNow(req);
                         respType = NettyProtocol.TIMEOUT_NOW_RESP;
                     }
                     default -> throw new IllegalStateException("unknown request type: " + type);
