@@ -199,6 +199,26 @@ public final class RaftClient implements AutoCloseable {
      * @throws RaftClientException if no node in the cluster accepted the command
      */
     public byte[] submit(byte[] command, Duration perAttemptTimeout) throws RaftClientException {
+        return submit("", command, perAttemptTimeout);
+    }
+
+    /**
+     * Submits a command to the state machine the servers registered under
+     * {@code stateMachine}, with the default timeout per attempted node. The empty
+     * name is the application state machine.
+     */
+    public byte[] submit(String stateMachine, byte[] command) throws RaftClientException {
+        return submit(stateMachine, command, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * Like {@link #submit(byte[], Duration)}, for a named state machine.
+     *
+     * <p>A server that predates named state machines ignores the name and hands the
+     * command to its application state machine: upgrade the servers first.
+     */
+    public byte[] submit(String stateMachine, byte[] command, Duration perAttemptTimeout)
+            throws RaftClientException {
         // One sequence number for the whole walk below. That is the point of it: the
         // attempt that times out against a leader which committed the command and the
         // attempt that then reaches its successor are the same command to the cluster.
@@ -213,7 +233,7 @@ public final class RaftClient implements AutoCloseable {
             acked = outstanding.first() - 1;
         }
         try {
-            return submitTagged(command, sequence, acked, perAttemptTimeout);
+            return submitTagged(stateMachine, command, sequence, acked, perAttemptTimeout);
         } finally {
             // Answered or given up: either way this client never asks for it again, so
             // the servers may drop its result once a later command carries the news.
@@ -221,8 +241,10 @@ public final class RaftClient implements AutoCloseable {
         }
     }
 
-    private byte[] submitTagged(byte[] command, long sequence, long acked, Duration perAttemptTimeout) throws RaftClientException {
+    private byte[] submitTagged(String stateMachine, byte[] command, long sequence, long acked,
+                                Duration perAttemptTimeout) throws RaftClientException {
         SubmitRequest request = SubmitRequest.newBuilder()
+                .setStateMachine(stateMachine)
                 .setCommand(ByteString.copyFrom(command))
                 .setClientId(clientId)
                 .setSequence(sequence)
@@ -288,6 +310,12 @@ public final class RaftClient implements AutoCloseable {
      */
     public byte[] query(byte[] query, Duration perAttemptTimeout, ReadMode mode)
             throws RaftClientException {
+        return query("", query, perAttemptTimeout, mode);
+    }
+
+    /** Like {@link #query(byte[], Duration, ReadMode)}, answered by a named state machine. */
+    public byte[] query(String stateMachine, byte[] query, Duration perAttemptTimeout, ReadMode mode)
+            throws RaftClientException {
         // An old server ignores the lease field and answers a ReadIndex read successfully,
         // and the response carries no record of which path ran. A lease measurement against
         // a cluster that predates the field therefore measures ReadIndex and says so
@@ -296,6 +324,7 @@ public final class RaftClient implements AutoCloseable {
                 .setQuery(ByteString.copyFrom(query))
                 .setLease(mode == ReadMode.LEASE)
                 .setAllowFollower(mode == ReadMode.FOLLOWER)
+                .setStateMachine(stateMachine)
                 .build();
         RaftClientException lastError = null;
         boolean followerRead = mode == ReadMode.FOLLOWER;

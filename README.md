@@ -58,6 +58,19 @@ For a quick API reference, see the
   - Streaming snapshots: written to disk, sent, received and restored chunk by
     chunk, so a snapshot costs one chunk of memory whatever the size of the state
   - Independent per-server compaction with configurable threshold
+- **Named state machines**: a node runs its application state machine and any
+  number of named ones beside it (`StateMachineRegistry`, one
+  `StateMachineRegistration` bean each). A log entry is for exactly one of them:
+  `submitCommand(name, command)` appends a `NamedCommand`, and only the state
+  machine registered under that name applies it. Each has its own section in the
+  snapshot. One state machine, one domain. Every server of a cluster must
+  register the same names, and every server must be upgraded before the first
+  named command is submitted
+- **Leader-side command preparation**: a state machine that also implements
+  `LeaderPreparation` gets its commands on the leader only, before they are
+  appended, and what `prepare()` returns is what every server applies. It is the
+  one place a state machine may fix a non-deterministic value (clock,
+  randomness) into a command; `fbtberger-common` builds its value issuer on it
 - **Transport abstraction layer**: pluggable gRPC, Netty TCP, and Hadoop RPC
   implementations, with per-RPC configurable timeouts and TLS/mTLS support
 - **Prometheus metrics + JMX**: counters, timers, and gauges published to both
@@ -122,6 +135,9 @@ fbtberger-raft/
     │       ├── WalStorage.java             # segmented WAL with CRC32 checksums
     │       ├── InMemoryStorage.java        # non-durable test implementation
     │       ├── StateMachine.java           # state machine interface (+ COW snapshot)
+    │       ├── StateMachineRegistry.java   # application + named state machines, snapshot sections
+    │       ├── StateMachineRegistration.java # Spring bean type that adds a named state machine
+    │       ├── LeaderPreparation.java      # optional leader-only hook before the append
     │       ├── KeyValueStateMachine.java   # demo key-value store
     │       ├── ClientSessions.java         # replicated session table (exactly-once, §8)
     │       ├── RaftClientGrpcService.java  # client-facing gRPC adapter

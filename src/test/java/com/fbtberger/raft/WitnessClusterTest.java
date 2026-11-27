@@ -64,6 +64,7 @@ class WitnessClusterTest {
     private final Map<String, String> addresses = new LinkedHashMap<>();
     private final Map<String, RaftNode> nodes = new LinkedHashMap<>();
     private final Map<String, KeyValueStateMachine> machines = new LinkedHashMap<>();
+    private final Map<String, KeyValueStateMachine> named = new LinkedHashMap<>();
     private final Map<String, InMemoryStorage> stores = new LinkedHashMap<>();
     private final Map<String, Server> servers = new LinkedHashMap<>();
     private final List<RaftTransport> transports = new ArrayList<>();
@@ -93,6 +94,26 @@ class WitnessClusterTest {
                         && nodes.get("w").appliedIndex() == nodes.get(leader).appliedIndex());
         assertNull(machines.get("w").get("k1"), "the state machine a witness is wired with stays empty");
         assertEquals("5", machines.get(leader).get("k5"));
+    }
+
+    @Test
+    void aCommandForANamedStateMachineCommitsWithTheWitnessWhichKeepsNoneOfIt() throws Exception {
+        start(1_000, 1_000);
+        String leader = awaitDataLeader();
+        isolate(otherDataNode(leader));
+
+        // Committed by the leader and the witness alone, so the witness has applied an
+        // entry for a name its own registry does not hold -- and must not fail on it.
+        nodes.get(leader).submitCommand("values", "SET issued 7".getBytes(StandardCharsets.UTF_8))
+                .get(3, TimeUnit.SECONDS);
+        write(leader, "SET k 1");
+
+        Await.until("the witness applied both", 3_000,
+                () -> nodes.get("w").appliedIndex() == nodes.get(leader).appliedIndex());
+        assertEquals("7", named.get(leader).get("issued"));
+        assertNull(named.get("w").get("issued"));
+        assertNull(machines.get("w").get("k"));
+        assertTrue(nodes.get("w").stateMachineNames().isEmpty());
     }
 
     @Test
@@ -241,7 +262,11 @@ class WitnessClusterTest {
             }
             InMemoryStorage store = new InMemoryStorage();
             KeyValueStateMachine machine = new KeyValueStateMachine();
-            RaftNode node = new RaftNode(config, store, machine, address -> {
+            KeyValueStateMachine namedMachine = new KeyValueStateMachine();
+            named.put(id, namedMachine);
+            // The witness is wired like every node, named state machine included.
+            RaftNode node = new RaftNode(config, store,
+                    new StateMachineRegistry(machine, Map.of("values", namedMachine)), address -> {
                 GrpcTransport grpc = new GrpcTransport(
                         InProcessChannelBuilder.forName(address).directExecutor().build());
                 transports.add(grpc);

@@ -83,6 +83,12 @@ message SubmitRequest {
   string client_id = 2;
   int64 sequence = 3;
   int64 acked_sequence = 4;
+  // The state machine this command is for. Unset means the application state
+  // machine, which is what every caller that predates this field gets.
+  //
+  // A server that predates the field ignores it and hands the command to its
+  // application state machine. Upgrade the servers before a client uses it.
+  string state_machine = 5;
 }
 
 message SubmitResponse {
@@ -131,6 +137,8 @@ message QueryRequest {
   // read is correct and merely not offloaded. `lease` is ignored when this is set
   // and the receiving node is not the leader.
   bool allow_follower = 3;
+  // The state machine that answers. Unset means the application state machine.
+  string state_machine = 4;
 }
 
 message QueryResponse {

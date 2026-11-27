@@ -136,9 +136,14 @@ public class RaftNodeConfiguration {
     public RaftNode raftNode(RaftConfig config,
                               RaftStorage storage,
                               StateMachine stateMachine,
+                              org.springframework.beans.factory.ObjectProvider<StateMachineRegistration> registrations,
                               RaftTransportFactory transportFactory,
                               RaftMetrics metrics) {
-        return new RaftNode(config, storage, stateMachine, transportFactory, metrics);
+        // The one StateMachine bean is the application's. Every StateMachineRegistration
+        // bean adds a named state machine beside it, with a domain of its own.
+        StateMachineRegistry stateMachines =
+                StateMachineRegistry.of(stateMachine, registrations.orderedStream().toList());
+        return new RaftNode(config, storage, stateMachines, transportFactory, metrics);
     }
 
     @Bean

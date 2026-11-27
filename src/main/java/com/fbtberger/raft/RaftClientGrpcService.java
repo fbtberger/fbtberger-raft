@@ -49,8 +49,8 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         // No client id is a request without a session, which is what every client older
         // than the field sends; it is applied on every arrival as before.
         CompletableFuture<byte[]> outcome = request.getClientId().isEmpty()
-                ? raftNode.submitCommand(command)
-                : raftNode.submitCommand(command, request.getClientId(),
+                ? raftNode.submitCommand(request.getStateMachine(), command)
+                : raftNode.submitCommand(request.getStateMachine(), command, request.getClientId(),
                         request.getSequence(), request.getAckedSequence());
         outcome.whenComplete((result, throwable) -> {
             sample.stop(metrics.clientSubmitTimer());
@@ -65,14 +65,15 @@ public final class RaftClientGrpcService extends RaftClientServiceGrpc.RaftClien
         // to be able to serve both during the same run, or the two cannot be compared
         // without a restart in between -- and a restart is a different experiment.
         byte[] q = request.getQuery().toByteArray();
+        String target = request.getStateMachine();
         CompletableFuture<byte[]> answer;
         if (request.getAllowFollower() && raftNode.role() != ServerRole.LEADER) {
             // Not the leader and allowed to answer anyway: the leader supplies the read
             // index, this node the read. On the leader the flag changes nothing, so the
             // lease choice below still applies there.
-            answer = raftNode.queryAnyRole(q);
+            answer = raftNode.queryAnyRole(target, q);
         } else {
-            answer = request.getLease() ? raftNode.queryWithLease(q) : raftNode.query(q);
+            answer = request.getLease() ? raftNode.queryWithLease(target, q) : raftNode.query(target, q);
         }
         answer.whenComplete((result, throwable) -> {
             responseObserver.onNext(throwable == null ? querySuccess(result) : queryFailure(unwrap(throwable)));
